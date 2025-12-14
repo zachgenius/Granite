@@ -1,6 +1,194 @@
-cmake_minimum_required(VERSION 3.31)
-project(Granite)
+cmake_minimum_required(VERSION 3.20)
+project(Granite VERSION 0.1.0 LANGUAGES CXX OBJCXX)
 
 set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-add_executable(Granite main.cpp)
+# Options
+option(GRANITE_BUILD_METAL "Build Metal backend (Apple only)" ON)
+option(GRANITE_BUILD_CPU "Build CPU backend" ON)
+option(GRANITE_BUILD_TESTS "Build tests" ON)
+option(GRANITE_BUILD_EXAMPLES "Build examples" ON)
+
+# =============================================================================
+# Dependencies
+# =============================================================================
+
+# GLM (header-only math library)
+add_subdirectory(third_party/glm)
+
+# fmt (formatting library - used by spdlog)
+add_subdirectory(third_party/fmt)
+
+# spdlog (logging library)
+set(SPDLOG_FMT_EXTERNAL ON CACHE BOOL "Use external fmt" FORCE)
+add_subdirectory(third_party/spdlog)
+
+# Catch2 (testing framework)
+if(GRANITE_BUILD_TESTS)
+    add_subdirectory(third_party/catch2)
+    list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/third_party/catch2/extras)
+endif()
+
+# metal-cpp (header-only, manually downloaded)
+add_library(metal-cpp INTERFACE)
+target_include_directories(metal-cpp INTERFACE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/metal-cpp
+)
+
+# =============================================================================
+# Granite Core Library
+# =============================================================================
+
+set(GRANITE_CORE_SOURCES
+    src/core/tensor.cpp
+    src/core/memory_manager.cpp
+    src/core/operator_registry.cpp
+    src/core/error.cpp
+    src/core/backend_factory.cpp
+)
+
+set(GRANITE_GRAPH_SOURCES
+    src/graph/graph.cpp
+    src/graph/scheduler.cpp
+)
+
+# Placeholder sources (will be implemented)
+# For now, create stub files to allow compilation
+
+add_library(granite STATIC
+    ${GRANITE_CORE_SOURCES}
+    ${GRANITE_GRAPH_SOURCES}
+)
+
+target_include_directories(granite
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_link_libraries(granite
+    PUBLIC
+        glm::glm
+        spdlog::spdlog
+    PRIVATE
+        fmt::fmt
+)
+
+target_compile_definitions(granite PUBLIC
+    GRANITE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    GRANITE_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+    GRANITE_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+)
+
+# =============================================================================
+# Metal Backend (Apple only)
+# =============================================================================
+
+if(APPLE AND GRANITE_BUILD_METAL)
+    set(GRANITE_METAL_SOURCES
+        src/backend/metal/metal_backend.mm
+        src/backend/metal/metal_buffer.mm
+        src/backend/metal/metal_pipeline.mm
+    )
+
+    target_sources(granite PRIVATE ${GRANITE_METAL_SOURCES})
+
+    target_link_libraries(granite
+        PRIVATE
+            metal-cpp
+            "-framework Metal"
+            "-framework MetalKit"
+            "-framework Foundation"
+            "-framework QuartzCore"
+    )
+
+    target_compile_definitions(granite PUBLIC GRANITE_HAS_METAL=1)
+
+    # Enable ARC for Objective-C++ files
+    set_source_files_properties(${GRANITE_METAL_SOURCES} PROPERTIES
+        COMPILE_FLAGS "-fobjc-arc"
+    )
+endif()
+
+# =============================================================================
+# CPU Backend
+# =============================================================================
+
+if(GRANITE_BUILD_CPU)
+    set(GRANITE_CPU_SOURCES
+        src/backend/cpu/cpu_backend.cpp
+    )
+
+    target_sources(granite PRIVATE ${GRANITE_CPU_SOURCES})
+    target_compile_definitions(granite PUBLIC GRANITE_HAS_CPU=1)
+
+    # SIMD flags
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+        # ARM NEON is always available on arm64
+        target_compile_definitions(granite PRIVATE GRANITE_HAS_NEON=1)
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        # Check for AVX2 support
+        include(CheckCXXCompilerFlag)
+        check_cxx_compiler_flag("-mavx2" COMPILER_SUPPORTS_AVX2)
+        if(COMPILER_SUPPORTS_AVX2)
+            target_compile_options(granite PRIVATE -mavx2)
+            target_compile_definitions(granite PRIVATE GRANITE_HAS_AVX2=1)
+        endif()
+    endif()
+endif()
+
+# =============================================================================
+# Main executable (for development/testing)
+# =============================================================================
+
+add_executable(granite_main main.cpp)
+target_link_libraries(granite_main PRIVATE granite)
+
+# =============================================================================
+# Tests
+# =============================================================================
+
+if(GRANITE_BUILD_TESTS)
+    enable_testing()
+    include(CTest)
+    include(Catch)
+
+    add_executable(granite_tests
+        tests/test_main.cpp
+        tests/test_types.cpp
+        tests/test_tensor.cpp
+    )
+
+    target_link_libraries(granite_tests
+        PRIVATE
+            granite
+            Catch2::Catch2WithMain
+    )
+
+    catch_discover_tests(granite_tests)
+endif()
+
+# =============================================================================
+# Examples
+# =============================================================================
+
+if(GRANITE_BUILD_EXAMPLES)
+    add_executable(example_basic examples/basic.cpp)
+    target_link_libraries(example_basic PRIVATE granite)
+endif()
+
+# =============================================================================
+# Installation
+# =============================================================================
+
+install(TARGETS granite
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+)
+
+install(DIRECTORY include/granite
+    DESTINATION include
+)

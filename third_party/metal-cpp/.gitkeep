@@ -1,0 +1,11 @@
+# metal-cpp
+
+Download from: https://developer.apple.com/metal/cpp/
+
+Extract and place the following directories here:
+- Metal/
+- Foundation/
+- QuartzCore/
+- MetalKit/ (optional)
+
+Or run: ../scripts/download_metal_cpp.sh
