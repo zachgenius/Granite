@@ -1,0 +1,130 @@
+name: Granite CI
+
+on:
+  push:
+    branches: [master, main, develop]
+  pull_request:
+    branches: [master, main, develop]
+
+jobs:
+  # =============================================================================
+  # macOS Build (Metal + CPU backends)
+  # =============================================================================
+  build-macos:
+    name: macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14      # M1/M2/M3 (arm64)
+            arch: arm64
+          - runner: macos-13      # Intel (x86_64)
+            arch: x86_64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Download metal-cpp
+        run: ./scripts/download_metal_cpp.sh
+
+      - name: Configure CMake
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGRANITE_BUILD_TESTS=ON \
+            -DGRANITE_BUILD_EXAMPLES=ON
+
+      - name: Build
+        run: cmake --build build --parallel $(sysctl -n hw.ncpu)
+
+      - name: Run Tests
+        run: ctest --test-dir build --output-on-failure
+
+  # =============================================================================
+  # Linux Build (CPU backend only)
+  # =============================================================================
+  build-linux:
+    name: Linux (CPU)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake
+
+      - name: Configure CMake
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGRANITE_BUILD_METAL=OFF \
+            -DGRANITE_BUILD_CPU=ON \
+            -DGRANITE_BUILD_TESTS=ON \
+            -DGRANITE_BUILD_EXAMPLES=ON
+
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+
+      - name: Run Tests
+        run: ctest --test-dir build --output-on-failure
+
+  # =============================================================================
+  # Code Quality Checks
+  # =============================================================================
+  lint:
+    name: Lint & Format Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check clang-format
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format
+          # Find all C++ files and check formatting
+          find include src tests -name "*.cpp" -o -name "*.h" -o -name "*.hpp" -o -name "*.mm" | \
+            xargs clang-format --dry-run --Werror || echo "Formatting issues found (non-blocking)"
+        continue-on-error: true
+
+  # =============================================================================
+  # Release Build Verification
+  # =============================================================================
+  release-check:
+    name: Release Build Check
+    runs-on: macos-14
+    needs: [build-macos, build-linux]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Download metal-cpp
+        run: ./scripts/download_metal_cpp.sh
+
+      - name: Configure Release Build
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGRANITE_BUILD_TESTS=OFF \
+            -DGRANITE_BUILD_EXAMPLES=OFF
+
+      - name: Build Library Only
+        run: cmake --build build --target granite --parallel $(sysctl -n hw.ncpu)
+
+      - name: Check Library Size
+        run: |
+          echo "Library size:"
+          ls -lh build/libgranite.a

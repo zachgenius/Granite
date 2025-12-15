@@ -155,7 +155,9 @@ target_link_libraries(granite_main PRIVATE granite)
 
 if(GRANITE_BUILD_TESTS)
     enable_testing()
-    include(CTest)
+    # Note: We use Catch2's test discovery instead of full CTest/CDash integration
+    # to avoid cluttering the target list with Continuous*/Experimental*/Nightly* targets
+    set(CTEST_USE_LAUNCHERS OFF)
     include(Catch)
 
     add_executable(granite_tests
