@@ -603,10 +603,13 @@ Result<Tensor> TransformerModel::embed(const Tensor& token_ids) {
     auto* out = static_cast<float*>(map_out.value());
 
     // Embedding lookup
+    // GGUF stores embedding with ne0=hidden_dim (innermost), ne1=vocab_size
+    // This means token embeddings are contiguous: token t's embedding at t * hidden_dim
+    int vocab_size = config_.vocab_size;
     for (int b = 0; b < batch; b++) {
         for (int s = 0; s < seq_len; s++) {
             int token_id = ids[b * seq_len + s];
-            if (token_id < 0 || token_id >= config_.vocab_size) {
+            if (token_id < 0 || token_id >= vocab_size) {
                 token_id = 0;  // Fallback to first token
             }
 
@@ -624,6 +627,29 @@ Result<Tensor> TransformerModel::embed(const Tensor& token_ids) {
     backend_->unmap_buffer(output.buffer());
 
     return output;
+}
+
+// Helper to print tensor stats for debugging
+static void debug_tensor_stats(const std::string& name, const Tensor& t, IComputeBackend* backend) {
+    auto map_result = backend->map_buffer(t.buffer());
+    if (!map_result.ok()) return;
+
+    const float* data = static_cast<const float*>(map_result.value());
+    size_t count = 1;
+    for (size_t i = 0; i < t.shape().size(); i++) count *= t.shape()[i];
+
+    float min_val = data[0], max_val = data[0], sum = 0;
+    for (size_t i = 0; i < count; i++) {
+        min_val = std::min(min_val, data[i]);
+        max_val = std::max(max_val, data[i]);
+        sum += data[i];
+    }
+    float mean = sum / count;
+
+    GRANITE_LOG_INFO("DEBUG {}: min={:.4f}, max={:.4f}, mean={:.4f}, first5=[{:.4f}, {:.4f}, {:.4f}, {:.4f}, {:.4f}]",
+                     name, min_val, max_val, mean, data[0], data[1], data[2], data[3], data[4]);
+
+    backend->unmap_buffer(t.buffer());
 }
 
 Result<Tensor> TransformerModel::forward(
@@ -656,7 +682,8 @@ Result<Tensor> TransformerModel::forward(
 
         if (map_h.ok() && map_w.ok()) {
             auto* h = static_cast<float*>(map_h.value());
-            const auto* w = static_cast<const uint16_t*>(map_w.value());
+            const void* w = map_w.value();
+            DataType w_dtype = norm_weight->dtype();
 
             int batch = static_cast<int>(hidden.size(0));
             int seq_len = static_cast<int>(hidden.size(1));
@@ -674,9 +701,12 @@ Result<Tensor> TransformerModel::forward(
                     float rms = std::sqrt(sum_sq / dim + config_.rms_norm_eps);
                     float inv_rms = 1.0f / rms;
 
-                    // Normalize and scale
+                    // Normalize and scale (handle FP32 or FP16 weights)
                     for (int d = 0; d < dim; d++) {
-                        row[d] = row[d] * inv_rms * fp16_to_fp32(w[d]);
+                        float weight_val = (w_dtype == DataType::FP32)
+                            ? static_cast<const float*>(w)[d]
+                            : fp16_to_fp32(static_cast<const uint16_t*>(w)[d]);
+                        row[d] = row[d] * inv_rms * weight_val;
                     }
                 }
             }
@@ -727,6 +757,9 @@ Result<Tensor> TransformerModel::forward(
     int hidden_dim = config_.hidden_dim;
     int vocab_size = config_.vocab_size;
 
+    // Output weight shape: [vocab_size, hidden_dim] with ne0=hidden_dim
+    // weight[v, d] = w[v * hidden_dim + d]
+    // logits[v] = sum_d hidden[d] * weight[v, d]
     for (int b = 0; b < batch; b++) {
         for (int s = 0; s < seq_len; s++) {
             const float* h_row = h + (b * seq_len + s) * hidden_dim;
@@ -734,9 +767,8 @@ Result<Tensor> TransformerModel::forward(
 
             for (int v = 0; v < vocab_size; v++) {
                 float sum = 0;
-                const uint16_t* w_row = w + v * hidden_dim;
                 for (int d = 0; d < hidden_dim; d++) {
-                    sum += h_row[d] * fp16_to_fp32(w_row[d]);
+                    sum += h_row[d] * fp16_to_fp32(w[v * hidden_dim + d]);
                 }
                 l_row[v] = sum;
             }
@@ -798,11 +830,13 @@ Tensor TransformerModel::apply_rms_norm(const Tensor& input, const Tensor* weigh
     const float* in_data = static_cast<const float*>(map_in.value());
     float* out_data = static_cast<float*>(map_out.value());
 
-    const uint16_t* w_data = nullptr;
+    const void* w_data = nullptr;
+    DataType w_dtype = DataType::FP16;
     if (weight) {
         auto map_w = backend_->map_buffer(weight->buffer());
         if (map_w.ok()) {
-            w_data = static_cast<const uint16_t*>(map_w.value());
+            w_data = map_w.value();
+            w_dtype = weight->dtype();
         }
     }
 
@@ -823,7 +857,12 @@ Tensor TransformerModel::apply_rms_norm(const Tensor& input, const Tensor* weigh
             for (int d = 0; d < dim; d++) {
                 float val = row[d] * inv_rms;
                 if (w_data) {
-                    val *= fp16_to_fp32(w_data[d]);
+                    // Handle both FP16 and FP32 weights
+                    if (w_dtype == DataType::FP32) {
+                        val *= static_cast<const float*>(w_data)[d];
+                    } else {
+                        val *= fp16_to_fp32(static_cast<const uint16_t*>(w_data)[d]);
+                    }
                 }
                 out_row[d] = val;
             }
@@ -941,7 +980,8 @@ Result<Tensor> TransformerModel::transformer_block(
     auto ffn_output = std::move(ffn_result).take();
 
     // 6. Residual add: output = post_attn + ffn_output
-    return add_tensors(post_attn, ffn_output);
+    auto output = add_tensors(post_attn, ffn_output);
+    return output;
 }
 
 Result<Tensor> TransformerModel::attention(
@@ -1022,14 +1062,18 @@ Result<Tensor> TransformerModel::attention(
     const uint16_t* wk_data = static_cast<const uint16_t*>(map_wk.value());
     const uint16_t* wv_data = static_cast<const uint16_t*>(map_wv.value());
 
-    // Q projection: [batch, seq, hidden] @ [hidden, num_heads*head_dim] -> [batch, seq, num_heads, head_dim]
+    // Q projection: [batch, seq, hidden] @ W_q.T -> [batch, seq, num_heads * head_dim]
+    // GGUF weight shape: ne0=hidden_dim, ne1=q_out_dim -> Granite shape [q_out_dim, hidden_dim]
+    // Data: output i = sum_d input[d] * weight[i, d] where weight[i,d] = w[i * hidden_dim + d]
+    int q_out_dim = num_heads * head_dim;
+
     for (int b = 0; b < batch; b++) {
         for (int s = 0; s < seq_len; s++) {
             const float* h_row = h_data + (b * seq_len + s) * hidden_dim;
 
-            // Q
+            // Q - shape [q_out_dim, hidden_dim]
             float* q_row = q_data + (b * seq_len + s) * num_heads * head_dim;
-            for (int i = 0; i < num_heads * head_dim; i++) {
+            for (int i = 0; i < q_out_dim; i++) {
                 float sum = 0;
                 for (int d = 0; d < hidden_dim; d++) {
                     sum += h_row[d] * fp16_to_fp32(wq_data[i * hidden_dim + d]);
@@ -1037,7 +1081,7 @@ Result<Tensor> TransformerModel::attention(
                 q_row[i] = sum;
             }
 
-            // K
+            // K - shape [kv_dim, hidden_dim]
             float* k_row = k_data + (b * seq_len + s) * num_kv_heads * head_dim;
             for (int i = 0; i < kv_dim; i++) {
                 float sum = 0;
@@ -1047,7 +1091,7 @@ Result<Tensor> TransformerModel::attention(
                 k_row[i] = sum;
             }
 
-            // V
+            // V - shape [kv_dim, hidden_dim]
             float* v_row = v_data + (b * seq_len + s) * num_kv_heads * head_dim;
             for (int i = 0; i < kv_dim; i++) {
                 float sum = 0;
@@ -1064,15 +1108,17 @@ Result<Tensor> TransformerModel::attention(
     backend_->unmap_buffer(wk->buffer());
     backend_->unmap_buffer(wv->buffer());
 
+    // Unmap Q, K, V before RoPE (RoPE will remap them)
+    backend_->unmap_buffer(q.buffer());
+    backend_->unmap_buffer(k.buffer());
+    backend_->unmap_buffer(v.buffer());
+
     // Apply RoPE to Q and K
     auto rope_result = rope_cache_.apply(q, k, start_pos, backend_);
     if (!rope_result.ok()) {
         GRANITE_LOG_WARN("RoPE failed: {}", rope_result.error().message());
     }
-
-    backend_->unmap_buffer(q.buffer());
-    backend_->unmap_buffer(k.buffer());
-    backend_->unmap_buffer(v.buffer());
+    // Note: RoPE::apply unmaps Q and K internally
 
     // Update KV cache if provided
     if (kv_cache) {
@@ -1268,7 +1314,9 @@ Result<Tensor> TransformerModel::attention(
 
     // Output projection: context @ wo
     // context: [batch, seq, num_heads * head_dim]
-    // wo: [hidden_dim, num_heads * head_dim]
+    // wo shape: [hidden_dim, q_out_dim] with ne0=q_out_dim
+    // output[d] = sum_i context[i] * weight[d, i] where weight[d,i] = w[d * q_out_dim + i]
+    int q_out_dim2 = num_heads * head_dim;
     for (int b = 0; b < batch; b++) {
         for (int s = 0; s < seq_len; s++) {
             const float* ctx_row = context.data() + (b * seq_len + s) * num_heads * head_dim;
@@ -1277,7 +1325,7 @@ Result<Tensor> TransformerModel::attention(
             for (int d = 0; d < hidden_dim; d++) {
                 float sum = 0;
                 for (int i = 0; i < num_heads * head_dim; i++) {
-                    sum += ctx_row[i] * fp16_to_fp32(wo_data[d * num_heads * head_dim + i]);
+                    sum += ctx_row[i] * fp16_to_fp32(wo_data[d * q_out_dim2 + i]);
                 }
                 out_row[d] = sum;
             }
@@ -1308,6 +1356,7 @@ Result<Tensor> TransformerModel::feed_forward(const Tensor& hidden, int layer) {
     int hidden_dim = config_.hidden_dim;
     int intermediate_dim = config_.intermediate_dim;
 
+    // Debug: verify intermediate_dim matches weight shape
     // Allocate output
     std::vector<int64_t> output_shape = {
         static_cast<int64_t>(batch),
@@ -1348,6 +1397,8 @@ Result<Tensor> TransformerModel::feed_forward(const Tensor& hidden, int layer) {
 
             // gate = h @ w_gate.T
             // up = h @ w_up.T
+            // Weight shape: [intermediate_dim, hidden_dim] with ne0=hidden_dim
+            // weight[i, d] = w[i * hidden_dim + d]
             for (int i = 0; i < intermediate_dim; i++) {
                 float gate_sum = 0;
                 float up_sum = 0;
@@ -1362,6 +1413,8 @@ Result<Tensor> TransformerModel::feed_forward(const Tensor& hidden, int layer) {
             }
 
             // output = (gate * up) @ w_down.T
+            // Down weight shape: [hidden_dim, intermediate_dim] with ne0=intermediate_dim
+            // weight[d, i] = w[d * intermediate_dim + i]
             for (int d = 0; d < hidden_dim; d++) {
                 float sum = 0;
                 for (int i = 0; i < intermediate_dim; i++) {

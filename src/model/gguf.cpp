@@ -910,13 +910,24 @@ Result<Tensor> ModelLoader::dequantize_tensor(
 
         case GGMLType::Q4_K: {
             // Q4_K: 256 elements per super-block, 144 bytes per block
-            // Structure:
+            // Structure (matching GGML's block_q4_K):
             //   - d: fp16 scale (2 bytes)
             //   - dmin: fp16 min (2 bytes)
-            //   - scales: 12 bytes (6-bit scales and 4-bit mins for 8 sub-blocks)
+            //   - scales: 12 bytes (8 6-bit scales + 8 6-bit mins, packed)
             //   - qs: 128 bytes (4-bit quantized values)
             const uint8_t* src = static_cast<const uint8_t*>(data);
             size_t num_blocks = (numel + 255) / 256;
+
+            // Lambda to match GGML's get_scale_min_k4
+            auto get_scale_min_k4 = [](int j, const uint8_t* q, uint8_t& sc, uint8_t& m) {
+                if (j < 4) {
+                    sc = q[j] & 63;
+                    m = q[j + 4] & 63;
+                } else {
+                    sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+                    m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+                }
+            };
 
             for (size_t b = 0; b < num_blocks; b++) {
                 // Read global scales
@@ -926,74 +937,42 @@ Result<Tensor> ModelLoader::dequantize_tensor(
                 float d = fp16_to_fp32(d_bits);
                 float dmin = fp16_to_fp32(dmin_bits);
 
-                // Read packed scales (12 bytes = 8 * 6-bit scales + 8 * 4-bit mins)
                 const uint8_t* scales_ptr = src + 4;
-
-                // Extract 6-bit scales and 4-bit mins
-                // First 4 bytes contain lower 4 bits of scales
-                // Bytes 4-5 contain upper 2 bits of first 4 scales
-                // Bytes 6-7 contain upper 2 bits of last 4 scales
-                // Bytes 8-11 contain 4-bit mins
-                uint8_t scales[8];
-                uint8_t mins[8];
-
-                // Lower 4 bits of scales (bytes 0-3)
-                for (int j = 0; j < 4; j++) {
-                    scales[j * 2] = scales_ptr[j] & 0x3F;
-                    scales[j * 2 + 1] = scales_ptr[j] >> 6;
-                }
-
-                // Actually, the format is more complex. Let me use GGML's exact layout:
-                // scales_ptr[0..3]: lower 6 bits for scales 0-3 and mins 0-3
-                // scales_ptr[4..5]: bits 4-5 of scales 4-7
-                // scales_ptr[6..7]: bits 4-5 of mins 4-7
-                // This is getting complex - use GGML's reference
-
-                // Simplified interpretation based on GGML source:
-                // The 12 bytes encode 8 6-bit scales and 8 6-bit mins
-                for (int j = 0; j < 8; j++) {
-                    // Each scale and min is 6 bits, packed across the 12 bytes
-                    if (j < 4) {
-                        scales[j] = scales_ptr[j] & 63;
-                        scales[j + 4] = (scales_ptr[j + 4] & 0xF) | ((scales_ptr[j] >> 6) << 4);
-                    }
-                }
-
-                // Extract mins similarly
-                for (int j = 0; j < 4; j++) {
-                    mins[j] = scales_ptr[j + 4] >> 4;
-                    mins[j + 4] = scales_ptr[j + 8] >> 4;
-                }
-
-                // For a simpler implementation, use approximate decoding
-                // Each sub-block (32 elements) uses: d * scales[j] * (q - mins[j])
-                // But the exact packing is complex, so use the documented approach
-
-                // Fallback: simple 4-bit decode with global scale only
-                // This is approximate but will load the tensor
                 const uint8_t* qs = src + 16;  // After d, dmin, scales (4 + 12 = 16)
 
-                for (int j = 0; j < 8; j++) {
-                    // Each sub-block has 32 elements
-                    float sub_scale = d * static_cast<float>(scales[j]);
-                    float sub_min = dmin * static_cast<float>(mins[j]);
+                int is = 0;
+                // Process 256 elements in groups of 64 (4 iterations)
+                for (int j = 0; j < 256; j += 64) {
+                    uint8_t sc, m;
 
-                    for (int k = 0; k < 16; k++) {
-                        size_t idx = b * 256 + j * 32 + k * 2;
+                    // Get scale/min for first 32 elements (low nibble)
+                    get_scale_min_k4(is, scales_ptr, sc, m);
+                    float d1 = d * static_cast<float>(sc);
+                    float m1 = dmin * static_cast<float>(m);
+
+                    // Get scale/min for next 32 elements (high nibble)
+                    get_scale_min_k4(is + 1, scales_ptr, sc, m);
+                    float d2 = d * static_cast<float>(sc);
+                    float m2 = dmin * static_cast<float>(m);
+
+                    // Dequantize 32 elements using low nibble
+                    for (int l = 0; l < 32; l++) {
+                        size_t idx = b * 256 + j + l;
                         if (idx >= numel) break;
-
-                        uint8_t byte = qs[j * 16 + k];
-                        int8_t q0 = byte & 0xF;
-                        int8_t q1 = byte >> 4;
-
-                        float f0 = sub_scale * static_cast<float>(q0) - sub_min;
-                        float f1 = sub_scale * static_cast<float>(q1) - sub_min;
-
-                        output[idx] = fp32_to_fp16(f0);
-                        if (idx + 1 < numel) {
-                            output[idx + 1] = fp32_to_fp16(f1);
-                        }
+                        float val = d1 * static_cast<float>(qs[l] & 0xF) - m1;
+                        output[idx] = fp32_to_fp16(val);
                     }
+
+                    // Dequantize 32 elements using high nibble
+                    for (int l = 0; l < 32; l++) {
+                        size_t idx = b * 256 + j + 32 + l;
+                        if (idx >= numel) break;
+                        float val = d2 * static_cast<float>(qs[l] >> 4) - m2;
+                        output[idx] = fp32_to_fp16(val);
+                    }
+
+                    qs += 32;
+                    is += 2;
                 }
 
                 src += 144;  // Move to next block
@@ -1001,46 +980,49 @@ Result<Tensor> ModelLoader::dequantize_tensor(
             break;
         }
 
+
         case GGMLType::Q6_K: {
             // Q6_K: 256 elements per super-block, 210 bytes per block
-            // Structure:
+            // Structure (matching GGML's block_q6_K):
             //   - ql: 128 bytes (lower 4 bits)
             //   - qh: 64 bytes (upper 2 bits)
-            //   - scales: 16 bytes (8-bit scales for 16 sub-blocks)
+            //   - scales: 16 bytes (8-bit signed scales)
             //   - d: fp16 scale (2 bytes)
             const uint8_t* src = static_cast<const uint8_t*>(data);
             size_t num_blocks = (numel + 255) / 256;
 
-            for (size_t b = 0; b < num_blocks; b++) {
+            for (size_t blk = 0; blk < num_blocks; blk++) {
                 const uint8_t* ql = src;           // 128 bytes
                 const uint8_t* qh = src + 128;     // 64 bytes
-                const int8_t* scales = reinterpret_cast<const int8_t*>(src + 192);  // 16 bytes
+                const int8_t* sc = reinterpret_cast<const int8_t*>(src + 192);  // 16 bytes
                 uint16_t d_bits;
                 memcpy(&d_bits, src + 208, 2);
                 float d = fp16_to_fp32(d_bits);
 
-                // Q6_K has 16 sub-blocks of 16 elements each
-                for (int j = 0; j < 16; j++) {
-                    float sub_scale = d * static_cast<float>(scales[j]);
+                // Process 256 elements in two passes of 128
+                for (int n = 0; n < 256; n += 128) {
+                    for (int l = 0; l < 32; l++) {
+                        int is = l / 16;  // Scale index base
 
-                    for (int k = 0; k < 16; k++) {
-                        size_t idx = b * 256 + j * 16 + k;
-                        if (idx >= numel) break;
+                        // Extract 4 6-bit values
+                        int8_t q1 = static_cast<int8_t>((ql[l + 0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                        int8_t q2 = static_cast<int8_t>((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                        int8_t q3 = static_cast<int8_t>((ql[l + 0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                        int8_t q4 = static_cast<int8_t>((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
 
-                        // Get lower 4 bits
-                        int l_idx = (j / 2) * 16 + k;
-                        uint8_t l = (j % 2 == 0) ? (ql[l_idx] & 0xF) : (ql[l_idx] >> 4);
-
-                        // Get upper 2 bits (more complex packing)
-                        int h_idx = (j / 4) * 16 + k;
-                        int h_shift = ((j % 4) * 2);
-                        uint8_t h = (qh[h_idx] >> h_shift) & 0x3;
-
-                        // Combine to 6-bit value
-                        int8_t q = static_cast<int8_t>((l | (h << 4)) - 32);
-
-                        output[idx] = fp32_to_fp16(sub_scale * static_cast<float>(q));
+                        size_t base_idx = blk * 256 + n;
+                        if (base_idx + l < numel)
+                            output[base_idx + l + 0] = fp32_to_fp16(d * static_cast<float>(sc[is + 0]) * static_cast<float>(q1));
+                        if (base_idx + l + 32 < numel)
+                            output[base_idx + l + 32] = fp32_to_fp16(d * static_cast<float>(sc[is + 2]) * static_cast<float>(q2));
+                        if (base_idx + l + 64 < numel)
+                            output[base_idx + l + 64] = fp32_to_fp16(d * static_cast<float>(sc[is + 4]) * static_cast<float>(q3));
+                        if (base_idx + l + 96 < numel)
+                            output[base_idx + l + 96] = fp32_to_fp16(d * static_cast<float>(sc[is + 6]) * static_cast<float>(q4));
                     }
+                    ql += 64;
+                    qh += 32;
+                    sc += 8;
                 }
 
                 src += 210;
