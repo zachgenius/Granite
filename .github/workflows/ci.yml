@@ -11,16 +11,8 @@ jobs:
   # macOS Build (Metal + CPU backends)
   # =============================================================================
   build-macos:
-    name: macOS (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-14      # M1/M2/M3 (arm64)
-            arch: arm64
-          - runner: macos-13      # Intel (x86_64)
-            arch: x86_64
+    name: macOS (arm64)
+    runs-on: macos-14  # Apple Silicon (arm64) - Intel runners retired
 
     steps:
       - name: Checkout
