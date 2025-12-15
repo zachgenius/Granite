@@ -1,4 +1,5 @@
 #include "granite/backend.h"
+#include "granite/operators.h"
 #include "granite/log.h"
 
 namespace granite {
@@ -26,6 +27,9 @@ extern std::unique_ptr<IComputeBackend> create_vulkan_backend();
 #endif
 
 std::unique_ptr<IComputeBackend> create_backend(BackendType type) {
+    // Initialize operators on first backend creation
+    initialize_operators();
+
     switch (type) {
         case BackendType::CPU:
 #ifdef GRANITE_HAS_CPU

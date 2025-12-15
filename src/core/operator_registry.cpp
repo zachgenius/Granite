@@ -291,4 +291,42 @@ Result<Tensor> rms_norm(const Tensor& x, const Tensor& weight, float eps) {
 
 }  // namespace ops
 
+// =============================================================================
+// Operator Initialization
+// =============================================================================
+
+// Weak symbols - defined in backend-specific files if available
+#ifdef GRANITE_HAS_CPU
+// Defined in src/operators/cpu/cpu_operators.cpp
+#else
+void register_cpu_operators() {}
+#endif
+
+#ifdef GRANITE_HAS_METAL
+// Defined in src/operators/metal/metal_operators.mm
+#else
+void register_metal_operators() {}
+#endif
+
+namespace {
+    bool operators_initialized = false;
+}
+
+void initialize_operators() {
+    if (operators_initialized) {
+        return;
+    }
+
+#ifdef GRANITE_HAS_CPU
+    register_cpu_operators();
+#endif
+
+#ifdef GRANITE_HAS_METAL
+    register_metal_operators();
+#endif
+
+    operators_initialized = true;
+    GRANITE_LOG_DEBUG("Operators initialized");
+}
+
 }  // namespace granite

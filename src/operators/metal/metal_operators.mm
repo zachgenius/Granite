@@ -680,14 +680,28 @@ public:
 // Register Operators
 // =============================================================================
 
-GRANITE_REGISTER_OP(Add, Metal, MetalBinaryOp<OpType::Add>);
-GRANITE_REGISTER_OP(Sub, Metal, MetalBinaryOp<OpType::Sub>);
-GRANITE_REGISTER_OP(Mul, Metal, MetalBinaryOp<OpType::Mul>);
-GRANITE_REGISTER_OP(Div, Metal, MetalBinaryOp<OpType::Div>);
-GRANITE_REGISTER_OP(ReLU, Metal, MetalUnaryOp<OpType::ReLU>);
-GRANITE_REGISTER_OP(GELU, Metal, MetalUnaryOp<OpType::GELU>);
-GRANITE_REGISTER_OP(SiLU, Metal, MetalUnaryOp<OpType::SiLU>);
-GRANITE_REGISTER_OP(MatMul, Metal, MetalMatMulOp);
+void register_metal_operators() {
+    auto& registry = OperatorRegistry::instance();
+
+    registry.register_op(OpType::Add, BackendType::Metal,
+                        []() { return std::make_unique<MetalBinaryOp<OpType::Add>>(); });
+    registry.register_op(OpType::Sub, BackendType::Metal,
+                        []() { return std::make_unique<MetalBinaryOp<OpType::Sub>>(); });
+    registry.register_op(OpType::Mul, BackendType::Metal,
+                        []() { return std::make_unique<MetalBinaryOp<OpType::Mul>>(); });
+    registry.register_op(OpType::Div, BackendType::Metal,
+                        []() { return std::make_unique<MetalBinaryOp<OpType::Div>>(); });
+    registry.register_op(OpType::ReLU, BackendType::Metal,
+                        []() { return std::make_unique<MetalUnaryOp<OpType::ReLU>>(); });
+    registry.register_op(OpType::GELU, BackendType::Metal,
+                        []() { return std::make_unique<MetalUnaryOp<OpType::GELU>>(); });
+    registry.register_op(OpType::SiLU, BackendType::Metal,
+                        []() { return std::make_unique<MetalUnaryOp<OpType::SiLU>>(); });
+    registry.register_op(OpType::MatMul, BackendType::Metal,
+                        []() { return std::make_unique<MetalMatMulOp>(); });
+
+    GRANITE_LOG_DEBUG("Registered Metal operators");
+}
 
 }  // namespace granite
 

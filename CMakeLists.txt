@@ -121,6 +121,7 @@ endif()
 if(GRANITE_BUILD_CPU)
     set(GRANITE_CPU_SOURCES
         src/backend/cpu/cpu_backend.cpp
+        src/operators/cpu/cpu_operators.cpp
     )
 
     target_sources(granite PRIVATE ${GRANITE_CPU_SOURCES})
@@ -161,6 +162,7 @@ if(GRANITE_BUILD_TESTS)
         tests/test_main.cpp
         tests/test_types.cpp
         tests/test_tensor.cpp
+        tests/test_operators.cpp
     )
 
     target_link_libraries(granite_tests

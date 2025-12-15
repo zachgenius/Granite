@@ -268,6 +268,19 @@ private:
     }()
 
 // =============================================================================
+// Backend-specific registration functions
+// =============================================================================
+
+/// Register CPU operators (called automatically during initialization)
+void register_cpu_operators();
+
+/// Register Metal operators (called automatically during initialization)
+void register_metal_operators();
+
+/// Initialize all available operators
+void initialize_operators();
+
+// =============================================================================
 // Functional API (convenience functions)
 // =============================================================================
 
