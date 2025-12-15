@@ -92,6 +92,7 @@ if(APPLE AND GRANITE_BUILD_METAL)
         src/backend/metal/metal_backend.mm
         src/backend/metal/metal_buffer.mm
         src/backend/metal/metal_pipeline.mm
+        src/operators/metal/metal_operators.mm
     )
 
     target_sources(granite PRIVATE ${GRANITE_METAL_SOURCES})
