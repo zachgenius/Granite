@@ -424,8 +424,16 @@ std::string Tokenizer::decode_token(int32_t token) const {
     }
     if (token >= 0 && token < static_cast<int32_t>(vocab_.size())) {
         const std::string& tok = vocab_[token];
-        // Handle special tokens like "▁" (sentencepiece space)
         std::string result = tok;
+
+        // Handle byte tokens like "<0x20>" -> space
+        if (result.size() == 6 && result.substr(0, 3) == "<0x" && result[5] == '>') {
+            std::string hex = result.substr(3, 2);
+            int byte_val = std::stoi(hex, nullptr, 16);
+            return std::string(1, static_cast<char>(byte_val));
+        }
+
+        // Handle special tokens like "▁" (sentencepiece space)
         size_t pos = 0;
         while ((pos = result.find("▁", pos)) != std::string::npos) {
             result.replace(pos, 3, " ");  // "▁" is 3 bytes in UTF-8
@@ -488,8 +496,10 @@ Result<ModelConfig> parse_model_config(const GGUFFile& gguf) {
     }
 
     // Vocab size from embedding tensor
+    // Shape is [hidden_dim, vocab_size] in GGUF format
     if (auto* emb = gguf.find_tensor("token_embd.weight")) {
-        config.vocab_size = static_cast<int>(emb->dimensions[0]);
+        // Use the larger dimension as vocab_size
+        config.vocab_size = static_cast<int>(std::max(emb->dimensions[0], emb->dimensions[1]));
     }
 
     // Compute derived values
