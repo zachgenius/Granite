@@ -23,6 +23,10 @@
 #include "granite/backend.h"
 #include "granite/tensor.h"
 #include "granite/operators.h"
+#include "granite/graph.h"
+#include "granite/memory.h"
+#include "granite/scheduler.h"
+#include "granite/optimization.h"
 #include "granite/log.h"
 
 namespace granite {

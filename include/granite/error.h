@@ -41,6 +41,11 @@ enum class ErrorCode {
     InvalidArgument,
     NullPointer,
 
+    // Graph errors
+    InvalidGraph,
+    CycleDetected,
+    InvalidState,
+
     // Model errors
     UnsupportedModel,
     CorruptedWeights,
@@ -72,6 +77,9 @@ constexpr const char* error_code_name(ErrorCode code) {
         case ErrorCode::DTypeMismatch:        return "DTypeMismatch";
         case ErrorCode::InvalidArgument:      return "InvalidArgument";
         case ErrorCode::NullPointer:          return "NullPointer";
+        case ErrorCode::InvalidGraph:         return "InvalidGraph";
+        case ErrorCode::CycleDetected:        return "CycleDetected";
+        case ErrorCode::InvalidState:         return "InvalidState";
         case ErrorCode::UnsupportedModel:     return "UnsupportedModel";
         case ErrorCode::CorruptedWeights:     return "CorruptedWeights";
         case ErrorCode::MissingOperator:      return "MissingOperator";

@@ -52,6 +52,7 @@ set(GRANITE_CORE_SOURCES
 set(GRANITE_GRAPH_SOURCES
     src/graph/graph.cpp
     src/graph/scheduler.cpp
+    src/graph/optimization.cpp
 )
 
 # Placeholder sources (will be implemented)
@@ -165,6 +166,10 @@ if(GRANITE_BUILD_TESTS)
         tests/test_types.cpp
         tests/test_tensor.cpp
         tests/test_operators.cpp
+        tests/test_graph.cpp
+        tests/test_memory.cpp
+        tests/test_scheduler.cpp
+        tests/test_optimization.cpp
     )
 
     target_link_libraries(granite_tests
