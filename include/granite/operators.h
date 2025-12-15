@@ -48,6 +48,7 @@ enum class OpType : uint32_t {
     // Matrix operations
     MatMul,
     BatchMatMul,
+    QuantizedMatMul,  // MatMul with quantized weights (dequantize on-the-fly)
 
     // Convolution
     Conv2D,
@@ -107,6 +108,7 @@ constexpr const char* op_type_name(OpType op) {
         case OpType::Softmax: return "Softmax";
         case OpType::MatMul: return "MatMul";
         case OpType::BatchMatMul: return "BatchMatMul";
+        case OpType::QuantizedMatMul: return "QuantizedMatMul";
         case OpType::Conv2D: return "Conv2D";
         case OpType::DepthwiseConv2D: return "DepthwiseConv2D";
         case OpType::ConvTranspose2D: return "ConvTranspose2D";

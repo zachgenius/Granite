@@ -1,9 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
-project(Granite VERSION 0.1.0 LANGUAGES CXX OBJCXX)
+project(Granite VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# Enable Objective-C++ only on Apple platforms (required for Metal backend)
+if(APPLE)
+    enable_language(OBJCXX)
+endif()
 
 # Options
 option(GRANITE_BUILD_METAL "Build Metal backend (Apple only)" ON)
@@ -55,12 +60,17 @@ set(GRANITE_GRAPH_SOURCES
     src/graph/optimization.cpp
 )
 
+set(GRANITE_MODEL_SOURCES
+    src/model/gguf.cpp
+)
+
 # Placeholder sources (will be implemented)
 # For now, create stub files to allow compilation
 
 add_library(granite STATIC
     ${GRANITE_CORE_SOURCES}
     ${GRANITE_GRAPH_SOURCES}
+    ${GRANITE_MODEL_SOURCES}
 )
 
 target_include_directories(granite
@@ -170,6 +180,7 @@ if(GRANITE_BUILD_TESTS)
         tests/test_memory.cpp
         tests/test_scheduler.cpp
         tests/test_optimization.cpp
+        tests/test_gguf.cpp
     )
 
     target_link_libraries(granite_tests
