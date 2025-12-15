@@ -71,9 +71,10 @@ enum class OpType : uint32_t {
     ScaledDotProductAttention,
     MultiHeadAttention,
 
-    // Embedding
+    // Embedding & Position
     Embedding,
-    RoPE,  // Rotary Position Embedding
+    RoPE,           // Rotary Position Embedding
+    CausalMask,     // Generate causal attention mask
 
     // Quantization
     Quantize,
@@ -124,6 +125,7 @@ constexpr const char* op_type_name(OpType op) {
         case OpType::MultiHeadAttention: return "MultiHeadAttention";
         case OpType::Embedding: return "Embedding";
         case OpType::RoPE: return "RoPE";
+        case OpType::CausalMask: return "CausalMask";
         case OpType::Quantize: return "Quantize";
         case OpType::Dequantize: return "Dequantize";
         case OpType::Custom: return "Custom";

@@ -28,6 +28,7 @@
 #include "granite/scheduler.h"
 #include "granite/optimization.h"
 #include "granite/gguf.h"
+#include "granite/llm.h"
 #include "granite/log.h"
 
 namespace granite {

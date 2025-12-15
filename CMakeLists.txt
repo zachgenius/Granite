@@ -64,6 +64,10 @@ set(GRANITE_MODEL_SOURCES
     src/model/gguf.cpp
 )
 
+set(GRANITE_LLM_SOURCES
+    src/llm/llm.cpp
+)
+
 # Placeholder sources (will be implemented)
 # For now, create stub files to allow compilation
 
@@ -71,6 +75,7 @@ add_library(granite STATIC
     ${GRANITE_CORE_SOURCES}
     ${GRANITE_GRAPH_SOURCES}
     ${GRANITE_MODEL_SOURCES}
+    ${GRANITE_LLM_SOURCES}
 )
 
 target_include_directories(granite
@@ -181,6 +186,7 @@ if(GRANITE_BUILD_TESTS)
         tests/test_scheduler.cpp
         tests/test_optimization.cpp
         tests/test_gguf.cpp
+        tests/test_llm.cpp
     )
 
     target_link_libraries(granite_tests
