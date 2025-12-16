@@ -85,6 +85,52 @@ public:
     );
 
     // =============================================================================
+    // LLM Operations - Q4_0 Quantized Matrix Multiply
+    // =============================================================================
+
+    // y = x @ W^T where W is Q4_0 quantized
+    Result<void> matvec_q4_0(
+        MTL::Buffer* x,      // Input [K] float
+        MTL::Buffer* W,      // Weights [N, K/32] Q4_0 blocks (18 bytes each)
+        MTL::Buffer* y,      // Output [N] float
+        uint32_t K,          // Input dimension
+        uint32_t N           // Output dimension
+    );
+
+    // Y = X @ W^T where W is Q4_0 quantized (batched)
+    Result<void> matmul_q4_0(
+        MTL::Buffer* X,      // Input [M, K] float
+        MTL::Buffer* W,      // Weights [N, K/32] Q4_0 blocks
+        MTL::Buffer* Y,      // Output [M, N] float
+        uint32_t M,          // Batch size (number of tokens)
+        uint32_t K,          // Input dimension
+        uint32_t N           // Output dimension
+    );
+
+    // =============================================================================
+    // LLM Operations - Q6_K Quantized Matrix Multiply
+    // =============================================================================
+
+    // y = x @ W^T where W is Q6_K quantized
+    Result<void> matvec_q6_k(
+        MTL::Buffer* x,      // Input [K] float
+        MTL::Buffer* W,      // Weights [N, K/256] Q6_K blocks (210 bytes each)
+        MTL::Buffer* y,      // Output [N] float
+        uint32_t K,          // Input dimension
+        uint32_t N           // Output dimension
+    );
+
+    // Y = X @ W^T where W is Q6_K quantized (batched)
+    Result<void> matmul_q6_k(
+        MTL::Buffer* X,      // Input [M, K] float
+        MTL::Buffer* W,      // Weights [N, K/256] Q6_K blocks
+        MTL::Buffer* Y,      // Output [M, N] float
+        uint32_t M,          // Batch size (number of tokens)
+        uint32_t K,          // Input dimension
+        uint32_t N           // Output dimension
+    );
+
+    // =============================================================================
     // LLM Operations - FP16/FP32 Matrix Multiply
     // =============================================================================
 
@@ -171,6 +217,28 @@ public:
         MTL::Buffer* x,           // Input [K] float
         MTL::Buffer* norm_weight, // RMSNorm weight [K] half
         MTL::Buffer* W,           // Q8_0 weights [N, K/32] blocks
+        MTL::Buffer* y,           // Output [N] float
+        uint32_t K,               // Input dimension
+        uint32_t N,               // Output dimension
+        float eps                 // RMSNorm epsilon
+    );
+
+    // Fused RMSNorm + Q4_0 MatVec: y = RMSNorm(x, weight) @ W^T
+    Result<void> rms_norm_matvec_q4_0(
+        MTL::Buffer* x,           // Input [K] float
+        MTL::Buffer* norm_weight, // RMSNorm weight [K] half
+        MTL::Buffer* W,           // Q4_0 weights [N, K/32] blocks
+        MTL::Buffer* y,           // Output [N] float
+        uint32_t K,               // Input dimension
+        uint32_t N,               // Output dimension
+        float eps                 // RMSNorm epsilon
+    );
+
+    // Fused RMSNorm + Q6_K MatVec: y = RMSNorm(x, weight) @ W^T
+    Result<void> rms_norm_matvec_q6_k(
+        MTL::Buffer* x,           // Input [K] float
+        MTL::Buffer* norm_weight, // RMSNorm weight [K] half
+        MTL::Buffer* W,           // Q6_K weights [N, K/256] blocks
         MTL::Buffer* y,           // Output [N] float
         uint32_t K,               // Input dimension
         uint32_t N,               // Output dimension
