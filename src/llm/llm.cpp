@@ -8,6 +8,21 @@
 #include <random>
 #include <cstring>
 #include <unordered_set>
+#include <thread>
+#include <vector>
+
+#ifdef GRANITE_HAS_ACCELERATE
+#include <Accelerate/Accelerate.h>
+#endif
+
+#ifdef GRANITE_HAS_OPENMP
+#include <omp.h>
+#endif
+
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>
+#define USE_GCD 1
+#endif
 
 namespace granite {
 
@@ -57,6 +72,127 @@ inline uint16_t fp32_to_fp16(float f) {
 
 // Thread-local RNG for sampling
 thread_local std::mt19937 g_rng{std::random_device{}()};
+
+// =============================================================================
+// Optimized Matrix Operations
+// =============================================================================
+
+// Simple parallel for using std::thread (portable)
+template<typename Func>
+inline void parallel_for(size_t n, size_t num_threads, Func&& f) {
+    if (num_threads <= 1 || n < num_threads) {
+        for (size_t i = 0; i < n; i++) {
+            f(i);
+        }
+        return;
+    }
+
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads);
+    size_t chunk_size = (n + num_threads - 1) / num_threads;
+
+    for (size_t t = 0; t < num_threads; t++) {
+        size_t start = t * chunk_size;
+        size_t end = std::min(start + chunk_size, n);
+        if (start >= n) break;
+
+        threads.emplace_back([&f, start, end]() {
+            for (size_t i = start; i < end; i++) {
+                f(i);
+            }
+        });
+    }
+
+    for (auto& th : threads) {
+        th.join();
+    }
+}
+
+// Get number of hardware threads
+inline size_t get_num_threads() {
+    return std::thread::hardware_concurrency();
+}
+
+// Convert FP16 array to FP32 (for weight pre-processing)
+inline void fp16_to_fp32_array(const uint16_t* src, float* dst, size_t n) {
+    size_t num_threads = get_num_threads();
+    parallel_for(n, num_threads, [src, dst](size_t i) {
+        dst[i] = fp16_to_fp32(src[i]);
+    });
+}
+
+// Optimized matrix multiply: C = A @ B^T
+// A: [M, K], B: [N, K] (transposed), C: [M, N]
+inline void matmul_transb(
+    const float* A, const float* B, float* C,
+    int M, int N, int K)
+{
+#ifdef GRANITE_HAS_ACCELERATE
+    // Use Apple's BLAS: C = alpha * A * B^T + beta * C
+    // cblas_sgemm(order, transA, transB, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc)
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                M, N, K,
+                1.0f, A, K,    // A is [M, K], lda = K
+                B, K,          // B is [N, K], ldb = K (but transposed)
+                0.0f, C, N);   // C is [M, N], ldc = N
+#else
+    // Fallback: naive implementation with OpenMP
+    #ifdef GRANITE_HAS_OPENMP
+    #pragma omp parallel for collapse(2)
+    #endif
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float sum = 0;
+            for (int k = 0; k < K; k++) {
+                sum += A[m * K + k] * B[n * K + k];
+            }
+            C[m * N + n] = sum;
+        }
+    }
+#endif
+}
+
+// Optimized matrix multiply with FP16 B matrix: C = A @ B^T
+// Converts B from FP16 on-the-fly (for when we can't pre-convert)
+inline void matmul_transb_fp16(
+    const float* A, const uint16_t* B_fp16, float* C,
+    int M, int N, int K)
+{
+    // For small M (single token), convert B to FP32 and use BLAS
+    // This is faster than element-wise conversion in inner loop
+    if (M <= 4) {
+        std::vector<float> B_fp32(N * K);
+        fp16_to_fp32_array(B_fp16, B_fp32.data(), N * K);
+        matmul_transb(A, B_fp32.data(), C, M, N, K);
+        return;
+    }
+
+    // For larger M, still convert and use BLAS (it's worth it)
+    std::vector<float> B_fp32(N * K);
+    fp16_to_fp32_array(B_fp16, B_fp32.data(), N * K);
+    matmul_transb(A, B_fp32.data(), C, M, N, K);
+}
+
+// SiLU activation: x * sigmoid(x)
+inline void silu_inplace(float* x, int n) {
+#ifdef GRANITE_HAS_OPENMP
+    #pragma omp parallel for
+#endif
+    for (int i = 0; i < n; i++) {
+        float val = x[i];
+        x[i] = val / (1.0f + std::exp(-val));
+    }
+}
+
+// Element-wise multiply: c = a * b
+inline void elementwise_mul(const float* a, const float* b, float* c, int n) {
+#ifdef GRANITE_HAS_OPENMP
+    #pragma omp parallel for
+#endif
+    for (int i = 0; i < n; i++) {
+        c[i] = a[i] * b[i];
+    }
+}
 
 }  // namespace
 
@@ -756,24 +892,11 @@ Result<Tensor> TransformerModel::forward(
 
     int hidden_dim = config_.hidden_dim;
     int vocab_size = config_.vocab_size;
+    int total_tokens = batch * seq_len;
 
-    // Output weight shape: [vocab_size, hidden_dim] with ne0=hidden_dim
-    // weight[v, d] = w[v * hidden_dim + d]
-    // logits[v] = sum_d hidden[d] * weight[v, d]
-    for (int b = 0; b < batch; b++) {
-        for (int s = 0; s < seq_len; s++) {
-            const float* h_row = h + (b * seq_len + s) * hidden_dim;
-            float* l_row = l + (b * seq_len + s) * vocab_size;
-
-            for (int v = 0; v < vocab_size; v++) {
-                float sum = 0;
-                for (int d = 0; d < hidden_dim; d++) {
-                    sum += h_row[d] * fp16_to_fp32(w[v * hidden_dim + d]);
-                }
-                l_row[v] = sum;
-            }
-        }
-    }
+    // Use optimized BLAS matmul: logits = hidden @ output_weight.T
+    // Output weight shape: [vocab_size, hidden_dim]
+    matmul_transb_fp16(h, w, l, total_tokens, vocab_size, hidden_dim);
 
     backend_->unmap_buffer(hidden.buffer());
     backend_->unmap_buffer(output_weight->buffer());
@@ -1062,46 +1185,19 @@ Result<Tensor> TransformerModel::attention(
     const uint16_t* wk_data = static_cast<const uint16_t*>(map_wk.value());
     const uint16_t* wv_data = static_cast<const uint16_t*>(map_wv.value());
 
-    // Q projection: [batch, seq, hidden] @ W_q.T -> [batch, seq, num_heads * head_dim]
-    // GGUF weight shape: ne0=hidden_dim, ne1=q_out_dim -> Granite shape [q_out_dim, hidden_dim]
-    // Data: output i = sum_d input[d] * weight[i, d] where weight[i,d] = w[i * hidden_dim + d]
+    // Use optimized BLAS for Q, K, V projections
+    // Q projection: [batch*seq, hidden] @ W_q.T -> [batch*seq, q_out_dim]
+    int total_tokens = batch * seq_len;
     int q_out_dim = num_heads * head_dim;
 
-    for (int b = 0; b < batch; b++) {
-        for (int s = 0; s < seq_len; s++) {
-            const float* h_row = h_data + (b * seq_len + s) * hidden_dim;
+    // Q = hidden @ W_q^T
+    matmul_transb_fp16(h_data, wq_data, q_data, total_tokens, q_out_dim, hidden_dim);
 
-            // Q - shape [q_out_dim, hidden_dim]
-            float* q_row = q_data + (b * seq_len + s) * num_heads * head_dim;
-            for (int i = 0; i < q_out_dim; i++) {
-                float sum = 0;
-                for (int d = 0; d < hidden_dim; d++) {
-                    sum += h_row[d] * fp16_to_fp32(wq_data[i * hidden_dim + d]);
-                }
-                q_row[i] = sum;
-            }
+    // K = hidden @ W_k^T
+    matmul_transb_fp16(h_data, wk_data, k_data, total_tokens, kv_dim, hidden_dim);
 
-            // K - shape [kv_dim, hidden_dim]
-            float* k_row = k_data + (b * seq_len + s) * num_kv_heads * head_dim;
-            for (int i = 0; i < kv_dim; i++) {
-                float sum = 0;
-                for (int d = 0; d < hidden_dim; d++) {
-                    sum += h_row[d] * fp16_to_fp32(wk_data[i * hidden_dim + d]);
-                }
-                k_row[i] = sum;
-            }
-
-            // V - shape [kv_dim, hidden_dim]
-            float* v_row = v_data + (b * seq_len + s) * num_kv_heads * head_dim;
-            for (int i = 0; i < kv_dim; i++) {
-                float sum = 0;
-                for (int d = 0; d < hidden_dim; d++) {
-                    sum += h_row[d] * fp16_to_fp32(wv_data[i * hidden_dim + d]);
-                }
-                v_row[i] = sum;
-            }
-        }
-    }
+    // V = hidden @ W_v^T
+    matmul_transb_fp16(h_data, wv_data, v_data, total_tokens, kv_dim, hidden_dim);
 
     backend_->unmap_buffer(hidden.buffer());
     backend_->unmap_buffer(wq->buffer());
@@ -1246,63 +1342,68 @@ Result<Tensor> TransformerModel::attention(
         total_seq = seq_len;
     }
 
-    // Compute attention for each head
+    // Compute attention for each head (parallelized)
     int heads_per_kv = num_heads / num_kv_heads;  // For GQA
 
     // Temporary buffer for context vectors
     std::vector<float> context(batch * seq_len * num_heads * head_dim);
 
-    for (int b = 0; b < batch; b++) {
-        for (int h = 0; h < num_heads; h++) {
-            int kv_h = h / heads_per_kv;  // GQA: which KV head to use
+    // Parallelize over batch * num_heads * seq_len
+    int total_work = batch * num_heads * seq_len;
+    size_t num_threads = get_num_threads();
 
-            for (int q_pos = 0; q_pos < seq_len; q_pos++) {
-                // Current query position in the full sequence
-                int abs_pos = start_pos + q_pos;
+    parallel_for(static_cast<size_t>(total_work), num_threads, [&](size_t work_idx_u) {
+        int work_idx = static_cast<int>(work_idx_u);
+        int b = work_idx / (num_heads * seq_len);
+        int rem = work_idx % (num_heads * seq_len);
+        int h = rem / seq_len;
+        int q_pos = rem % seq_len;
 
-                // Compute attention scores
-                std::vector<float> scores(total_seq);
-                const float* q_vec = q_data + (b * seq_len + q_pos) * num_heads * head_dim + h * head_dim;
+        int kv_h = h / heads_per_kv;  // GQA: which KV head to use
+        int abs_pos = start_pos + q_pos;
 
-                for (int k_pos = 0; k_pos < total_seq; k_pos++) {
-                    // Causal mask: can only attend to positions <= current
-                    if (k_pos > abs_pos) {
-                        scores[k_pos] = -std::numeric_limits<float>::infinity();
-                    } else {
-                        const float* k_vec = k_all + k_pos * num_kv_heads * head_dim + kv_h * head_dim;
-                        float dot = 0;
-                        for (int d = 0; d < head_dim; d++) {
-                            dot += q_vec[d] * k_vec[d];
-                        }
-                        scores[k_pos] = dot * scale;
-                    }
+        // Thread-local scores buffer
+        std::vector<float> scores(total_seq);
+        const float* q_vec = q_data + (b * seq_len + q_pos) * num_heads * head_dim + h * head_dim;
+
+        // Compute attention scores
+        for (int k_pos = 0; k_pos < total_seq; k_pos++) {
+            if (k_pos > abs_pos) {
+                scores[k_pos] = -std::numeric_limits<float>::infinity();
+            } else {
+                const float* k_vec = k_all + k_pos * num_kv_heads * head_dim + kv_h * head_dim;
+                float dot = 0;
+                for (int d = 0; d < head_dim; d++) {
+                    dot += q_vec[d] * k_vec[d];
                 }
-
-                // Softmax
-                float max_score = *std::max_element(scores.begin(), scores.end());
-                float sum = 0;
-                for (int i = 0; i < total_seq; i++) {
-                    scores[i] = std::exp(scores[i] - max_score);
-                    sum += scores[i];
-                }
-                for (int i = 0; i < total_seq; i++) {
-                    scores[i] /= sum;
-                }
-
-                // Weighted sum of values
-                float* ctx = context.data() + (b * seq_len + q_pos) * num_heads * head_dim + h * head_dim;
-                std::fill(ctx, ctx + head_dim, 0.0f);
-
-                for (int v_pos = 0; v_pos < total_seq; v_pos++) {
-                    const float* v_vec = v_all + v_pos * num_kv_heads * head_dim + kv_h * head_dim;
-                    float w = scores[v_pos];
-                    for (int d = 0; d < head_dim; d++) {
-                        ctx[d] += w * v_vec[d];
-                    }
-                }
+                scores[k_pos] = dot * scale;
             }
         }
-    }
+
+        // Softmax
+        float max_score = *std::max_element(scores.begin(), scores.begin() + total_seq);
+        float sum = 0;
+        for (int i = 0; i < total_seq; i++) {
+            scores[i] = std::exp(scores[i] - max_score);
+            sum += scores[i];
+        }
+        float inv_sum = 1.0f / sum;
+        for (int i = 0; i < total_seq; i++) {
+            scores[i] *= inv_sum;
+        }
+
+        // Weighted sum of values
+        float* ctx = context.data() + (b * seq_len + q_pos) * num_heads * head_dim + h * head_dim;
+        std::fill(ctx, ctx + head_dim, 0.0f);
+
+        for (int v_pos = 0; v_pos < total_seq; v_pos++) {
+            const float* v_vec = v_all + v_pos * num_kv_heads * head_dim + kv_h * head_dim;
+            float w = scores[v_pos];
+            for (int d = 0; d < head_dim; d++) {
+                ctx[d] += w * v_vec[d];
+            }
+        }
+    });  // End parallel_for
 
     // Unmap K, V if not using cache
     if (!kv_cache || kv_cache->seq_len() == 0) {
@@ -1312,25 +1413,15 @@ Result<Tensor> TransformerModel::attention(
 
     backend_->unmap_buffer(q.buffer());
 
-    // Output projection: context @ wo
-    // context: [batch, seq, num_heads * head_dim]
+    // Output projection: context @ wo.T using optimized BLAS
+    // context: [batch*seq, num_heads * head_dim]
     // wo shape: [hidden_dim, q_out_dim] with ne0=q_out_dim
-    // output[d] = sum_i context[i] * weight[d, i] where weight[d,i] = w[d * q_out_dim + i]
-    int q_out_dim2 = num_heads * head_dim;
-    for (int b = 0; b < batch; b++) {
-        for (int s = 0; s < seq_len; s++) {
-            const float* ctx_row = context.data() + (b * seq_len + s) * num_heads * head_dim;
-            float* out_row = out_data + (b * seq_len + s) * hidden_dim;
+    int total_tokens2 = batch * seq_len;
+    int attn_out_dim = num_heads * head_dim;
 
-            for (int d = 0; d < hidden_dim; d++) {
-                float sum = 0;
-                for (int i = 0; i < num_heads * head_dim; i++) {
-                    sum += ctx_row[i] * fp16_to_fp32(wo_data[d * q_out_dim2 + i]);
-                }
-                out_row[d] = sum;
-            }
-        }
-    }
+    // output = context @ wo.T
+    matmul_transb_fp16(context.data(), wo_data, out_data,
+                       total_tokens2, hidden_dim, attn_out_dim);
 
     backend_->unmap_buffer(output.buffer());
     backend_->unmap_buffer(wo->buffer());
@@ -1386,44 +1477,32 @@ Result<Tensor> TransformerModel::feed_forward(const Tensor& hidden, int layer) {
     const uint16_t* wu_data = static_cast<const uint16_t*>(map_wu.value());
     const uint16_t* wd_data = static_cast<const uint16_t*>(map_wd.value());
 
-    // Temporary buffers for intermediate values
-    std::vector<float> gate(intermediate_dim);
-    std::vector<float> up(intermediate_dim);
+    // Use optimized BLAS-based matmul
+    int total_tokens = batch * seq_len;
 
-    for (int b = 0; b < batch; b++) {
-        for (int s = 0; s < seq_len; s++) {
-            const float* h_row = h_data + (b * seq_len + s) * hidden_dim;
-            float* o_row = o_data + (b * seq_len + s) * hidden_dim;
+    // Allocate intermediate buffers
+    std::vector<float> gate_buf(total_tokens * intermediate_dim);
+    std::vector<float> up_buf(total_tokens * intermediate_dim);
+    std::vector<float> intermediate_buf(total_tokens * intermediate_dim);
 
-            // gate = h @ w_gate.T
-            // up = h @ w_up.T
-            // Weight shape: [intermediate_dim, hidden_dim] with ne0=hidden_dim
-            // weight[i, d] = w[i * hidden_dim + d]
-            for (int i = 0; i < intermediate_dim; i++) {
-                float gate_sum = 0;
-                float up_sum = 0;
-                for (int d = 0; d < hidden_dim; d++) {
-                    gate_sum += h_row[d] * fp16_to_fp32(wg_data[i * hidden_dim + d]);
-                    up_sum += h_row[d] * fp16_to_fp32(wu_data[i * hidden_dim + d]);
-                }
-                // SiLU activation on gate: x * sigmoid(x)
-                float sigmoid_gate = 1.0f / (1.0f + std::exp(-gate_sum));
-                gate[i] = gate_sum * sigmoid_gate;
-                up[i] = up_sum;
-            }
+    // gate = hidden @ w_gate.T  [total_tokens, intermediate_dim]
+    // Weight shape: [intermediate_dim, hidden_dim]
+    matmul_transb_fp16(h_data, wg_data, gate_buf.data(),
+                       total_tokens, intermediate_dim, hidden_dim);
 
-            // output = (gate * up) @ w_down.T
-            // Down weight shape: [hidden_dim, intermediate_dim] with ne0=intermediate_dim
-            // weight[d, i] = w[d * intermediate_dim + i]
-            for (int d = 0; d < hidden_dim; d++) {
-                float sum = 0;
-                for (int i = 0; i < intermediate_dim; i++) {
-                    sum += (gate[i] * up[i]) * fp16_to_fp32(wd_data[d * intermediate_dim + i]);
-                }
-                o_row[d] = sum;
-            }
-        }
-    }
+    // up = hidden @ w_up.T  [total_tokens, intermediate_dim]
+    matmul_transb_fp16(h_data, wu_data, up_buf.data(),
+                       total_tokens, intermediate_dim, hidden_dim);
+
+    // Apply SiLU to gate and multiply with up
+    silu_inplace(gate_buf.data(), total_tokens * intermediate_dim);
+    elementwise_mul(gate_buf.data(), up_buf.data(), intermediate_buf.data(),
+                    total_tokens * intermediate_dim);
+
+    // output = intermediate @ w_down.T  [total_tokens, hidden_dim]
+    // Down weight shape: [hidden_dim, intermediate_dim]
+    matmul_transb_fp16(intermediate_buf.data(), wd_data, o_data,
+                       total_tokens, hidden_dim, intermediate_dim);
 
     backend_->unmap_buffer(hidden.buffer());
     backend_->unmap_buffer(output.buffer());

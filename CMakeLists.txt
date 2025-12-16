@@ -159,6 +159,25 @@ if(GRANITE_BUILD_CPU)
 endif()
 
 # =============================================================================
+# Accelerate Framework (Apple BLAS/LAPACK)
+# =============================================================================
+
+if(APPLE)
+    target_link_libraries(granite PRIVATE "-framework Accelerate")
+    target_compile_definitions(granite PRIVATE GRANITE_HAS_ACCELERATE=1)
+endif()
+
+# =============================================================================
+# OpenMP (optional, for CPU parallelization)
+# =============================================================================
+
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(granite PRIVATE OpenMP::OpenMP_CXX)
+    target_compile_definitions(granite PRIVATE GRANITE_HAS_OPENMP=1)
+endif()
+
+# =============================================================================
 # Main executable (for development/testing)
 # =============================================================================
 
