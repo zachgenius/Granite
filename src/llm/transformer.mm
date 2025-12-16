@@ -1,10 +1,28 @@
+// TransformerModel - Core LLM inference implementation
+//
+// File organization:
+// 1. Model Loading & Initialization (lines ~15-120)
+// 2. Embedding Lookup (lines ~125-205)
+// 3. Forward Pass (lines ~210-415)
+// 4. Helper Functions: apply_rms_norm, add_tensors (lines ~420-530)
+// 5. Transformer Block - main layer processing (lines ~535-775)
+// 6. CPU Attention (lines ~780-1100)
+// 7. CPU Feed-Forward (lines ~1105-1180)
+// 8. GPU/Metal Implementations (lines ~1185-1800):
+//    - feed_forward_gpu
+//    - allocate_gpu_kv_cache
+//    - init_decode_pool
+//    - sync_cpu_to_gpu_kv_cache
+//    - attention_full_gpu
+//    - attention_gpu
+
 #include "llm_internal.h"
 #include "math_ops.h"
 
 namespace granite {
 
 // =============================================================================
-// TransformerModel Implementation
+// SECTION 1: Model Loading & Initialization
 // =============================================================================
 
 Result<TransformerModel> TransformerModel::load(
@@ -119,6 +137,10 @@ const RawWeight* TransformerModel::get_raw_weight(const std::string& name) const
     return &it->second;
 }
 
+// =============================================================================
+// SECTION 2: Embedding Lookup
+// =============================================================================
+
 Result<Tensor> TransformerModel::embed(const Tensor& token_ids) {
     const Tensor* emb_weight = get_weight("token_embd.weight");
     if (!emb_weight) {
@@ -203,6 +225,10 @@ Result<Tensor> TransformerModel::embed(const Tensor& token_ids) {
 
     return output;
 }
+
+// =============================================================================
+// SECTION 3: Forward Pass
+// =============================================================================
 
 // Helper to print tensor stats for debugging
 static void debug_tensor_stats(const std::string& name, const Tensor& t, IComputeBackend* backend) {
@@ -411,7 +437,11 @@ Result<Tensor> TransformerModel::forward_single(int32_t token_id, KVCache& kv_ca
     return forward(ids, &kv_cache, start_pos);
 }
 
-// Helper: Apply RMSNorm in place
+// =============================================================================
+// SECTION 4: Helper Functions
+// =============================================================================
+
+// Apply RMSNorm in place
 Tensor TransformerModel::apply_rms_norm(const Tensor& input, const Tensor* weight) {
     int batch = static_cast<int>(input.size(0));
     int seq_len = static_cast<int>(input.size(1));
@@ -527,6 +557,10 @@ Tensor TransformerModel::add_tensors(const Tensor& a, const Tensor& b) {
 
     return output;
 }
+
+// =============================================================================
+// SECTION 5: Transformer Block (Layer Processing)
+// =============================================================================
 
 Result<Tensor> TransformerModel::transformer_block(
     const Tensor& hidden,
@@ -775,6 +809,10 @@ cpu_path:
     auto output = add_tensors(post_attn, ffn_output);
     return output;
 }
+
+// =============================================================================
+// SECTION 6: CPU Attention
+// =============================================================================
 
 Result<Tensor> TransformerModel::attention(
     const Tensor& hidden,
@@ -1098,6 +1136,10 @@ Result<Tensor> TransformerModel::attention(
     return output;
 }
 
+// =============================================================================
+// SECTION 7: CPU Feed-Forward (SwiGLU)
+// =============================================================================
+
 Result<Tensor> TransformerModel::feed_forward(const Tensor& hidden, int layer) {
     std::string prefix = "blk." + std::to_string(layer) + ".";
 
@@ -1181,7 +1223,13 @@ Result<Tensor> TransformerModel::feed_forward(const Tensor& hidden, int layer) {
     return output;
 }
 
+// =============================================================================
+// SECTION 8: GPU/Metal Implementations
+// =============================================================================
+
 #ifdef GRANITE_HAS_METAL
+
+// GPU Feed-Forward using Q4_K quantized weights
 Result<Tensor> TransformerModel::feed_forward_gpu(const Tensor& hidden, int layer) {
     std::string prefix = "blk." + std::to_string(layer) + ".";
 
@@ -1676,6 +1724,120 @@ Result<Tensor> TransformerModel::attention_gpu(
 
         // If GPU cache is ahead, something is wrong - fall back to CPU
         // This shouldn't happen in normal operation
+    }
+
+    // GPU PREFILL PATH: For multi-token prefill with GPU cache
+    if (!is_decode && has_gpu_cache && start_pos == 0) {
+        auto* gpu = get_metal_compute();
+        if (gpu && gpu->is_initialized()) {
+            std::string prefix = "blk." + std::to_string(layer) + ".";
+
+            // Get raw Q4_K weights
+            const RawWeight* raw_wq = get_raw_weight(prefix + "attn_q.weight");
+            const RawWeight* raw_wk = get_raw_weight(prefix + "attn_k.weight");
+            const RawWeight* raw_wv = get_raw_weight(prefix + "attn_v.weight");
+            const RawWeight* raw_wo = get_raw_weight(prefix + "attn_output.weight");
+
+            if (raw_wq && raw_wk && raw_wv && raw_wo &&
+                raw_wq->quant_type == GGMLType::Q4_K) {
+
+                int hidden_dim = config_.hidden_dim;
+                int num_heads = config_.num_heads;
+                int num_kv_heads = config_.num_kv_heads;
+                int head_dim = config_.head_dim;
+                int q_dim = num_heads * head_dim;
+                int kv_dim = num_kv_heads * head_dim;
+                int max_seq = gpu_kv_cache_->max_seq_len;
+
+                // Get Metal buffers
+                auto* h_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(hidden.buffer()));
+                auto* wq_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_wq->buffer));
+                auto* wk_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_wk->buffer));
+                auto* wv_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_wv->buffer));
+                auto* wo_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_wo->buffer));
+
+                // Get KV cache for this layer
+                auto& layer_cache = gpu_kv_cache_->layers[layer];
+                auto* k_cache_buf = static_cast<MTL::Buffer*>(layer_cache.k_cache);
+                auto* v_cache_buf = static_cast<MTL::Buffer*>(layer_cache.v_cache);
+
+                // Allocate temporary buffers for Q, K, V
+                MTL::Buffer* q_buf = gpu->create_buffer(total_tokens * q_dim * sizeof(float));
+                MTL::Buffer* k_buf = gpu->create_buffer(total_tokens * kv_dim * sizeof(float));
+                MTL::Buffer* v_buf = gpu->create_buffer(total_tokens * kv_dim * sizeof(float));
+                MTL::Buffer* attn_out_buf = gpu->create_buffer(total_tokens * q_dim * sizeof(float));
+
+                if (q_buf && k_buf && v_buf && attn_out_buf) {
+                    // 1. Q/K/V projections using matmul_q4k
+                    gpu->matmul_q4k(h_buf, wq_buf, q_buf, total_tokens, hidden_dim, q_dim);
+                    gpu->matmul_q4k(h_buf, wk_buf, k_buf, total_tokens, hidden_dim, kv_dim);
+                    gpu->matmul_q4k(h_buf, wv_buf, v_buf, total_tokens, hidden_dim, kv_dim);
+
+                    // 2. Apply RoPE to Q and K (batched)
+                    gpu->rope_multihead(q_buf, k_buf, num_heads, num_kv_heads, total_tokens, head_dim,
+                                        start_pos, config_.rope_theta);
+
+                    // 3. Append K/V to FP16 cache (kv_cache_append uses FP16 by default)
+                    gpu->kv_cache_append(
+                        k_cache_buf, v_cache_buf,
+                        k_buf, v_buf,
+                        num_kv_heads, head_dim,
+                        0,  // current_len = 0 for prefill start
+                        total_tokens, max_seq
+                    );
+
+                    // 4. Multi-head attention (prefill kernel handles causal mask)
+                    float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+                    gpu->multihead_attention(
+                        q_buf,
+                        k_cache_buf,
+                        v_cache_buf,
+                        attn_out_buf,
+                        num_heads,
+                        num_kv_heads,
+                        total_tokens,  // seq_q
+                        total_tokens,  // seq_kv (same as seq_q for prefill)
+                        head_dim,
+                        scale
+                    );
+
+                    // 5. Output projection
+                    std::vector<int64_t> output_shape = {batch, seq_len, static_cast<int64_t>(hidden_dim)};
+                    auto output_result = Tensor::allocate(output_shape, DataType::FP32, backend_);
+                    if (output_result.ok()) {
+                        auto output = std::move(output_result).take();
+                        auto* o_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(output.buffer()));
+
+                        gpu->matmul_q4k(attn_out_buf, wo_buf, o_buf, total_tokens, q_dim, hidden_dim);
+
+                        // Update GPU cache length on last layer
+                        if (layer == config_.num_layers - 1) {
+                            gpu_kv_cache_->current_len = total_tokens;
+                            if (kv_cache) {
+                                kv_cache->set_seq_len(total_tokens);
+                            }
+                        }
+
+                        // NOTE: Don't sync here - let operations batch across layers
+                        // Sync happens in forward() at the end of all layers
+
+                        // Cleanup temp buffers
+                        q_buf->release();
+                        k_buf->release();
+                        v_buf->release();
+                        attn_out_buf->release();
+
+                        return output;
+                    }
+                }
+
+                // Cleanup on failure
+                if (q_buf) q_buf->release();
+                if (k_buf) k_buf->release();
+                if (v_buf) v_buf->release();
+                if (attn_out_buf) attn_out_buf->release();
+            }
+        }
     }
 
     // Fall back to CPU attention for prefill or when GPU cache is not valid

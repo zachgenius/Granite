@@ -112,6 +112,7 @@ public:
 
     /// Increment sequence length (for GPU path that writes directly to cache)
     void increment_seq_len(int delta = 1) { current_len_ += delta; }
+    void set_seq_len(int len) { current_len_ = len; }
 
     /// Memory usage in bytes
     [[nodiscard]] size_t memory_bytes() const;
