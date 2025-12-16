@@ -981,6 +981,92 @@ Result<Tensor> ModelLoader::dequantize_tensor(
         }
 
 
+        case GGMLType::Q5_K: {
+            // Q5_K: 256 elements per super-block, 176 bytes per block
+            // Structure (matching GGML's block_q5_K):
+            //   - d: fp16 scale (2 bytes)
+            //   - dmin: fp16 min (2 bytes)
+            //   - scales: 12 bytes (6-bit scales and mins, packed)
+            //   - qh: 32 bytes (high bits, 1 per element)
+            //   - qs: 128 bytes (low 4 bits, 2 per byte)
+            const uint8_t* src = static_cast<const uint8_t*>(data);
+            size_t num_blocks = (numel + 255) / 256;
+
+            // Lambda to match GGML's get_scale_min_k4
+            auto get_scale_min_k4 = [](int j, const uint8_t* q, uint8_t& sc, uint8_t& m) {
+                if (j < 4) {
+                    sc = q[j] & 63;
+                    m = q[j + 4] & 63;
+                } else {
+                    sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+                    m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+                }
+            };
+
+            for (size_t b = 0; b < num_blocks; b++) {
+                // Read global scales
+                uint16_t d_bits, dmin_bits;
+                memcpy(&d_bits, src, 2);
+                memcpy(&dmin_bits, src + 2, 2);
+                float d = fp16_to_fp32(d_bits);
+                float dmin = fp16_to_fp32(dmin_bits);
+
+                const uint8_t* scales_ptr = src + 4;    // 12 bytes
+                const uint8_t* qh = src + 16;           // 32 bytes (high bits)
+                const uint8_t* qs = src + 48;           // 128 bytes (low 4 bits)
+
+                int is = 0;
+                // Process 256 elements in groups of 64 (4 iterations)
+                for (int j = 0; j < 256; j += 64) {
+                    uint8_t sc, m;
+
+                    // Get scale/min for first 32 elements (low nibble)
+                    get_scale_min_k4(is, scales_ptr, sc, m);
+                    float d1 = d * static_cast<float>(sc);
+                    float m1 = dmin * static_cast<float>(m);
+
+                    // Get scale/min for next 32 elements (high nibble)
+                    get_scale_min_k4(is + 1, scales_ptr, sc, m);
+                    float d2 = d * static_cast<float>(sc);
+                    float m2 = dmin * static_cast<float>(m);
+
+                    // Dequantize 32 elements using low nibble + high bit
+                    for (int l = 0; l < 32; l++) {
+                        size_t idx = b * 256 + j + l;
+                        if (idx >= numel) break;
+                        // Get high bit from qh
+                        int qh_idx = (j / 8) + (l / 8);
+                        int qh_bit = l % 8;
+                        uint8_t hbit = (qh[qh_idx] >> qh_bit) & 1;
+                        // Combine low 4 bits + high bit to get 5-bit value
+                        int q5 = (qs[l] & 0xF) | (hbit << 4);
+                        float val = d1 * static_cast<float>(q5) - m1;
+                        output[idx] = fp32_to_fp16(val);
+                    }
+
+                    // Dequantize 32 elements using high nibble + high bit
+                    for (int l = 0; l < 32; l++) {
+                        size_t idx = b * 256 + j + 32 + l;
+                        if (idx >= numel) break;
+                        // Get high bit from qh (offset by 4 bytes for high nibble)
+                        int qh_idx = (j / 8) + 4 + (l / 8);
+                        int qh_bit = l % 8;
+                        uint8_t hbit = (qh[qh_idx] >> qh_bit) & 1;
+                        // Combine high 4 bits + high bit to get 5-bit value
+                        int q5 = (qs[l] >> 4) | (hbit << 4);
+                        float val = d2 * static_cast<float>(q5) - m2;
+                        output[idx] = fp32_to_fp16(val);
+                    }
+
+                    qs += 32;
+                    is += 2;
+                }
+
+                src += 176;  // Move to next block
+            }
+            break;
+        }
+
         case GGMLType::Q6_K: {
             // Q6_K: 256 elements per super-block, 210 bytes per block
             // Structure (matching GGML's block_q6_K):
