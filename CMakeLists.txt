@@ -65,8 +65,24 @@ set(GRANITE_MODEL_SOURCES
 )
 
 set(GRANITE_LLM_SOURCES
-    src/llm/llm.cpp
+    src/llm/math_ops.cpp
+    src/llm/kv_cache.cpp
+    src/llm/rope.cpp
+    src/llm/tokenizer.cpp
+    src/llm/model_config.cpp
+    src/llm/runner.cpp
 )
+
+# TransformerModel uses Metal - compile as .mm on Apple
+if(APPLE AND GRANITE_BUILD_METAL)
+    list(APPEND GRANITE_LLM_SOURCES src/llm/transformer.mm)
+    set_source_files_properties(src/llm/transformer.mm PROPERTIES
+        COMPILE_FLAGS "-fobjc-arc"
+    )
+else()
+    # For non-Metal builds, compile as .cpp (rename or use conditional)
+    list(APPEND GRANITE_LLM_SOURCES src/llm/transformer.mm)
+endif()
 
 # Placeholder sources (will be implemented)
 # For now, create stub files to allow compilation
