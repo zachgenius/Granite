@@ -107,6 +107,42 @@ public:
         uint32_t size
     );
 
+    // =============================================================================
+    // Fused Kernels (for reduced memory bandwidth)
+    // =============================================================================
+
+    // Fused SiLU + Multiply: c = silu(a) * b
+    // Used in SwiGLU FFN to eliminate intermediate buffer
+    Result<void> silu_mul(
+        MTL::Buffer* a,       // gate input
+        MTL::Buffer* b,       // up input
+        MTL::Buffer* c,       // output
+        uint32_t size
+    );
+
+    // Fused RMSNorm + Q4_K MatVec: y = RMSNorm(x, weight) @ W^T
+    // Eliminates intermediate normalized buffer write/read
+    Result<void> rms_norm_matvec_q4k(
+        MTL::Buffer* x,           // Input [K] float
+        MTL::Buffer* norm_weight, // RMSNorm weight [K] half
+        MTL::Buffer* W,           // Q4_K weights [N, K/256] blocks
+        MTL::Buffer* y,           // Output [N] float
+        uint32_t K,               // Input dimension
+        uint32_t N,               // Output dimension
+        float eps                 // RMSNorm epsilon
+    );
+
+    // Fused RMSNorm + FP16 MatVec: y = RMSNorm(x, weight) @ W^T
+    Result<void> rms_norm_matvec_f16(
+        MTL::Buffer* x,           // Input [K] float
+        MTL::Buffer* norm_weight, // RMSNorm weight [K] half
+        MTL::Buffer* W,           // FP16 weights [N, K]
+        MTL::Buffer* y,           // Output [N] float
+        uint32_t K,               // Input dimension
+        uint32_t N,               // Output dimension
+        float eps                 // RMSNorm epsilon
+    );
+
     // RoPE (Rotary Position Embedding)
     Result<void> rope(
         MTL::Buffer* x,
@@ -168,10 +204,17 @@ public:
     // GPU KV Cache
     // =============================================================================
 
-    // Allocate GPU KV cache for a layer
+    // Allocate GPU KV cache for a layer (FP16 by default for better bandwidth)
     // Returns pair of (K buffer, V buffer)
     // Shape: [num_kv_heads, max_seq_len, head_dim]
     std::pair<MTL::Buffer*, MTL::Buffer*> create_kv_cache(
+        uint32_t num_kv_heads,
+        uint32_t max_seq_len,
+        uint32_t head_dim
+    );
+
+    // Allocate FP32 KV cache (for compatibility)
+    std::pair<MTL::Buffer*, MTL::Buffer*> create_kv_cache_f32(
         uint32_t num_kv_heads,
         uint32_t max_seq_len,
         uint32_t head_dim

@@ -623,22 +623,88 @@ Result<Tensor> TransformerModel::transformer_block(
                 // 3. GPU Residual add: post_attn = hidden + attn_output
                 gpu->elementwise_add(h_buf, attn_out_buf, post_attn_buf, hidden_dim);
 
-                // 4. GPU RMSNorm for FFN
-                is_f16_weight = (ffn_norm_weight->dtype() == DataType::FP16);
-                if (is_f16_weight) {
-                    gpu->rms_norm_f16(post_attn_buf, ffn_norm_buf, ffn_in_buf,
-                                     hidden_dim, config_.rms_norm_eps);
+                // 4+5. FUSED GPU Feed Forward using rms_norm_matvec_q4k
+                // This eliminates the intermediate normalized buffer by fusing
+                // RMSNorm with the gate/up projections
+                const RawWeight* w_gate = get_raw_weight(prefix + "ffn_gate.weight");
+                const RawWeight* w_up = get_raw_weight(prefix + "ffn_up.weight");
+                const RawWeight* w_down = get_raw_weight(prefix + "ffn_down.weight");
+
+                // Check if we can use fused kernels (need Q4_K weights and FP16 norm)
+                bool can_fuse = w_gate && w_up && w_down &&
+                               w_gate->quant_type == GGMLType::Q4_K &&
+                               ffn_norm_weight->dtype() == DataType::FP16;
+
+                Tensor ffn_output;
+                if (can_fuse) {
+                    // Get weight buffers
+                    auto* wg_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(w_gate->buffer));
+                    auto* wu_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(w_up->buffer));
+                    auto* wd_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(w_down->buffer));
+
+                    // Use pooled FFN buffers if available
+                    MTL::Buffer* gate_buf;
+                    MTL::Buffer* up_buf;
+                    bool use_ffn_pool = decode_pool_ && decode_pool_->initialized &&
+                                        decode_pool_->ffn_gate_buf && decode_pool_->ffn_up_buf;
+
+                    if (use_ffn_pool) {
+                        gate_buf = static_cast<MTL::Buffer*>(decode_pool_->ffn_gate_buf);
+                        up_buf = static_cast<MTL::Buffer*>(decode_pool_->ffn_up_buf);
+                    } else {
+                        gate_buf = gpu->create_buffer(config_.intermediate_dim * sizeof(float));
+                        up_buf = gpu->create_buffer(config_.intermediate_dim * sizeof(float));
+                    }
+
+                    // Allocate output
+                    std::vector<int64_t> ffn_out_shape = {1, 1, static_cast<int64_t>(hidden_dim)};
+                    auto ffn_out_result = Tensor::allocate(ffn_out_shape, DataType::FP32, backend_);
+                    if (!ffn_out_result.ok()) {
+                        if (!use_ffn_pool) {
+                            if (gate_buf) gate_buf->release();
+                            if (up_buf) up_buf->release();
+                        }
+                        return ffn_out_result.error();
+                    }
+                    ffn_output = std::move(ffn_out_result).take();
+                    auto* ffn_out_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(ffn_output.buffer()));
+
+                    // Fused RMSNorm + gate projection: eliminates intermediate norm buffer
+                    gpu->rms_norm_matvec_q4k(post_attn_buf, ffn_norm_buf, wg_buf, gate_buf,
+                                            hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+
+                    // Fused RMSNorm + up projection: recomputes norm but saves memory read
+                    gpu->rms_norm_matvec_q4k(post_attn_buf, ffn_norm_buf, wu_buf, up_buf,
+                                            hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+
+                    // Fused silu + mul
+                    gpu->silu_mul(gate_buf, up_buf, gate_buf, config_.intermediate_dim);
+
+                    // Down projection
+                    gpu->matvec_q4k(gate_buf, wd_buf, ffn_out_buf, config_.intermediate_dim, hidden_dim);
+
+                    if (!use_ffn_pool) {
+                        gate_buf->release();
+                        up_buf->release();
+                    }
                 } else {
-                    gpu->rms_norm(post_attn_buf, ffn_norm_buf, ffn_in_buf,
-                                 hidden_dim, config_.rms_norm_eps);
+                    // Fallback: separate RMSNorm + feed_forward_gpu
+                    is_f16_weight = (ffn_norm_weight->dtype() == DataType::FP16);
+                    if (is_f16_weight) {
+                        gpu->rms_norm_f16(post_attn_buf, ffn_norm_buf, ffn_in_buf,
+                                         hidden_dim, config_.rms_norm_eps);
+                    } else {
+                        gpu->rms_norm(post_attn_buf, ffn_norm_buf, ffn_in_buf,
+                                     hidden_dim, config_.rms_norm_eps);
+                    }
+
+                    auto ffn_result = feed_forward_gpu(ffn_input, layer);
+                    if (!ffn_result.ok()) {
+                        return ffn_result.error();
+                    }
+                    ffn_output = std::move(ffn_result).take();
                 }
 
-                // 5. GPU Feed forward
-                auto ffn_result = feed_forward_gpu(ffn_input, layer);
-                if (!ffn_result.ok()) {
-                    return ffn_result.error();
-                }
-                auto ffn_output = std::move(ffn_result).take();
                 auto* ffn_out_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(ffn_output.buffer()));
 
                 // 6. GPU Residual add: output = post_attn + ffn_output
@@ -1206,18 +1272,17 @@ Result<Tensor> TransformerModel::feed_forward_gpu(const Tensor& hidden, int laye
         gpu->matvec_q4k(h_buf, wg_buf, gate_buf, hidden_dim, intermediate_dim);
         // up = x @ W_up^T
         gpu->matvec_q4k(h_buf, wu_buf, up_buf, hidden_dim, intermediate_dim);
-        // silu(gate)
-        gpu->silu(gate_buf, intermediate_dim);
-        // gate = gate * up (reuse gate_buf for result)
-        gpu->elementwise_mul(gate_buf, up_buf, gate_buf, intermediate_dim);
+        // Fused silu + mul: gate_buf = silu(gate_buf) * up_buf
+        // Saves one kernel dispatch and one memory round-trip
+        gpu->silu_mul(gate_buf, up_buf, gate_buf, intermediate_dim);
         // output = intermediate @ W_down^T
         gpu->matvec_q4k(gate_buf, wd_buf, o_buf, intermediate_dim, hidden_dim);
     } else {
         // Batched: use matmul_q4k
         gpu->matmul_q4k(h_buf, wg_buf, gate_buf, total_tokens, hidden_dim, intermediate_dim);
         gpu->matmul_q4k(h_buf, wu_buf, up_buf, total_tokens, hidden_dim, intermediate_dim);
-        gpu->silu(gate_buf, total_tokens * intermediate_dim);
-        gpu->elementwise_mul(gate_buf, up_buf, gate_buf, total_tokens * intermediate_dim);
+        // Fused silu + mul
+        gpu->silu_mul(gate_buf, up_buf, gate_buf, total_tokens * intermediate_dim);
         gpu->matmul_q4k(gate_buf, wd_buf, o_buf, total_tokens, intermediate_dim, hidden_dim);
     }
 
