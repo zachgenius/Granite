@@ -351,6 +351,32 @@ kernel void rope(
     x[idx + 1] = x0 * sin_theta + x1 * cos_theta;
 }
 
+// Embedding lookup: gather rows from FP16 embedding table
+// token_ids: [num_tokens] int32
+// embeddings: [vocab_size, hidden_dim] half
+// output: [num_tokens, hidden_dim] float
+kernel void embedding_lookup(
+    device const int* token_ids    [[buffer(0)]],
+    device const half* embeddings  [[buffer(1)]],
+    device float* output           [[buffer(2)]],
+    constant uint& hidden_dim      [[buffer(3)]],
+    constant uint& vocab_size      [[buffer(4)]],
+    uint2 gid                      [[thread_position_in_grid]]
+) {
+    uint token_idx = gid.y;  // Which token
+    uint dim = gid.x;        // Which dimension
+
+    if (dim >= hidden_dim) return;
+
+    int token_id = token_ids[token_idx];
+    // Clamp to valid range
+    if (token_id < 0) token_id = 0;
+    if (token_id >= int(vocab_size)) token_id = 0;
+
+    // Gather from embedding table (row-major: [vocab_size, hidden_dim])
+    output[token_idx * hidden_dim + dim] = float(embeddings[token_id * hidden_dim + dim]);
+}
+
 kernel void elementwise_add(
     device const float* a          [[buffer(0)]],
     device const float* b          [[buffer(1)]],
@@ -744,7 +770,7 @@ private:
             "matvec_q4k", "matmul_q4k", "matvec_f16", "matvec_f32",
             "rms_norm", "rms_norm_f16", "silu", "elementwise_mul", "rope",
             "elementwise_add", "rope_multihead", "softmax_row", "attention_decode",
-            "kv_cache_append", "multihead_attention_decode"
+            "kv_cache_append", "multihead_attention_decode", "embedding_lookup"
         };
 
         for (const auto& name : kernels) {
@@ -1197,6 +1223,35 @@ Result<void> MetalCompute::multihead_attention(
     }
 
     return Error(ErrorCode::NotImplemented, "GPU prefill multihead attention not implemented");
+}
+
+Result<void> MetalCompute::embedding_lookup(
+    MTL::Buffer* token_ids,
+    MTL::Buffer* embeddings,
+    MTL::Buffer* output,
+    uint32_t num_tokens,
+    uint32_t hidden_dim,
+    uint32_t vocab_size)
+{
+    auto* encoder = impl_->get_encoder();
+    auto* pipeline = impl_->get_pipeline("embedding_lookup");
+    if (!pipeline) {
+        return Error(ErrorCode::InternalError, "embedding_lookup pipeline not found");
+    }
+
+    encoder->setComputePipelineState(pipeline);
+    encoder->setBuffer(token_ids, 0, 0);
+    encoder->setBuffer(embeddings, 0, 1);
+    encoder->setBuffer(output, 0, 2);
+    encoder->setBytes(&hidden_dim, sizeof(hidden_dim), 3);
+    encoder->setBytes(&vocab_size, sizeof(vocab_size), 4);
+
+    // 2D grid: [hidden_dim, num_tokens]
+    MTL::Size grid_size = MTL::Size::Make(hidden_dim, num_tokens, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(std::min((uint32_t)256, hidden_dim), 1, 1);
+    encoder->dispatchThreads(grid_size, threadgroup_size);
+
+    return {};
 }
 
 // Global singleton

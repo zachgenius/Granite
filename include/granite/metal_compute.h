@@ -211,6 +211,23 @@ public:
     );
 
     // =============================================================================
+    // Embedding Operations
+    // =============================================================================
+
+    // Embedding lookup: gather rows from FP16 embedding table
+    // token_ids: [num_tokens] int32
+    // embeddings: [vocab_size, hidden_dim] half
+    // output: [num_tokens, hidden_dim] float
+    Result<void> embedding_lookup(
+        MTL::Buffer* token_ids,
+        MTL::Buffer* embeddings,
+        MTL::Buffer* output,
+        uint32_t num_tokens,
+        uint32_t hidden_dim,
+        uint32_t vocab_size
+    );
+
+    // =============================================================================
     // Buffer Management
     // =============================================================================
 

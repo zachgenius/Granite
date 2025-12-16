@@ -783,6 +783,7 @@ Result<Tensor> TransformerModel::embed(const Tensor& token_ids) {
     int batch = static_cast<int>(token_ids.size(0));
     int seq_len = static_cast<int>(token_ids.size(1));
     int hidden_dim = config_.hidden_dim;
+    int total_tokens = batch * seq_len;
 
     std::vector<int64_t> output_shape = {
         static_cast<int64_t>(batch),
@@ -795,7 +796,26 @@ Result<Tensor> TransformerModel::embed(const Tensor& token_ids) {
     }
     auto output = std::move(output_result).take();
 
-    // Map buffers
+#ifdef GRANITE_HAS_METAL
+    // GPU path for single-token decode
+    if (use_gpu_ && total_tokens == 1) {
+        auto* gpu = get_metal_compute();
+        if (gpu && gpu->is_initialized()) {
+            auto* ids_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(token_ids.buffer()));
+            auto* emb_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(emb_weight->buffer()));
+            auto* out_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(output.buffer()));
+
+            if (ids_buf && emb_buf && out_buf) {
+                gpu->embedding_lookup(ids_buf, emb_buf, out_buf,
+                                     total_tokens, hidden_dim, config_.vocab_size);
+                // No sync needed - will be synced by subsequent operations
+                return output;
+            }
+        }
+    }
+#endif
+
+    // CPU path
     auto map_ids = backend_->map_buffer(token_ids.buffer());
     auto map_emb = backend_->map_buffer(emb_weight->buffer());
     auto map_out = backend_->map_buffer(output.buffer());
