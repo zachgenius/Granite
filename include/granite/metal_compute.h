@@ -62,6 +62,29 @@ public:
     );
 
     // =============================================================================
+    // LLM Operations - Q8_0 Quantized Matrix Multiply
+    // =============================================================================
+
+    // y = x @ W^T where W is Q8_0 quantized
+    Result<void> matvec_q8_0(
+        MTL::Buffer* x,      // Input [K] float
+        MTL::Buffer* W,      // Weights [N, K/32] Q8_0 blocks (34 bytes each)
+        MTL::Buffer* y,      // Output [N] float
+        uint32_t K,          // Input dimension
+        uint32_t N           // Output dimension
+    );
+
+    // Y = X @ W^T where W is Q8_0 quantized (batched)
+    Result<void> matmul_q8_0(
+        MTL::Buffer* X,      // Input [M, K] float
+        MTL::Buffer* W,      // Weights [N, K/32] Q8_0 blocks
+        MTL::Buffer* Y,      // Output [M, N] float
+        uint32_t M,          // Batch size (number of tokens)
+        uint32_t K,          // Input dimension
+        uint32_t N           // Output dimension
+    );
+
+    // =============================================================================
     // LLM Operations - FP16/FP32 Matrix Multiply
     // =============================================================================
 
@@ -137,6 +160,17 @@ public:
         MTL::Buffer* x,           // Input [K] float
         MTL::Buffer* norm_weight, // RMSNorm weight [K] half
         MTL::Buffer* W,           // FP16 weights [N, K]
+        MTL::Buffer* y,           // Output [N] float
+        uint32_t K,               // Input dimension
+        uint32_t N,               // Output dimension
+        float eps                 // RMSNorm epsilon
+    );
+
+    // Fused RMSNorm + Q8_0 MatVec: y = RMSNorm(x, weight) @ W^T
+    Result<void> rms_norm_matvec_q8_0(
+        MTL::Buffer* x,           // Input [K] float
+        MTL::Buffer* norm_weight, // RMSNorm weight [K] half
+        MTL::Buffer* W,           // Q8_0 weights [N, K/32] blocks
         MTL::Buffer* y,           // Output [N] float
         uint32_t K,               // Input dimension
         uint32_t N,               // Output dimension

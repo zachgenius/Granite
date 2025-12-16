@@ -135,12 +135,15 @@ private:
 
         std::vector<std::string> kernels = {
             "matvec_q4k", "matmul_q4k", "matvec_f16", "matvec_f32",
+            // Q8_0 kernels
+            "matvec_q8_0", "matmul_q8_0",
             "rms_norm", "rms_norm_f16", "silu", "elementwise_mul", "rope",
             "elementwise_add", "rope_multihead", "softmax_row", "attention_decode",
             "kv_cache_append", "kv_cache_append_f16", "multihead_attention_decode",
             "multihead_attention_decode_f16kv", "embedding_lookup",
             // Fused kernels
             "silu_mul", "rms_norm_matvec_q4k", "rms_norm_matvec_f16",
+            "rms_norm_matvec_q8_0",
             // Flash attention
             "flash_attention_decode",
             // Prefill attention
@@ -235,6 +238,64 @@ Result<void> MetalCompute::matmul_q4k(
     auto* pipeline = impl_->get_pipeline("matmul_q4k");
     if (!pipeline) {
         return Error(ErrorCode::InternalError, "matmul_q4k pipeline not found");
+    }
+
+    encoder->setComputePipelineState(pipeline);
+    encoder->setBuffer(X, 0, 0);
+    encoder->setBuffer(W, 0, 1);
+    encoder->setBuffer(Y, 0, 2);
+    encoder->setBytes(&M, sizeof(M), 3);
+    encoder->setBytes(&K, sizeof(K), 4);
+    encoder->setBytes(&N, sizeof(N), 5);
+
+    MTL::Size grid_size = MTL::Size::Make(N, M, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(16, 16, 1);
+    encoder->dispatchThreads(grid_size, threadgroup_size);
+
+    return {};
+}
+
+// =============================================================================
+// Q8_0 Quantized Operations
+// =============================================================================
+
+Result<void> MetalCompute::matvec_q8_0(
+    MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* y,
+    uint32_t K, uint32_t N)
+{
+    auto* encoder = impl_->get_encoder();
+    auto* pipeline = impl_->get_pipeline("matvec_q8_0");
+    if (!pipeline) {
+        return Error(ErrorCode::InternalError, "matvec_q8_0 pipeline not found");
+    }
+
+    encoder->setComputePipelineState(pipeline);
+    encoder->setBuffer(x, 0, 0);
+    encoder->setBuffer(W, 0, 1);
+    encoder->setBuffer(y, 0, 2);
+    encoder->setBytes(&K, sizeof(K), 3);
+    encoder->setBytes(&N, sizeof(N), 4);
+
+    // 8 SIMD groups per threadgroup (256 threads), each SIMD group handles 2 rows
+    uint32_t simd_groups = 8;
+    uint32_t rows_per_simd = 2;  // NR0_Q8_0
+    uint32_t rows_per_tg = simd_groups * rows_per_simd;  // 16 rows per threadgroup
+    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
+    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(32 * simd_groups, 1, 1);  // 8 SIMD groups = 256 threads
+    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
+
+    return {};
+}
+
+Result<void> MetalCompute::matmul_q8_0(
+    MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
+    uint32_t M, uint32_t K, uint32_t N)
+{
+    auto* encoder = impl_->get_encoder();
+    auto* pipeline = impl_->get_pipeline("matmul_q8_0");
+    if (!pipeline) {
+        return Error(ErrorCode::InternalError, "matmul_q8_0 pipeline not found");
     }
 
     encoder->setComputePipelineState(pipeline);
@@ -748,6 +809,34 @@ Result<void> MetalCompute::rms_norm_matvec_f16(
     auto* pipeline = impl_->get_pipeline("rms_norm_matvec_f16");
     if (!pipeline) {
         return Error(ErrorCode::InternalError, "rms_norm_matvec_f16 pipeline not found");
+    }
+
+    encoder->setComputePipelineState(pipeline);
+    encoder->setBuffer(x, 0, 0);
+    encoder->setBuffer(norm_weight, 0, 1);
+    encoder->setBuffer(W, 0, 2);
+    encoder->setBuffer(y, 0, 3);
+    encoder->setBytes(&K, sizeof(K), 4);
+    encoder->setBytes(&N, sizeof(N), 5);
+    encoder->setBytes(&eps, sizeof(eps), 6);
+
+    uint32_t rows_per_tg = 8;
+    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
+    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
+
+    return {};
+}
+
+Result<void> MetalCompute::rms_norm_matvec_q8_0(
+    MTL::Buffer* x, MTL::Buffer* norm_weight, MTL::Buffer* W, MTL::Buffer* y,
+    uint32_t K, uint32_t N, float eps)
+{
+    auto* encoder = impl_->get_encoder();
+    auto* pipeline = impl_->get_pipeline("rms_norm_matvec_q8_0");
+    if (!pipeline) {
+        return Error(ErrorCode::InternalError, "rms_norm_matvec_q8_0 pipeline not found");
     }
 
     encoder->setComputePipelineState(pipeline);

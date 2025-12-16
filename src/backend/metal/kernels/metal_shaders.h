@@ -10,12 +10,20 @@ static const char* METAL_SHADER_SOURCE = R"(
 using namespace metal;
 
 constant constexpr uint QK_K = 256;
+constant constexpr uint QK8_0 = 32;  // Q8_0 block size
 
 struct block_q4_K {
     half d;
     half dmin;
     uint8_t scales[12];
     uint8_t qs[128];
+};
+
+// Q8_0: 32 elements per block, 34 bytes
+// Simple format: FP16 scale + 32 int8 values
+struct block_q8_0 {
+    half d;           // scale
+    int8_t qs[32];    // quantized values
 };
 
 inline void get_scale_min_k4(int j, const device uint8_t* q, thread uint8_t& sc, thread uint8_t& m) {
@@ -293,6 +301,186 @@ kernel void matmul_q4k(
     }
 
     Y[row * N + col] = sum;
+}
+
+// =============================================================================
+// Q8_0 Matrix-Vector Multiplication (Single Token Decode)
+// =============================================================================
+// Optimized using same techniques as Q4_K:
+// - SIMD groups for parallel reduction
+// - Register-based input caching
+// - 2 rows per SIMD group
+
+constant constexpr short NR0_Q8_0 = 2;  // Rows per SIMD group
+constant constexpr uint Q8_0_ROWS_PER_TG = 8;  // SIMD groups per threadgroup
+
+kernel void matvec_q8_0(
+    device const float* x          [[buffer(0)]],
+    device const void* W           [[buffer(1)]],
+    device float* y                [[buffer(2)]],
+    constant uint& K               [[buffer(3)]],
+    constant uint& N               [[buffer(4)]],
+    uint tgid                      [[threadgroup_position_in_grid]],
+    uint tiisg                     [[thread_index_in_simdgroup]],
+    uint sgitg                     [[simdgroup_index_in_threadgroup]]
+) {
+    const uint nb = K / QK8_0;  // Number of Q8_0 blocks per row
+
+    // Each SIMD group handles NR0_Q8_0 rows
+    const uint first_row = (tgid * Q8_0_ROWS_PER_TG + sgitg) * NR0_Q8_0;
+
+    device const block_q8_0* weights = (const device block_q8_0*)W;
+
+    float sumf[NR0_Q8_0] = {0.f, 0.f};
+
+    // Thread indexing: 32 threads per SIMD group
+    // Each thread processes every 32nd block
+    for (uint ib = tiisg; ib < nb; ib += 32) {
+        // Cache input values in registers
+        float xl[32];
+        uint x_base = ib * QK8_0;
+        for (int i = 0; i < 32; i++) {
+            xl[i] = x[x_base + i];
+        }
+
+        // Process each row
+        for (short row = 0; row < NR0_Q8_0; row++) {
+            uint row_idx = first_row + row;
+            if (row_idx >= N) continue;
+
+            device const block_q8_0* block = &weights[row_idx * nb + ib];
+            float d = float(block->d);
+
+            // Vectorized accumulation
+            float acc = 0.f;
+            for (int i = 0; i < 32; i += 4) {
+                acc += xl[i+0] * float(block->qs[i+0]);
+                acc += xl[i+1] * float(block->qs[i+1]);
+                acc += xl[i+2] * float(block->qs[i+2]);
+                acc += xl[i+3] * float(block->qs[i+3]);
+            }
+            sumf[row] += d * acc;
+        }
+    }
+
+    // SIMD reduction and output
+    for (short row = 0; row < NR0_Q8_0; row++) {
+        uint row_idx = first_row + row;
+        if (row_idx < N) {
+            float sum = simd_sum(sumf[row]);
+            if (tiisg == 0) {
+                y[row_idx] = sum;
+            }
+        }
+    }
+}
+
+// Q8_0 Matrix Multiplication (Batched - Prefill)
+kernel void matmul_q8_0(
+    device const float* X          [[buffer(0)]],
+    device const void* W           [[buffer(1)]],
+    device float* Y                [[buffer(2)]],
+    constant uint& M               [[buffer(3)]],
+    constant uint& K               [[buffer(4)]],
+    constant uint& N               [[buffer(5)]],
+    uint2 gid                      [[thread_position_in_grid]]
+) {
+    uint row = gid.y;
+    uint col = gid.x;
+
+    if (row >= M || col >= N) return;
+
+    const uint num_blocks_k = K / QK8_0;
+    const device block_q8_0* weights = (const device block_q8_0*)W;
+
+    float sum = 0.0f;
+
+    for (uint kb = 0; kb < num_blocks_k; kb++) {
+        const device block_q8_0* block = &weights[col * num_blocks_k + kb];
+        float d = float(block->d);
+
+        uint base_idx = kb * QK8_0;
+
+        for (int i = 0; i < 32; i++) {
+            float w = d * float(block->qs[i]);
+            sum += X[row * K + base_idx + i] * w;
+        }
+    }
+
+    Y[row * N + col] = sum;
+}
+
+// Fused RMSNorm + Q8_0 MatVec
+// Computes: y = RMSNorm(x, weight) @ W^T (Q8_0)
+kernel void rms_norm_matvec_q8_0(
+    device const float* x          [[buffer(0)]],
+    device const half* norm_weight [[buffer(1)]],
+    device const void* W           [[buffer(2)]],
+    device float* y                [[buffer(3)]],
+    constant uint& K               [[buffer(4)]],
+    constant uint& N               [[buffer(5)]],
+    constant float& eps            [[buffer(6)]],
+    uint tgid                      [[threadgroup_position_in_grid]],
+    uint tid                       [[thread_position_in_threadgroup]],
+    uint simd_lane                 [[thread_index_in_simdgroup]],
+    uint simd_id                   [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup float x_norm[4096];
+    threadgroup float reduction_scratch[8];
+
+    // Step 1: RMSNorm
+    float local_sum_sq = 0.0f;
+    for (uint i = tid; i < K; i += 256) {
+        float val = x[i];
+        local_sum_sq += val * val;
+    }
+
+    float simd_sum_sq = simd_sum(local_sum_sq);
+    if (simd_lane == 0) {
+        reduction_scratch[simd_id] = simd_sum_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float rms_inv;
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint i = 0; i < 8; i++) {
+            total += reduction_scratch[i];
+        }
+        rms_inv = rsqrt(total / float(K) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < K; i += 256) {
+        x_norm[i] = x[i] * rms_inv * float(norm_weight[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 2: Q8_0 MatVec
+    uint row = tgid * 8 + simd_id;
+    if (row >= N) return;
+
+    const uint num_blocks_k = K / QK8_0;
+    const device block_q8_0* weights = (const device block_q8_0*)W;
+
+    float local_sum = 0.0f;
+
+    for (uint kb = simd_lane; kb < num_blocks_k; kb += 32) {
+        const device block_q8_0* block = &weights[row * num_blocks_k + kb];
+        float d = float(block->d);
+
+        uint base_idx = kb * QK8_0;
+        float acc = 0.f;
+        for (int i = 0; i < 32; i++) {
+            acc += x_norm[base_idx + i] * float(block->qs[i]);
+        }
+        local_sum += d * acc;
+    }
+
+    float sum = simd_sum(local_sum);
+    if (simd_lane == 0) {
+        y[row] = sum;
+    }
 }
 
 // SIMD-optimized matvec for FP16 weights

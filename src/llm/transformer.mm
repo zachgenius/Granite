@@ -61,10 +61,11 @@ Result<TransformerModel> TransformerModel::load(
     model.weights_ = std::move(weights_result).take();
 
     // Also load raw quantized weights for GPU path
-    // Only load Q4_K weights that are used in matmul operations
+    // Only load quantized weights that are used in matmul operations
     for (const auto& info : model.gguf_->tensors()) {
         // Only keep raw weights for quantized types used in projections
-        if (info.type != GGMLType::Q4_K && info.type != GGMLType::Q6_K) {
+        if (info.type != GGMLType::Q4_K && info.type != GGMLType::Q6_K &&
+            info.type != GGMLType::Q8_0) {
             continue;
         }
 
@@ -664,10 +665,12 @@ Result<Tensor> TransformerModel::transformer_block(
                 const RawWeight* w_up = get_raw_weight(prefix + "ffn_up.weight");
                 const RawWeight* w_down = get_raw_weight(prefix + "ffn_down.weight");
 
-                // Check if we can use fused kernels (need Q4_K weights and FP16 norm)
+                // Check if we can use fused kernels (need Q4_K/Q8_0 weights and FP16 norm)
                 bool can_fuse = w_gate && w_up && w_down &&
-                               w_gate->quant_type == GGMLType::Q4_K &&
+                               (w_gate->quant_type == GGMLType::Q4_K ||
+                                w_gate->quant_type == GGMLType::Q8_0) &&
                                ffn_norm_weight->dtype() == DataType::FP16;
+                bool fused_use_q8_0 = can_fuse && (w_gate->quant_type == GGMLType::Q8_0);
 
                 Tensor ffn_output;
                 if (can_fuse) {
@@ -704,18 +707,29 @@ Result<Tensor> TransformerModel::transformer_block(
                     auto* ffn_out_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(ffn_output.buffer()));
 
                     // Fused RMSNorm + gate projection: eliminates intermediate norm buffer
-                    gpu->rms_norm_matvec_q4k(post_attn_buf, ffn_norm_buf, wg_buf, gate_buf,
-                                            hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
-
-                    // Fused RMSNorm + up projection: recomputes norm but saves memory read
-                    gpu->rms_norm_matvec_q4k(post_attn_buf, ffn_norm_buf, wu_buf, up_buf,
-                                            hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                    if (fused_use_q8_0) {
+                        gpu->rms_norm_matvec_q8_0(post_attn_buf, ffn_norm_buf, wg_buf, gate_buf,
+                                                hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                        // Fused RMSNorm + up projection: recomputes norm but saves memory read
+                        gpu->rms_norm_matvec_q8_0(post_attn_buf, ffn_norm_buf, wu_buf, up_buf,
+                                                hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                    } else {
+                        gpu->rms_norm_matvec_q4k(post_attn_buf, ffn_norm_buf, wg_buf, gate_buf,
+                                                hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                        // Fused RMSNorm + up projection: recomputes norm but saves memory read
+                        gpu->rms_norm_matvec_q4k(post_attn_buf, ffn_norm_buf, wu_buf, up_buf,
+                                                hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                    }
 
                     // Fused silu + mul
                     gpu->silu_mul(gate_buf, up_buf, gate_buf, config_.intermediate_dim);
 
                     // Down projection
-                    gpu->matvec_q4k(gate_buf, wd_buf, ffn_out_buf, config_.intermediate_dim, hidden_dim);
+                    if (fused_use_q8_0) {
+                        gpu->matvec_q8_0(gate_buf, wd_buf, ffn_out_buf, config_.intermediate_dim, hidden_dim);
+                    } else {
+                        gpu->matvec_q4k(gate_buf, wd_buf, ffn_out_buf, config_.intermediate_dim, hidden_dim);
+                    }
 
                     if (!use_ffn_pool) {
                         gate_buf->release();
@@ -1244,10 +1258,11 @@ Result<Tensor> TransformerModel::feed_forward_gpu(const Tensor& hidden, int laye
         return feed_forward(hidden, layer);
     }
 
-    // Only support Q4_K for now
-    if (w_gate->quant_type != GGMLType::Q4_K) {
+    // Support Q4_K and Q8_0
+    if (w_gate->quant_type != GGMLType::Q4_K && w_gate->quant_type != GGMLType::Q8_0) {
         return feed_forward(hidden, layer);
     }
+    bool use_q8_0 = (w_gate->quant_type == GGMLType::Q8_0);
 
     auto* gpu = get_metal_compute();
     if (!gpu || !gpu->is_initialized()) {
@@ -1314,24 +1329,40 @@ Result<Tensor> TransformerModel::feed_forward_gpu(const Tensor& hidden, int laye
     // intermediate = gate * up
     // output = intermediate @ w_down.T (Q4_K)
 
-    // For single token (decode), use matvec_q4k
+    // For single token (decode), use matvec
     if (total_tokens == 1) {
-        // gate = x @ W_gate^T
-        gpu->matvec_q4k(h_buf, wg_buf, gate_buf, hidden_dim, intermediate_dim);
-        // up = x @ W_up^T
-        gpu->matvec_q4k(h_buf, wu_buf, up_buf, hidden_dim, intermediate_dim);
-        // Fused silu + mul: gate_buf = silu(gate_buf) * up_buf
-        // Saves one kernel dispatch and one memory round-trip
-        gpu->silu_mul(gate_buf, up_buf, gate_buf, intermediate_dim);
-        // output = intermediate @ W_down^T
-        gpu->matvec_q4k(gate_buf, wd_buf, o_buf, intermediate_dim, hidden_dim);
+        if (use_q8_0) {
+            // gate = x @ W_gate^T (Q8_0)
+            gpu->matvec_q8_0(h_buf, wg_buf, gate_buf, hidden_dim, intermediate_dim);
+            // up = x @ W_up^T (Q8_0)
+            gpu->matvec_q8_0(h_buf, wu_buf, up_buf, hidden_dim, intermediate_dim);
+            // Fused silu + mul: gate_buf = silu(gate_buf) * up_buf
+            gpu->silu_mul(gate_buf, up_buf, gate_buf, intermediate_dim);
+            // output = intermediate @ W_down^T (Q8_0)
+            gpu->matvec_q8_0(gate_buf, wd_buf, o_buf, intermediate_dim, hidden_dim);
+        } else {
+            // gate = x @ W_gate^T (Q4_K)
+            gpu->matvec_q4k(h_buf, wg_buf, gate_buf, hidden_dim, intermediate_dim);
+            // up = x @ W_up^T (Q4_K)
+            gpu->matvec_q4k(h_buf, wu_buf, up_buf, hidden_dim, intermediate_dim);
+            // Fused silu + mul: gate_buf = silu(gate_buf) * up_buf
+            gpu->silu_mul(gate_buf, up_buf, gate_buf, intermediate_dim);
+            // output = intermediate @ W_down^T (Q4_K)
+            gpu->matvec_q4k(gate_buf, wd_buf, o_buf, intermediate_dim, hidden_dim);
+        }
     } else {
-        // Batched: use matmul_q4k
-        gpu->matmul_q4k(h_buf, wg_buf, gate_buf, total_tokens, hidden_dim, intermediate_dim);
-        gpu->matmul_q4k(h_buf, wu_buf, up_buf, total_tokens, hidden_dim, intermediate_dim);
-        // Fused silu + mul
-        gpu->silu_mul(gate_buf, up_buf, gate_buf, total_tokens * intermediate_dim);
-        gpu->matmul_q4k(gate_buf, wd_buf, o_buf, total_tokens, intermediate_dim, hidden_dim);
+        // Batched: use matmul
+        if (use_q8_0) {
+            gpu->matmul_q8_0(h_buf, wg_buf, gate_buf, total_tokens, hidden_dim, intermediate_dim);
+            gpu->matmul_q8_0(h_buf, wu_buf, up_buf, total_tokens, hidden_dim, intermediate_dim);
+            gpu->silu_mul(gate_buf, up_buf, gate_buf, total_tokens * intermediate_dim);
+            gpu->matmul_q8_0(gate_buf, wd_buf, o_buf, total_tokens, intermediate_dim, hidden_dim);
+        } else {
+            gpu->matmul_q4k(h_buf, wg_buf, gate_buf, total_tokens, hidden_dim, intermediate_dim);
+            gpu->matmul_q4k(h_buf, wu_buf, up_buf, total_tokens, hidden_dim, intermediate_dim);
+            gpu->silu_mul(gate_buf, up_buf, gate_buf, total_tokens * intermediate_dim);
+            gpu->matmul_q4k(gate_buf, wd_buf, o_buf, total_tokens, intermediate_dim, hidden_dim);
+        }
     }
 
     // NOTE: No sync here - let commands batch across layers for better pipelining
@@ -1530,7 +1561,7 @@ Result<Tensor> TransformerModel::attention_full_gpu(
 {
     std::string prefix = "blk." + std::to_string(layer) + ".";
 
-    // Get raw Q4_K weights for GPU projection
+    // Get raw quantized weights for GPU projection
     const RawWeight* raw_wq = get_raw_weight(prefix + "attn_q.weight");
     const RawWeight* raw_wk = get_raw_weight(prefix + "attn_k.weight");
     const RawWeight* raw_wv = get_raw_weight(prefix + "attn_v.weight");
@@ -1539,6 +1570,9 @@ Result<Tensor> TransformerModel::attention_full_gpu(
     if (!raw_wq || !raw_wk || !raw_wv || !raw_wo) {
         GRANITE_FAIL(ErrorCode::InternalError, "Missing attention weights");
     }
+
+    // Check quantization type
+    bool use_q8_0 = (raw_wq->quant_type == GGMLType::Q8_0);
 
     auto* gpu = get_metal_compute();
     if (!gpu || !gpu->is_initialized() || !gpu_kv_cache_ || !gpu_kv_cache_->is_allocated()) {
@@ -1617,9 +1651,15 @@ Result<Tensor> TransformerModel::attention_full_gpu(
     // === ALL GPU OPERATIONS - NO SYNC UNTIL END ===
 
     // 1. Q/K/V projections
-    gpu->matvec_q4k(h_buf, wq_buf, q_buf, hidden_dim, q_dim);
-    gpu->matvec_q4k(h_buf, wk_buf, k_buf, hidden_dim, kv_dim);
-    gpu->matvec_q4k(h_buf, wv_buf, v_buf, hidden_dim, kv_dim);
+    if (use_q8_0) {
+        gpu->matvec_q8_0(h_buf, wq_buf, q_buf, hidden_dim, q_dim);
+        gpu->matvec_q8_0(h_buf, wk_buf, k_buf, hidden_dim, kv_dim);
+        gpu->matvec_q8_0(h_buf, wv_buf, v_buf, hidden_dim, kv_dim);
+    } else {
+        gpu->matvec_q4k(h_buf, wq_buf, q_buf, hidden_dim, q_dim);
+        gpu->matvec_q4k(h_buf, wk_buf, k_buf, hidden_dim, kv_dim);
+        gpu->matvec_q4k(h_buf, wv_buf, v_buf, hidden_dim, kv_dim);
+    }
 
     // 2. Apply RoPE to Q and K
     gpu->rope_multihead(q_buf, k_buf, num_heads, num_kv_heads, 1, head_dim,
@@ -1649,7 +1689,11 @@ Result<Tensor> TransformerModel::attention_full_gpu(
     );
 
     // 5. Output projection
-    gpu->matvec_q4k(attn_out_buf, wo_buf, o_buf, q_dim, hidden_dim);
+    if (use_q8_0) {
+        gpu->matvec_q8_0(attn_out_buf, wo_buf, o_buf, q_dim, hidden_dim);
+    } else {
+        gpu->matvec_q4k(attn_out_buf, wo_buf, o_buf, q_dim, hidden_dim);
+    }
 
     // Only sync at the end - NOT here, let caller sync
     // gpu->sync();  // Removed - caller will sync
@@ -1732,15 +1776,16 @@ Result<Tensor> TransformerModel::attention_gpu(
         if (gpu && gpu->is_initialized()) {
             std::string prefix = "blk." + std::to_string(layer) + ".";
 
-            // Get raw Q4_K weights
+            // Get raw quantized weights
             const RawWeight* raw_wq = get_raw_weight(prefix + "attn_q.weight");
             const RawWeight* raw_wk = get_raw_weight(prefix + "attn_k.weight");
             const RawWeight* raw_wv = get_raw_weight(prefix + "attn_v.weight");
             const RawWeight* raw_wo = get_raw_weight(prefix + "attn_output.weight");
 
             if (raw_wq && raw_wk && raw_wv && raw_wo &&
-                raw_wq->quant_type == GGMLType::Q4_K) {
+                (raw_wq->quant_type == GGMLType::Q4_K || raw_wq->quant_type == GGMLType::Q8_0)) {
 
+                bool prefill_use_q8_0 = (raw_wq->quant_type == GGMLType::Q8_0);
                 int hidden_dim = config_.hidden_dim;
                 int num_heads = config_.num_heads;
                 int num_kv_heads = config_.num_kv_heads;
@@ -1768,10 +1813,16 @@ Result<Tensor> TransformerModel::attention_gpu(
                 MTL::Buffer* attn_out_buf = gpu->create_buffer(total_tokens * q_dim * sizeof(float));
 
                 if (q_buf && k_buf && v_buf && attn_out_buf) {
-                    // 1. Q/K/V projections using matmul_q4k
-                    gpu->matmul_q4k(h_buf, wq_buf, q_buf, total_tokens, hidden_dim, q_dim);
-                    gpu->matmul_q4k(h_buf, wk_buf, k_buf, total_tokens, hidden_dim, kv_dim);
-                    gpu->matmul_q4k(h_buf, wv_buf, v_buf, total_tokens, hidden_dim, kv_dim);
+                    // 1. Q/K/V projections
+                    if (prefill_use_q8_0) {
+                        gpu->matmul_q8_0(h_buf, wq_buf, q_buf, total_tokens, hidden_dim, q_dim);
+                        gpu->matmul_q8_0(h_buf, wk_buf, k_buf, total_tokens, hidden_dim, kv_dim);
+                        gpu->matmul_q8_0(h_buf, wv_buf, v_buf, total_tokens, hidden_dim, kv_dim);
+                    } else {
+                        gpu->matmul_q4k(h_buf, wq_buf, q_buf, total_tokens, hidden_dim, q_dim);
+                        gpu->matmul_q4k(h_buf, wk_buf, k_buf, total_tokens, hidden_dim, kv_dim);
+                        gpu->matmul_q4k(h_buf, wv_buf, v_buf, total_tokens, hidden_dim, kv_dim);
+                    }
 
                     // 2. Apply RoPE to Q and K (batched)
                     gpu->rope_multihead(q_buf, k_buf, num_heads, num_kv_heads, total_tokens, head_dim,
@@ -1808,7 +1859,11 @@ Result<Tensor> TransformerModel::attention_gpu(
                         auto output = std::move(output_result).take();
                         auto* o_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(output.buffer()));
 
-                        gpu->matmul_q4k(attn_out_buf, wo_buf, o_buf, total_tokens, q_dim, hidden_dim);
+                        if (prefill_use_q8_0) {
+                            gpu->matmul_q8_0(attn_out_buf, wo_buf, o_buf, total_tokens, q_dim, hidden_dim);
+                        } else {
+                            gpu->matmul_q4k(attn_out_buf, wo_buf, o_buf, total_tokens, q_dim, hidden_dim);
+                        }
 
                         // Update GPU cache length on last layer
                         if (layer == config_.num_layers - 1) {
