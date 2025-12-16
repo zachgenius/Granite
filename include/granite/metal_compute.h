@@ -107,6 +107,54 @@ public:
         float freq_base = 10000.0f
     );
 
+    // Element-wise add: c = a + b
+    Result<void> elementwise_add(
+        MTL::Buffer* a,
+        MTL::Buffer* b,
+        MTL::Buffer* c,
+        uint32_t size
+    );
+
+    // =============================================================================
+    // Attention Operations
+    // =============================================================================
+
+    // RoPE applied to Q and K tensors for multi-head attention
+    // Q/K shape: [num_heads, seq_len, head_dim]
+    Result<void> rope_multihead(
+        MTL::Buffer* q,           // Q tensor
+        MTL::Buffer* k,           // K tensor
+        uint32_t num_heads_q,     // Number of Q heads
+        uint32_t num_heads_k,     // Number of K heads (for GQA)
+        uint32_t seq_len,         // Sequence length
+        uint32_t head_dim,        // Head dimension
+        uint32_t start_pos,       // Starting position for RoPE
+        float freq_base = 10000.0f
+    );
+
+    // Softmax over last dimension (in-place)
+    // x shape: [M, N], softmax over N dimension
+    Result<void> softmax(
+        MTL::Buffer* x,
+        uint32_t M,               // Number of rows
+        uint32_t N                // Number of columns (softmax dimension)
+    );
+
+    // Single-head attention: output = softmax(Q @ K^T / sqrt(d)) @ V
+    // Q: [seq_q, head_dim], K: [seq_kv, head_dim], V: [seq_kv, head_dim]
+    // output: [seq_q, head_dim]
+    Result<void> attention_single_head(
+        MTL::Buffer* Q,           // Query [seq_q, head_dim]
+        MTL::Buffer* K,           // Key [seq_kv, head_dim]
+        MTL::Buffer* V,           // Value [seq_kv, head_dim]
+        MTL::Buffer* output,      // Output [seq_q, head_dim]
+        uint32_t seq_q,           // Query sequence length (usually 1 for decode)
+        uint32_t seq_kv,          // KV sequence length (includes cache)
+        uint32_t head_dim,        // Head dimension
+        uint32_t start_pos,       // Position for causal mask
+        float scale               // 1/sqrt(head_dim)
+    );
+
     // =============================================================================
     // Buffer Management
     // =============================================================================

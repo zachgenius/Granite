@@ -1152,8 +1152,13 @@ Result<Tensor> TransformerModel::transformer_block(
     // 1. RMSNorm for attention
     auto attn_input = apply_rms_norm(hidden, attn_norm_weight);
 
-    // 2. Attention with KV cache
+    // 2. Attention with KV cache (use GPU if available)
+#ifdef GRANITE_HAS_METAL
+    auto attn_result = use_gpu_ ? attention_gpu(attn_input, layer, kv_cache, start_pos)
+                                : attention(attn_input, layer, kv_cache, start_pos);
+#else
     auto attn_result = attention(attn_input, layer, kv_cache, start_pos);
+#endif
     if (!attn_result.ok()) {
         return attn_result.error();
     }
@@ -1697,9 +1702,261 @@ Result<Tensor> TransformerModel::attention_gpu(
     KVCache* kv_cache,
     int start_pos)
 {
-    // For now, fall back to CPU attention
-    // GPU attention requires more complex implementation with KV cache handling
-    return attention(hidden, layer, kv_cache, start_pos);
+    std::string prefix = "blk." + std::to_string(layer) + ".";
+
+    // Get raw Q4_K weights for GPU projection
+    const RawWeight* raw_wq = get_raw_weight(prefix + "attn_q.weight");
+    const RawWeight* raw_wk = get_raw_weight(prefix + "attn_k.weight");
+    const RawWeight* raw_wv = get_raw_weight(prefix + "attn_v.weight");
+    const RawWeight* raw_wo = get_raw_weight(prefix + "attn_output.weight");
+
+    // Fall back to CPU if raw weights not available
+    if (!raw_wq || !raw_wk || !raw_wv || !raw_wo) {
+        return attention(hidden, layer, kv_cache, start_pos);
+    }
+
+    auto* gpu = get_metal_compute();
+    if (!gpu || !gpu->is_initialized()) {
+        return attention(hidden, layer, kv_cache, start_pos);
+    }
+
+    int batch = static_cast<int>(hidden.size(0));
+    int seq_len = static_cast<int>(hidden.size(1));
+    int hidden_dim = config_.hidden_dim;
+    int num_heads = config_.num_heads;
+    int num_kv_heads = config_.num_kv_heads;
+    int head_dim = config_.head_dim;
+    int q_dim = num_heads * head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+    int total_tokens = batch * seq_len;
+
+    // For decode (single token), use full GPU path
+    bool is_decode = (total_tokens == 1);
+
+    if (!is_decode) {
+        // For prefill, fall back to CPU (GPU prefill attention not implemented yet)
+        return attention(hidden, layer, kv_cache, start_pos);
+    }
+
+    // Get Metal buffers for weights
+    auto* h_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(hidden.buffer()));
+    auto* wq_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_wq->buffer));
+    auto* wk_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_wk->buffer));
+    auto* wv_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_wv->buffer));
+    auto* wo_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_wo->buffer));
+
+    if (!h_buf || !wq_buf || !wk_buf || !wv_buf || !wo_buf) {
+        return attention(hidden, layer, kv_cache, start_pos);
+    }
+
+    // Allocate GPU buffers for Q, K, V projections
+    MTL::Buffer* q_buf = gpu->create_buffer(q_dim * sizeof(float));
+    MTL::Buffer* k_buf = gpu->create_buffer(kv_dim * sizeof(float));
+    MTL::Buffer* v_buf = gpu->create_buffer(kv_dim * sizeof(float));
+
+    if (!q_buf || !k_buf || !v_buf) {
+        if (q_buf) q_buf->release();
+        if (k_buf) k_buf->release();
+        if (v_buf) v_buf->release();
+        return attention(hidden, layer, kv_cache, start_pos);
+    }
+
+    // GPU Q/K/V projections using Q4_K (batched - no sync between)
+    gpu->matvec_q4k(h_buf, wq_buf, q_buf, hidden_dim, q_dim);
+    gpu->matvec_q4k(h_buf, wk_buf, k_buf, hidden_dim, kv_dim);
+    gpu->matvec_q4k(h_buf, wv_buf, v_buf, hidden_dim, kv_dim);
+
+    // Apply RoPE on GPU (still in same command buffer)
+    gpu->rope_multihead(q_buf, k_buf, num_heads, num_kv_heads, 1, head_dim,
+                        start_pos, config_.rope_theta);
+
+    // Commit and wait - need results for attention computation
+    gpu->sync();
+
+    // Total KV sequence length (including new token)
+    int cached_len = kv_cache ? kv_cache->seq_len() : 0;
+    int total_seq = cached_len + 1;
+
+    // Allocate output buffer
+    std::vector<int64_t> output_shape = {
+        static_cast<int64_t>(batch),
+        static_cast<int64_t>(seq_len),
+        static_cast<int64_t>(hidden_dim)
+    };
+    auto output_result = Tensor::allocate(output_shape, DataType::FP32, backend_);
+    if (!output_result.ok()) {
+        q_buf->release();
+        k_buf->release();
+        v_buf->release();
+        return output_result.error();
+    }
+    auto output = std::move(output_result).take();
+
+    // Allocate buffers for full K/V sequences and attention output
+    MTL::Buffer* k_full_buf = gpu->create_buffer(total_seq * kv_dim * sizeof(float));
+    MTL::Buffer* v_full_buf = gpu->create_buffer(total_seq * kv_dim * sizeof(float));
+    MTL::Buffer* attn_out_buf = gpu->create_buffer(q_dim * sizeof(float));
+
+    if (!k_full_buf || !v_full_buf || !attn_out_buf) {
+        q_buf->release();
+        k_buf->release();
+        v_buf->release();
+        if (k_full_buf) k_full_buf->release();
+        if (v_full_buf) v_full_buf->release();
+        if (attn_out_buf) attn_out_buf->release();
+        return attention(hidden, layer, kv_cache, start_pos);
+    }
+
+    // Fill K/V full buffers from cache + current
+    float* k_full = static_cast<float*>(k_full_buf->contents());
+    float* v_full = static_cast<float*>(v_full_buf->contents());
+
+    // Get current K, V values
+    float* k_data = static_cast<float*>(k_buf->contents());
+    float* v_data = static_cast<float*>(v_buf->contents());
+
+    if (kv_cache && kv_cache->is_allocated() && cached_len > 0) {
+        auto [cached_k, cached_v] = kv_cache->get(layer);
+        auto map_ck = backend_->map_buffer(cached_k.buffer());
+        auto map_cv = backend_->map_buffer(cached_v.buffer());
+
+        if (map_ck.ok() && map_cv.ok()) {
+            const uint16_t* k_cache = static_cast<const uint16_t*>(map_ck.value());
+            const uint16_t* v_cache = static_cast<const uint16_t*>(map_cv.value());
+            int max_seq = kv_cache->max_seq_len();
+
+            // Copy cached K/V and convert to FP32
+            // Cache layout: [num_kv_heads, max_seq, head_dim]
+            // Target layout: [seq, num_kv_heads, head_dim] for attention
+            for (int s = 0; s < cached_len; s++) {
+                for (int h = 0; h < num_kv_heads; h++) {
+                    for (int d = 0; d < head_dim; d++) {
+                        int cache_idx = h * max_seq * head_dim + s * head_dim + d;
+                        int full_idx = s * kv_dim + h * head_dim + d;
+                        k_full[full_idx] = fp16_to_fp32(k_cache[cache_idx]);
+                        v_full[full_idx] = fp16_to_fp32(v_cache[cache_idx]);
+                    }
+                }
+            }
+
+            backend_->unmap_buffer(cached_k.buffer());
+            backend_->unmap_buffer(cached_v.buffer());
+        }
+    }
+
+    // Add current K/V at position cached_len
+    for (int h = 0; h < num_kv_heads; h++) {
+        for (int d = 0; d < head_dim; d++) {
+            int src_idx = h * head_dim + d;
+            int full_idx = cached_len * kv_dim + h * head_dim + d;
+            k_full[full_idx] = k_data[src_idx];
+            v_full[full_idx] = v_data[src_idx];
+        }
+    }
+
+    // Update KV cache with new K, V
+    if (kv_cache && kv_cache->is_allocated()) {
+        auto [cached_k, cached_v] = kv_cache->get(layer);
+        auto map_ck = backend_->map_buffer(cached_k.buffer());
+        auto map_cv = backend_->map_buffer(cached_v.buffer());
+
+        if (map_ck.ok() && map_cv.ok()) {
+            uint16_t* k_cache = static_cast<uint16_t*>(map_ck.value());
+            uint16_t* v_cache = static_cast<uint16_t*>(map_cv.value());
+            int max_seq = kv_cache->max_seq_len();
+
+            // Write new K, V to cache
+            for (int h = 0; h < num_kv_heads; h++) {
+                for (int d = 0; d < head_dim; d++) {
+                    int src_idx = h * head_dim + d;
+                    int dst_idx = h * max_seq * head_dim + cached_len * head_dim + d;
+                    k_cache[dst_idx] = fp32_to_fp16(k_data[src_idx]);
+                    v_cache[dst_idx] = fp32_to_fp16(v_data[src_idx]);
+                }
+            }
+
+            backend_->unmap_buffer(cached_k.buffer());
+            backend_->unmap_buffer(cached_v.buffer());
+
+            // Only update cache length on last layer (same as CPU path)
+            if (layer == config_.num_layers - 1) {
+                kv_cache->increment_seq_len(1);
+            }
+        }
+    }
+
+    // Compute attention for each head (parallelized over heads)
+    // For GQA: multiple Q heads share same K/V head
+    int heads_per_kv = num_heads / num_kv_heads;
+    float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    float* attn_out = static_cast<float*>(attn_out_buf->contents());
+    float* q_data = static_cast<float*>(q_buf->contents());
+
+    // Parallel attention computation over heads using GCD
+#ifdef USE_GCD
+    dispatch_apply(num_heads, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t h_idx) {
+        int h = static_cast<int>(h_idx);
+#else
+    parallel_for(static_cast<size_t>(num_heads), get_num_threads(), [&](size_t h_idx) {
+        int h = static_cast<int>(h_idx);
+#endif
+        int kv_h = h / heads_per_kv;
+        float* q_head = q_data + h * head_dim;
+        float* out_head = attn_out + h * head_dim;
+
+        // Compute attention scores
+        std::vector<float> scores(total_seq);
+        for (int s = 0; s < total_seq; s++) {
+            float* k_vec = k_full + s * kv_dim + kv_h * head_dim;
+            float dot = 0;
+            for (int d = 0; d < head_dim; d++) {
+                dot += q_head[d] * k_vec[d];
+            }
+            scores[s] = dot * scale;
+        }
+
+        // Softmax
+        float max_score = *std::max_element(scores.begin(), scores.end());
+        float sum = 0;
+        for (int s = 0; s < total_seq; s++) {
+            scores[s] = std::exp(scores[s] - max_score);
+            sum += scores[s];
+        }
+        float inv_sum = 1.0f / sum;
+        for (int s = 0; s < total_seq; s++) {
+            scores[s] *= inv_sum;
+        }
+
+        // Weighted sum of values
+        std::fill(out_head, out_head + head_dim, 0.0f);
+        for (int s = 0; s < total_seq; s++) {
+            float* v_vec = v_full + s * kv_dim + kv_h * head_dim;
+            float w = scores[s];
+            for (int d = 0; d < head_dim; d++) {
+                out_head[d] += w * v_vec[d];
+            }
+        }
+#ifdef USE_GCD
+    });
+#else
+    });
+#endif
+
+    // Output projection: attn_out @ wo^T
+    auto* o_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(output.buffer()));
+    gpu->matvec_q4k(attn_out_buf, wo_buf, o_buf, q_dim, hidden_dim);
+    gpu->sync();
+
+    // Clean up
+    q_buf->release();
+    k_buf->release();
+    v_buf->release();
+    k_full_buf->release();
+    v_full_buf->release();
+    attn_out_buf->release();
+
+    return output;
 }
 #else
 // Non-Metal stubs

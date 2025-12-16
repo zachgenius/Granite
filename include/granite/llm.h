@@ -85,6 +85,9 @@ public:
     /// Clear cache (reset for new sequence)
     void clear();
 
+    /// Increment sequence length (for GPU path that writes directly to cache)
+    void increment_seq_len(int delta = 1) { current_len_ += delta; }
+
     /// Memory usage in bytes
     [[nodiscard]] size_t memory_bytes() const;
 
