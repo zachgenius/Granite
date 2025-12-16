@@ -879,8 +879,72 @@ Result<Tensor> TransformerModel::forward(
         hidden = std::move(block_result).take();
     }
 
-    // Final RMSNorm
+    // Final RMSNorm and output projection
     const Tensor* norm_weight = get_weight("output_norm.weight");
+    const Tensor* output_weight = get_weight("output.weight");
+    if (!output_weight) {
+        // Try tied embeddings
+        output_weight = get_weight("token_embd.weight");
+    }
+    if (!output_weight) {
+        GRANITE_FAIL(ErrorCode::InvalidState, "Output weight not found");
+    }
+
+    int batch = static_cast<int>(hidden.size(0));
+    int seq_len = static_cast<int>(hidden.size(1));
+    int total_tokens = batch * seq_len;
+    bool is_decode = (total_tokens == 1);
+
+#ifdef GRANITE_HAS_METAL
+    // GPU path for decode mode
+    if (use_gpu_ && is_decode && norm_weight) {
+        auto* gpu = get_metal_compute();
+        if (gpu && gpu->is_initialized()) {
+            auto* h_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(hidden.buffer()));
+            auto* norm_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(norm_weight->buffer()));
+            auto* out_w_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(output_weight->buffer()));
+
+            if (h_buf && norm_buf && out_w_buf) {
+                // Allocate output tensor for normalized hidden
+                std::vector<int64_t> norm_shape = {1, 1, static_cast<int64_t>(config_.hidden_dim)};
+                auto norm_out_result = Tensor::allocate(norm_shape, DataType::FP32, backend_);
+
+                // Allocate logits tensor
+                std::vector<int64_t> logits_shape = {1, 1, static_cast<int64_t>(config_.vocab_size)};
+                auto logits_result = Tensor::allocate(logits_shape, DataType::FP32, backend_);
+
+                if (norm_out_result.ok() && logits_result.ok()) {
+                    auto norm_out = std::move(norm_out_result).take();
+                    auto logits = std::move(logits_result).take();
+
+                    auto* norm_out_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(norm_out.buffer()));
+                    auto* logits_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(logits.buffer()));
+
+                    // GPU Final RMSNorm
+                    bool is_f16 = (norm_weight->dtype() == DataType::FP16);
+                    if (is_f16) {
+                        gpu->rms_norm_f16(h_buf, norm_buf, norm_out_buf,
+                                         config_.hidden_dim, config_.rms_norm_eps);
+                    } else {
+                        gpu->rms_norm(h_buf, norm_buf, norm_out_buf,
+                                     config_.hidden_dim, config_.rms_norm_eps);
+                    }
+
+                    // GPU Output projection (FP16 weights -> matvec_f16)
+                    gpu->matvec_f16(norm_out_buf, out_w_buf, logits_buf,
+                                   config_.hidden_dim, config_.vocab_size);
+
+                    // Sync before returning results
+                    gpu->sync();
+
+                    return logits;
+                }
+            }
+        }
+    }
+#endif
+
+    // CPU path
     if (norm_weight) {
         // Apply RMSNorm (simplified inline implementation)
         auto map_h = backend_->map_buffer(hidden.buffer());
@@ -891,8 +955,6 @@ Result<Tensor> TransformerModel::forward(
             const void* w = map_w.value();
             DataType w_dtype = norm_weight->dtype();
 
-            int batch = static_cast<int>(hidden.size(0));
-            int seq_len = static_cast<int>(hidden.size(1));
             int dim = config_.hidden_dim;
 
             for (int b = 0; b < batch; b++) {
@@ -922,20 +984,6 @@ Result<Tensor> TransformerModel::forward(
         }
     }
 
-    // Output projection (lm_head)
-    const Tensor* output_weight = get_weight("output.weight");
-    if (!output_weight) {
-        // Try tied embeddings
-        output_weight = get_weight("token_embd.weight");
-    }
-    if (!output_weight) {
-        GRANITE_FAIL(ErrorCode::InvalidState, "Output weight not found");
-    }
-
-    // MatMul: hidden @ output_weight.T -> logits
-    int batch = static_cast<int>(hidden.size(0));
-    int seq_len = static_cast<int>(hidden.size(1));
-
     std::vector<int64_t> logits_shape = {
         static_cast<int64_t>(batch),
         static_cast<int64_t>(seq_len),
@@ -962,7 +1010,6 @@ Result<Tensor> TransformerModel::forward(
 
     int hidden_dim = config_.hidden_dim;
     int vocab_size = config_.vocab_size;
-    int total_tokens = batch * seq_len;
 
     // Use optimized BLAS matmul: logits = hidden @ output_weight.T
     // Output weight shape: [vocab_size, hidden_dim]
@@ -1123,12 +1170,92 @@ Result<Tensor> TransformerModel::transformer_block(
     int batch = static_cast<int>(hidden.size(0));
     int seq_len = static_cast<int>(hidden.size(1));
     int hidden_dim = config_.hidden_dim;
+    int total_tokens = batch * seq_len;
+    bool is_decode = (total_tokens == 1);
 
     // Get weights
     const Tensor* attn_norm_weight = get_weight(prefix + "attn_norm.weight");
     const Tensor* ffn_norm_weight = get_weight(prefix + "ffn_norm.weight");
 
-    // Clone hidden for residual (we'll modify it in place for RMSNorm)
+#ifdef GRANITE_HAS_METAL
+    // Full GPU path for decode mode - avoid CPU<->GPU transfers
+    if (use_gpu_ && is_decode) {
+        auto* gpu = get_metal_compute();
+        if (gpu && gpu->is_initialized() && attn_norm_weight && ffn_norm_weight) {
+            // Get Metal buffers
+            auto* h_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(hidden.buffer()));
+            auto* attn_norm_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(attn_norm_weight->buffer()));
+            auto* ffn_norm_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(ffn_norm_weight->buffer()));
+
+            if (h_buf && attn_norm_buf && ffn_norm_buf) {
+                // Allocate output and temp buffers
+                std::vector<int64_t> output_shape = {1, 1, static_cast<int64_t>(hidden_dim)};
+                auto attn_in_result = Tensor::allocate(output_shape, DataType::FP32, backend_);
+                auto post_attn_result = Tensor::allocate(output_shape, DataType::FP32, backend_);
+                auto ffn_in_result = Tensor::allocate(output_shape, DataType::FP32, backend_);
+                auto output_result = Tensor::allocate(output_shape, DataType::FP32, backend_);
+
+                if (attn_in_result.ok() && post_attn_result.ok() && ffn_in_result.ok() && output_result.ok()) {
+                    auto attn_input = std::move(attn_in_result).take();
+                    auto post_attn = std::move(post_attn_result).take();
+                    auto ffn_input = std::move(ffn_in_result).take();
+                    auto output = std::move(output_result).take();
+
+                    auto* attn_in_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(attn_input.buffer()));
+                    auto* post_attn_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(post_attn.buffer()));
+                    auto* ffn_in_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(ffn_input.buffer()));
+                    auto* out_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(output.buffer()));
+
+                    // 1. GPU RMSNorm for attention
+                    bool is_f16_weight = (attn_norm_weight->dtype() == DataType::FP16);
+                    if (is_f16_weight) {
+                        gpu->rms_norm_f16(h_buf, attn_norm_buf, attn_in_buf,
+                                         hidden_dim, config_.rms_norm_eps);
+                    } else {
+                        gpu->rms_norm(h_buf, attn_norm_buf, attn_in_buf,
+                                     hidden_dim, config_.rms_norm_eps);
+                    }
+
+                    // 2. GPU Attention
+                    auto attn_result = attention_gpu(attn_input, layer, kv_cache, start_pos);
+                    if (!attn_result.ok()) {
+                        return attn_result.error();
+                    }
+                    auto attn_output = std::move(attn_result).take();
+                    auto* attn_out_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(attn_output.buffer()));
+
+                    // 3. GPU Residual add: post_attn = hidden + attn_output
+                    gpu->elementwise_add(h_buf, attn_out_buf, post_attn_buf, hidden_dim);
+
+                    // 4. GPU RMSNorm for FFN
+                    is_f16_weight = (ffn_norm_weight->dtype() == DataType::FP16);
+                    if (is_f16_weight) {
+                        gpu->rms_norm_f16(post_attn_buf, ffn_norm_buf, ffn_in_buf,
+                                         hidden_dim, config_.rms_norm_eps);
+                    } else {
+                        gpu->rms_norm(post_attn_buf, ffn_norm_buf, ffn_in_buf,
+                                     hidden_dim, config_.rms_norm_eps);
+                    }
+
+                    // 5. GPU Feed forward
+                    auto ffn_result = feed_forward_gpu(ffn_input, layer);
+                    if (!ffn_result.ok()) {
+                        return ffn_result.error();
+                    }
+                    auto ffn_output = std::move(ffn_result).take();
+                    auto* ffn_out_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(ffn_output.buffer()));
+
+                    // 6. GPU Residual add: output = post_attn + ffn_output
+                    gpu->elementwise_add(post_attn_buf, ffn_out_buf, out_buf, hidden_dim);
+
+                    return output;
+                }
+            }
+        }
+    }
+#endif
+
+    // CPU path (or fallback)
     std::vector<int64_t> hidden_shape = {
         static_cast<int64_t>(batch),
         static_cast<int64_t>(seq_len),
@@ -1686,8 +1813,8 @@ Result<Tensor> TransformerModel::feed_forward_gpu(const Tensor& hidden, int laye
         gpu->matmul_q4k(gate_buf, wd_buf, o_buf, total_tokens, intermediate_dim, hidden_dim);
     }
 
-    // Sync to ensure computation is complete
-    gpu->sync();
+    // NOTE: No sync here - let commands batch across layers for better pipelining
+    // The sync happens at the end of forward() or when results are needed
 
     // Clean up intermediate buffers
     gate_buf->release();
@@ -1696,10 +1823,142 @@ Result<Tensor> TransformerModel::feed_forward_gpu(const Tensor& hidden, int laye
     return output;
 }
 
-Result<Tensor> TransformerModel::attention_gpu(
+// Allocate GPU KV cache
+Result<void> TransformerModel::allocate_gpu_kv_cache(int max_seq_len) {
+    auto* gpu = get_metal_compute();
+    if (!gpu || !gpu->is_initialized()) {
+        GRANITE_FAIL(ErrorCode::InternalError, "MetalCompute not initialized");
+    }
+
+    gpu_kv_cache_ = std::make_unique<GPUKVCache>();
+    gpu_kv_cache_->max_seq_len = max_seq_len;
+    gpu_kv_cache_->num_kv_heads = config_.num_kv_heads;
+    gpu_kv_cache_->head_dim = config_.head_dim;
+    gpu_kv_cache_->current_len = 0;
+    gpu_kv_cache_->layers.resize(config_.num_layers);
+
+    for (int layer = 0; layer < config_.num_layers; layer++) {
+        auto [k_cache, v_cache] = gpu->create_kv_cache(
+            config_.num_kv_heads,
+            max_seq_len,
+            config_.head_dim
+        );
+        if (!k_cache || !v_cache) {
+            GRANITE_FAIL(ErrorCode::OutOfMemory, "Failed to allocate GPU KV cache");
+        }
+        gpu_kv_cache_->layers[layer].k_cache = k_cache;
+        gpu_kv_cache_->layers[layer].v_cache = v_cache;
+    }
+
+    return {};
+}
+
+// Sync CPU KV cache to GPU KV cache (for transitioning from prefill to decode)
+Result<void> TransformerModel::sync_cpu_to_gpu_kv_cache(KVCache* kv_cache) {
+    if (!kv_cache || !kv_cache->is_allocated()) {
+        GRANITE_FAIL(ErrorCode::InvalidState, "CPU KV cache not allocated");
+    }
+    if (!gpu_kv_cache_ || !gpu_kv_cache_->is_allocated()) {
+        GRANITE_FAIL(ErrorCode::InvalidState, "GPU KV cache not allocated");
+    }
+
+    auto* gpu = get_metal_compute();
+    if (!gpu || !gpu->is_initialized()) {
+        GRANITE_FAIL(ErrorCode::InternalError, "MetalCompute not initialized");
+    }
+
+    int cpu_len = kv_cache->seq_len();
+    if (cpu_len == 0) {
+        gpu_kv_cache_->current_len = 0;
+        return {};
+    }
+
+    if (cpu_len > gpu_kv_cache_->max_seq_len) {
+        GRANITE_FAIL(ErrorCode::InvalidArgument, "CPU cache too large for GPU cache");
+    }
+
+    int num_kv_heads = config_.num_kv_heads;
+    int head_dim = config_.head_dim;
+
+    // Copy each layer's cache
+    for (int layer = 0; layer < config_.num_layers; layer++) {
+        auto [k_cpu, v_cpu] = kv_cache->get(layer);
+
+        auto* k_gpu = static_cast<MTL::Buffer*>(gpu_kv_cache_->layers[layer].k_cache);
+        auto* v_gpu = static_cast<MTL::Buffer*>(gpu_kv_cache_->layers[layer].v_cache);
+
+        // Map CPU buffers (FP16)
+        auto map_k = backend_->map_buffer(k_cpu.buffer());
+        auto map_v = backend_->map_buffer(v_cpu.buffer());
+        if (!map_k.ok() || !map_v.ok()) {
+            GRANITE_FAIL(ErrorCode::InternalError, "Failed to map CPU KV cache");
+        }
+
+        const auto* k_fp16 = static_cast<const uint16_t*>(map_k.value());
+        const auto* v_fp16 = static_cast<const uint16_t*>(map_v.value());
+
+        // Map GPU buffers (FP32)
+        float* k_fp32 = static_cast<float*>(k_gpu->contents());
+        float* v_fp32 = static_cast<float*>(v_gpu->contents());
+
+        // Convert FP16 to FP32 and copy
+        // CPU cache shape: [1, num_kv_heads, max_seq_len, head_dim]
+        // GPU cache shape: [num_kv_heads, max_seq_len, head_dim]
+        int max_seq_cpu = kv_cache->max_seq_len();
+        int max_seq_gpu = gpu_kv_cache_->max_seq_len;
+
+        for (int h = 0; h < num_kv_heads; h++) {
+            for (int s = 0; s < cpu_len; s++) {
+                for (int d = 0; d < head_dim; d++) {
+                    size_t cpu_idx = h * max_seq_cpu * head_dim + s * head_dim + d;
+                    size_t gpu_idx = h * max_seq_gpu * head_dim + s * head_dim + d;
+
+                    // FP16 to FP32 conversion
+                    uint16_t k_bits = k_fp16[cpu_idx];
+                    uint16_t v_bits = v_fp16[cpu_idx];
+
+                    // Simple FP16 decode
+                    auto fp16_to_fp32 = [](uint16_t h) -> float {
+                        uint32_t sign = (h >> 15) & 0x1;
+                        uint32_t exp = (h >> 10) & 0x1F;
+                        uint32_t mant = h & 0x3FF;
+
+                        if (exp == 0) {
+                            if (mant == 0) return sign ? -0.0f : 0.0f;
+                            // Denorm
+                            float f = mant / 1024.0f;
+                            f *= std::pow(2.0f, -14.0f);
+                            return sign ? -f : f;
+                        } else if (exp == 31) {
+                            return mant ? NAN : (sign ? -INFINITY : INFINITY);
+                        }
+
+                        uint32_t f = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+                        float result;
+                        std::memcpy(&result, &f, sizeof(float));
+                        return result;
+                    };
+
+                    k_fp32[gpu_idx] = fp16_to_fp32(k_bits);
+                    v_fp32[gpu_idx] = fp16_to_fp32(v_bits);
+                }
+            }
+        }
+
+        backend_->unmap_buffer(k_cpu.buffer());
+        backend_->unmap_buffer(v_cpu.buffer());
+    }
+
+    gpu_kv_cache_->current_len = cpu_len;
+    GRANITE_LOG_DEBUG("Synced CPU KV cache to GPU: {} tokens", cpu_len);
+
+    return {};
+}
+
+// Full GPU attention (no CPU sync until final output)
+Result<Tensor> TransformerModel::attention_full_gpu(
     const Tensor& hidden,
     int layer,
-    KVCache* kv_cache,
     int start_pos)
 {
     std::string prefix = "blk." + std::to_string(layer) + ".";
@@ -1710,258 +1969,189 @@ Result<Tensor> TransformerModel::attention_gpu(
     const RawWeight* raw_wv = get_raw_weight(prefix + "attn_v.weight");
     const RawWeight* raw_wo = get_raw_weight(prefix + "attn_output.weight");
 
-    // Fall back to CPU if raw weights not available
     if (!raw_wq || !raw_wk || !raw_wv || !raw_wo) {
-        return attention(hidden, layer, kv_cache, start_pos);
+        GRANITE_FAIL(ErrorCode::InternalError, "Missing attention weights");
     }
 
     auto* gpu = get_metal_compute();
-    if (!gpu || !gpu->is_initialized()) {
-        return attention(hidden, layer, kv_cache, start_pos);
+    if (!gpu || !gpu->is_initialized() || !gpu_kv_cache_ || !gpu_kv_cache_->is_allocated()) {
+        GRANITE_FAIL(ErrorCode::InternalError, "GPU or KV cache not initialized");
     }
 
-    int batch = static_cast<int>(hidden.size(0));
-    int seq_len = static_cast<int>(hidden.size(1));
     int hidden_dim = config_.hidden_dim;
     int num_heads = config_.num_heads;
     int num_kv_heads = config_.num_kv_heads;
     int head_dim = config_.head_dim;
     int q_dim = num_heads * head_dim;
     int kv_dim = num_kv_heads * head_dim;
-    int total_tokens = batch * seq_len;
+    int max_seq = gpu_kv_cache_->max_seq_len;
+    int current_len = gpu_kv_cache_->current_len;
+    int total_seq = current_len + 1;  // Including new token
 
-    // For decode (single token), use full GPU path
-    bool is_decode = (total_tokens == 1);
-
-    if (!is_decode) {
-        // For prefill, fall back to CPU (GPU prefill attention not implemented yet)
-        return attention(hidden, layer, kv_cache, start_pos);
-    }
-
-    // Get Metal buffers for weights
+    // Get Metal buffers
     auto* h_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(hidden.buffer()));
     auto* wq_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_wq->buffer));
     auto* wk_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_wk->buffer));
     auto* wv_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_wv->buffer));
     auto* wo_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_wo->buffer));
 
-    if (!h_buf || !wq_buf || !wk_buf || !wv_buf || !wo_buf) {
-        return attention(hidden, layer, kv_cache, start_pos);
-    }
+    // Get KV cache for this layer
+    auto& layer_cache = gpu_kv_cache_->layers[layer];
+    auto* k_cache_buf = static_cast<MTL::Buffer*>(layer_cache.k_cache);
+    auto* v_cache_buf = static_cast<MTL::Buffer*>(layer_cache.v_cache);
 
-    // Allocate GPU buffers for Q, K, V projections
+    // Allocate temporary GPU buffers (could be pooled for better performance)
     MTL::Buffer* q_buf = gpu->create_buffer(q_dim * sizeof(float));
     MTL::Buffer* k_buf = gpu->create_buffer(kv_dim * sizeof(float));
     MTL::Buffer* v_buf = gpu->create_buffer(kv_dim * sizeof(float));
+    MTL::Buffer* attn_out_buf = gpu->create_buffer(q_dim * sizeof(float));
 
-    if (!q_buf || !k_buf || !v_buf) {
+    if (!q_buf || !k_buf || !v_buf || !attn_out_buf) {
         if (q_buf) q_buf->release();
         if (k_buf) k_buf->release();
         if (v_buf) v_buf->release();
-        return attention(hidden, layer, kv_cache, start_pos);
+        if (attn_out_buf) attn_out_buf->release();
+        GRANITE_FAIL(ErrorCode::OutOfMemory, "Failed to allocate attention buffers");
     }
 
-    // GPU Q/K/V projections using Q4_K (batched - no sync between)
-    gpu->matvec_q4k(h_buf, wq_buf, q_buf, hidden_dim, q_dim);
-    gpu->matvec_q4k(h_buf, wk_buf, k_buf, hidden_dim, kv_dim);
-    gpu->matvec_q4k(h_buf, wv_buf, v_buf, hidden_dim, kv_dim);
-
-    // Apply RoPE on GPU (still in same command buffer)
-    gpu->rope_multihead(q_buf, k_buf, num_heads, num_kv_heads, 1, head_dim,
-                        start_pos, config_.rope_theta);
-
-    // Commit and wait - need results for attention computation
-    gpu->sync();
-
-    // Total KV sequence length (including new token)
-    int cached_len = kv_cache ? kv_cache->seq_len() : 0;
-    int total_seq = cached_len + 1;
-
-    // Allocate output buffer
-    std::vector<int64_t> output_shape = {
-        static_cast<int64_t>(batch),
-        static_cast<int64_t>(seq_len),
-        static_cast<int64_t>(hidden_dim)
-    };
+    // Allocate output tensor
+    std::vector<int64_t> output_shape = {1, 1, static_cast<int64_t>(hidden_dim)};
     auto output_result = Tensor::allocate(output_shape, DataType::FP32, backend_);
     if (!output_result.ok()) {
         q_buf->release();
         k_buf->release();
         v_buf->release();
+        attn_out_buf->release();
         return output_result.error();
     }
     auto output = std::move(output_result).take();
-
-    // Allocate buffers for full K/V sequences and attention output
-    MTL::Buffer* k_full_buf = gpu->create_buffer(total_seq * kv_dim * sizeof(float));
-    MTL::Buffer* v_full_buf = gpu->create_buffer(total_seq * kv_dim * sizeof(float));
-    MTL::Buffer* attn_out_buf = gpu->create_buffer(q_dim * sizeof(float));
-
-    if (!k_full_buf || !v_full_buf || !attn_out_buf) {
-        q_buf->release();
-        k_buf->release();
-        v_buf->release();
-        if (k_full_buf) k_full_buf->release();
-        if (v_full_buf) v_full_buf->release();
-        if (attn_out_buf) attn_out_buf->release();
-        return attention(hidden, layer, kv_cache, start_pos);
-    }
-
-    // Fill K/V full buffers from cache + current
-    float* k_full = static_cast<float*>(k_full_buf->contents());
-    float* v_full = static_cast<float*>(v_full_buf->contents());
-
-    // Get current K, V values
-    float* k_data = static_cast<float*>(k_buf->contents());
-    float* v_data = static_cast<float*>(v_buf->contents());
-
-    if (kv_cache && kv_cache->is_allocated() && cached_len > 0) {
-        auto [cached_k, cached_v] = kv_cache->get(layer);
-        auto map_ck = backend_->map_buffer(cached_k.buffer());
-        auto map_cv = backend_->map_buffer(cached_v.buffer());
-
-        if (map_ck.ok() && map_cv.ok()) {
-            const uint16_t* k_cache = static_cast<const uint16_t*>(map_ck.value());
-            const uint16_t* v_cache = static_cast<const uint16_t*>(map_cv.value());
-            int max_seq = kv_cache->max_seq_len();
-
-            // Copy cached K/V and convert to FP32
-            // Cache layout: [num_kv_heads, max_seq, head_dim]
-            // Target layout: [seq, num_kv_heads, head_dim] for attention
-            for (int s = 0; s < cached_len; s++) {
-                for (int h = 0; h < num_kv_heads; h++) {
-                    for (int d = 0; d < head_dim; d++) {
-                        int cache_idx = h * max_seq * head_dim + s * head_dim + d;
-                        int full_idx = s * kv_dim + h * head_dim + d;
-                        k_full[full_idx] = fp16_to_fp32(k_cache[cache_idx]);
-                        v_full[full_idx] = fp16_to_fp32(v_cache[cache_idx]);
-                    }
-                }
-            }
-
-            backend_->unmap_buffer(cached_k.buffer());
-            backend_->unmap_buffer(cached_v.buffer());
-        }
-    }
-
-    // Add current K/V at position cached_len
-    for (int h = 0; h < num_kv_heads; h++) {
-        for (int d = 0; d < head_dim; d++) {
-            int src_idx = h * head_dim + d;
-            int full_idx = cached_len * kv_dim + h * head_dim + d;
-            k_full[full_idx] = k_data[src_idx];
-            v_full[full_idx] = v_data[src_idx];
-        }
-    }
-
-    // Update KV cache with new K, V
-    if (kv_cache && kv_cache->is_allocated()) {
-        auto [cached_k, cached_v] = kv_cache->get(layer);
-        auto map_ck = backend_->map_buffer(cached_k.buffer());
-        auto map_cv = backend_->map_buffer(cached_v.buffer());
-
-        if (map_ck.ok() && map_cv.ok()) {
-            uint16_t* k_cache = static_cast<uint16_t*>(map_ck.value());
-            uint16_t* v_cache = static_cast<uint16_t*>(map_cv.value());
-            int max_seq = kv_cache->max_seq_len();
-
-            // Write new K, V to cache
-            for (int h = 0; h < num_kv_heads; h++) {
-                for (int d = 0; d < head_dim; d++) {
-                    int src_idx = h * head_dim + d;
-                    int dst_idx = h * max_seq * head_dim + cached_len * head_dim + d;
-                    k_cache[dst_idx] = fp32_to_fp16(k_data[src_idx]);
-                    v_cache[dst_idx] = fp32_to_fp16(v_data[src_idx]);
-                }
-            }
-
-            backend_->unmap_buffer(cached_k.buffer());
-            backend_->unmap_buffer(cached_v.buffer());
-
-            // Only update cache length on last layer (same as CPU path)
-            if (layer == config_.num_layers - 1) {
-                kv_cache->increment_seq_len(1);
-            }
-        }
-    }
-
-    // Compute attention for each head (parallelized over heads)
-    // For GQA: multiple Q heads share same K/V head
-    int heads_per_kv = num_heads / num_kv_heads;
-    float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-
-    float* attn_out = static_cast<float*>(attn_out_buf->contents());
-    float* q_data = static_cast<float*>(q_buf->contents());
-
-    // Parallel attention computation over heads using GCD
-#ifdef USE_GCD
-    dispatch_apply(num_heads, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t h_idx) {
-        int h = static_cast<int>(h_idx);
-#else
-    parallel_for(static_cast<size_t>(num_heads), get_num_threads(), [&](size_t h_idx) {
-        int h = static_cast<int>(h_idx);
-#endif
-        int kv_h = h / heads_per_kv;
-        float* q_head = q_data + h * head_dim;
-        float* out_head = attn_out + h * head_dim;
-
-        // Compute attention scores
-        std::vector<float> scores(total_seq);
-        for (int s = 0; s < total_seq; s++) {
-            float* k_vec = k_full + s * kv_dim + kv_h * head_dim;
-            float dot = 0;
-            for (int d = 0; d < head_dim; d++) {
-                dot += q_head[d] * k_vec[d];
-            }
-            scores[s] = dot * scale;
-        }
-
-        // Softmax
-        float max_score = *std::max_element(scores.begin(), scores.end());
-        float sum = 0;
-        for (int s = 0; s < total_seq; s++) {
-            scores[s] = std::exp(scores[s] - max_score);
-            sum += scores[s];
-        }
-        float inv_sum = 1.0f / sum;
-        for (int s = 0; s < total_seq; s++) {
-            scores[s] *= inv_sum;
-        }
-
-        // Weighted sum of values
-        std::fill(out_head, out_head + head_dim, 0.0f);
-        for (int s = 0; s < total_seq; s++) {
-            float* v_vec = v_full + s * kv_dim + kv_h * head_dim;
-            float w = scores[s];
-            for (int d = 0; d < head_dim; d++) {
-                out_head[d] += w * v_vec[d];
-            }
-        }
-#ifdef USE_GCD
-    });
-#else
-    });
-#endif
-
-    // Output projection: attn_out @ wo^T
     auto* o_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(output.buffer()));
-    gpu->matvec_q4k(attn_out_buf, wo_buf, o_buf, q_dim, hidden_dim);
-    gpu->sync();
 
-    // Clean up
+    // === ALL GPU OPERATIONS - NO SYNC UNTIL END ===
+
+    // 1. Q/K/V projections
+    gpu->matvec_q4k(h_buf, wq_buf, q_buf, hidden_dim, q_dim);
+    gpu->matvec_q4k(h_buf, wk_buf, k_buf, hidden_dim, kv_dim);
+    gpu->matvec_q4k(h_buf, wv_buf, v_buf, hidden_dim, kv_dim);
+
+    // 2. Apply RoPE to Q and K
+    gpu->rope_multihead(q_buf, k_buf, num_heads, num_kv_heads, 1, head_dim,
+                        start_pos, config_.rope_theta);
+
+    // 3. Append new K/V to cache
+    gpu->kv_cache_append(
+        k_cache_buf, v_cache_buf,
+        k_buf, v_buf,
+        num_kv_heads, head_dim,
+        current_len, 1, max_seq
+    );
+
+    // 4. Multi-head attention (GPU kernel)
+    float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    gpu->multihead_attention(
+        q_buf,
+        k_cache_buf,
+        v_cache_buf,
+        attn_out_buf,
+        num_heads,
+        num_kv_heads,
+        1,          // seq_q = 1 for decode
+        total_seq,  // seq_kv = all cached + new
+        head_dim,
+        scale
+    );
+
+    // 5. Output projection
+    gpu->matvec_q4k(attn_out_buf, wo_buf, o_buf, q_dim, hidden_dim);
+
+    // Only sync at the end - NOT here, let caller sync
+    // gpu->sync();  // Removed - caller will sync
+
+    // Update cache length only on last layer
+    if (layer == config_.num_layers - 1) {
+        // Need to commit current work before updating length
+        gpu->sync();
+        gpu_kv_cache_->increment_len(1);
+    }
+
+    // Clean up temporary buffers
     q_buf->release();
     k_buf->release();
     v_buf->release();
-    k_full_buf->release();
-    v_full_buf->release();
     attn_out_buf->release();
 
     return output;
 }
+
+Result<Tensor> TransformerModel::attention_gpu(
+    const Tensor& hidden,
+    int layer,
+    KVCache* kv_cache,
+    int start_pos)
+{
+    int batch = static_cast<int>(hidden.size(0));
+    int seq_len = static_cast<int>(hidden.size(1));
+    int total_tokens = batch * seq_len;
+    bool is_decode = (total_tokens == 1);
+
+    // Check if GPU cache exists and is allocated
+    bool has_gpu_cache = gpu_kv_cache_ && gpu_kv_cache_->is_allocated();
+
+    // If decode mode and GPU cache exists
+    if (is_decode && has_gpu_cache) {
+        int gpu_len = gpu_kv_cache_->seq_len();
+
+        // If GPU cache is already valid (gpu_len == start_pos), use GPU path
+        if (gpu_len == start_pos) {
+            auto result = attention_full_gpu(hidden, layer, start_pos);
+            // After last layer, sync CPU cache length to match GPU cache
+            // This keeps forward_single's start_pos calculation correct
+            if (result.ok() && layer == config_.num_layers - 1 && kv_cache) {
+                kv_cache->increment_seq_len(1);
+            }
+            return result;
+        }
+
+        // If GPU cache is behind CPU cache, sync on layer 0
+        if (gpu_len < start_pos && kv_cache && kv_cache->seq_len() >= start_pos) {
+            if (layer == 0) {
+                auto sync_result = sync_cpu_to_gpu_kv_cache(kv_cache);
+                if (!sync_result.ok()) {
+                    GRANITE_LOG_WARN("Failed to sync CPU->GPU KV cache: {}",
+                                     sync_result.error().message());
+                    return attention(hidden, layer, kv_cache, start_pos);
+                }
+            }
+            // After sync, GPU cache should be valid
+            if (gpu_kv_cache_->seq_len() == start_pos) {
+                auto result = attention_full_gpu(hidden, layer, start_pos);
+                // After last layer, sync CPU cache length
+                if (result.ok() && layer == config_.num_layers - 1 && kv_cache) {
+                    kv_cache->increment_seq_len(1);
+                }
+                return result;
+            }
+        }
+
+        // If GPU cache is ahead, something is wrong - fall back to CPU
+        // This shouldn't happen in normal operation
+    }
+
+    // Fall back to CPU attention for prefill or when GPU cache is not valid
+    return attention(hidden, layer, kv_cache, start_pos);
+}
+
 #else
 // Non-Metal stubs
 Result<Tensor> TransformerModel::feed_forward_gpu(const Tensor& hidden, int layer) {
     return feed_forward(hidden, layer);
+}
+
+Result<Tensor> TransformerModel::attention_full_gpu(
+    const Tensor& hidden,
+    int layer,
+    int start_pos) {
+    return attention(hidden, layer, nullptr, start_pos);
 }
 
 Result<Tensor> TransformerModel::attention_gpu(

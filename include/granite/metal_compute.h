@@ -78,10 +78,19 @@ public:
     // LLM Operations - Element-wise
     // =============================================================================
 
-    // RMS Normalization
+    // RMS Normalization (FP32 weights)
     Result<void> rms_norm(
         MTL::Buffer* x,
         MTL::Buffer* weight,
+        MTL::Buffer* out,
+        uint32_t size,
+        float eps
+    );
+
+    // RMS Normalization with FP16 weights
+    Result<void> rms_norm_f16(
+        MTL::Buffer* x,
+        MTL::Buffer* weight,  // FP16 weights
         MTL::Buffer* out,
         uint32_t size,
         float eps
@@ -153,6 +162,52 @@ public:
         uint32_t head_dim,        // Head dimension
         uint32_t start_pos,       // Position for causal mask
         float scale               // 1/sqrt(head_dim)
+    );
+
+    // =============================================================================
+    // GPU KV Cache
+    // =============================================================================
+
+    // Allocate GPU KV cache for a layer
+    // Returns pair of (K buffer, V buffer)
+    // Shape: [num_kv_heads, max_seq_len, head_dim]
+    std::pair<MTL::Buffer*, MTL::Buffer*> create_kv_cache(
+        uint32_t num_kv_heads,
+        uint32_t max_seq_len,
+        uint32_t head_dim
+    );
+
+    // Append new K/V to GPU cache
+    // new_k, new_v: [num_kv_heads, seq_len, head_dim]
+    // cache_k, cache_v: [num_kv_heads, max_seq_len, head_dim]
+    Result<void> kv_cache_append(
+        MTL::Buffer* cache_k,
+        MTL::Buffer* cache_v,
+        MTL::Buffer* new_k,
+        MTL::Buffer* new_v,
+        uint32_t num_kv_heads,
+        uint32_t head_dim,
+        uint32_t current_len,      // Current cache length
+        uint32_t new_len,          // Length of new K/V (usually 1 for decode)
+        uint32_t max_seq_len       // Max cache length
+    );
+
+    // Multi-head attention on GPU
+    // Q: [num_heads, seq_q, head_dim]
+    // K: [num_kv_heads, seq_kv, head_dim]
+    // V: [num_kv_heads, seq_kv, head_dim]
+    // output: [num_heads, seq_q, head_dim]
+    Result<void> multihead_attention(
+        MTL::Buffer* Q,
+        MTL::Buffer* K,
+        MTL::Buffer* V,
+        MTL::Buffer* output,
+        uint32_t num_heads,
+        uint32_t num_kv_heads,
+        uint32_t seq_q,
+        uint32_t seq_kv,
+        uint32_t head_dim,
+        float scale
     );
 
     // =============================================================================

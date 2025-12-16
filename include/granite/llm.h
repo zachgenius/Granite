@@ -57,6 +57,31 @@ struct ModelConfig {
 };
 
 // =============================================================================
+// GPU KV Cache (Metal-native)
+// =============================================================================
+
+#ifdef GRANITE_HAS_METAL
+// Forward declaration - actual type is in Metal framework
+struct GPUKVCache {
+    struct LayerCache {
+        void* k_cache = nullptr;  // MTL::Buffer* [num_kv_heads, max_seq_len, head_dim]
+        void* v_cache = nullptr;  // MTL::Buffer*
+    };
+
+    std::vector<LayerCache> layers;
+    int max_seq_len = 0;
+    int current_len = 0;
+    int num_kv_heads = 0;
+    int head_dim = 0;
+
+    bool is_allocated() const { return !layers.empty(); }
+    int seq_len() const { return current_len; }
+    void clear() { current_len = 0; }
+    void increment_len(int delta = 1) { current_len += delta; }
+};
+#endif
+
+// =============================================================================
 // KV Cache
 // =============================================================================
 
@@ -258,6 +283,18 @@ public:
     /// Get raw weight by name (for GPU path)
     [[nodiscard]] const RawWeight* get_raw_weight(const std::string& name) const;
 
+#ifdef GRANITE_HAS_METAL
+    /// Allocate GPU KV cache
+    Result<void> allocate_gpu_kv_cache(int max_seq_len);
+
+    /// Sync CPU KV cache to GPU KV cache (for transitioning from prefill to decode)
+    Result<void> sync_cpu_to_gpu_kv_cache(KVCache* kv_cache);
+
+    /// Get GPU KV cache
+    GPUKVCache* gpu_kv_cache() { return gpu_kv_cache_.get(); }
+    const GPUKVCache* gpu_kv_cache() const { return gpu_kv_cache_.get(); }
+#endif
+
 private:
     ModelConfig config_;
     std::unordered_map<std::string, Tensor> weights_;
@@ -266,6 +303,10 @@ private:
     IComputeBackend* backend_ = nullptr;
     std::unique_ptr<GGUFFile> gguf_;
     bool use_gpu_ = false;
+
+#ifdef GRANITE_HAS_METAL
+    std::unique_ptr<GPUKVCache> gpu_kv_cache_;
+#endif
 
     // Layer forward pass
     Result<Tensor> transformer_block(
@@ -292,6 +333,12 @@ private:
         const Tensor& hidden,
         int layer,
         KVCache* kv_cache,
+        int start_pos);
+
+    // Full GPU attention (no CPU sync until output)
+    Result<Tensor> attention_full_gpu(
+        const Tensor& hidden,
+        int layer,
         int start_pos);
 
     // Helper functions

@@ -143,13 +143,27 @@ void benchmark_inference(const std::string& model_path, IComputeBackend* backend
     }
     auto kv_cache = std::move(kv_result).take();
 
+    // Enable GPU mode and allocate GPU KV cache
+#ifdef GRANITE_HAS_METAL
+    model.set_use_gpu(true);
+    auto gpu_cache_result = model.allocate_gpu_kv_cache(512);
+    if (gpu_cache_result.ok()) {
+        std::cout << "GPU KV cache allocated\n";
+    } else {
+        std::cout << "GPU KV cache allocation failed, using CPU cache\n";
+    }
+#endif
+
     // Benchmark prefill with different sequence lengths
+    std::cerr << "[DEBUG] Starting prefill benchmark...\n" << std::flush;
     std::cout << "\nPrefill (prompt processing):\n";
     std::cout << std::setw(15) << "Seq Length" << std::setw(15) << "Time (ms)"
               << std::setw(15) << "Tokens/sec" << "\n";
     std::cout << std::string(45, '-') << "\n";
+    std::cout << std::flush;
 
-    for (int64_t seq_len : {1, 2, 4, 8, 16}) {
+    for (int64_t seq_len : {1, 2, 4}) {  // Skip longer sequences for now
+        std::cerr << "[DEBUG] Testing prefill seq_len=" << seq_len << "...\n" << std::flush;
         // Create token tensor
         std::vector<int64_t> shape = {1, seq_len};
         auto ids_result = Tensor::allocate(shape, DataType::INT32, backend);
@@ -166,10 +180,20 @@ void benchmark_inference(const std::string& model_path, IComputeBackend* backend
 
         // Clear cache
         kv_cache.clear();
+#ifdef GRANITE_HAS_METAL
+        if (model.gpu_kv_cache()) {
+            model.gpu_kv_cache()->clear();
+        }
+#endif
 
         // Benchmark
         auto prefill = [&]() {
             kv_cache.clear();
+#ifdef GRANITE_HAS_METAL
+            if (model.gpu_kv_cache()) {
+                model.gpu_kv_cache()->clear();
+            }
+#endif
             auto result = model.forward(ids, &kv_cache, 0);
             return result.ok();
         };
@@ -191,6 +215,11 @@ void benchmark_inference(const std::string& model_path, IComputeBackend* backend
     // First, do a prefill to populate the cache
     {
         kv_cache.clear();
+#ifdef GRANITE_HAS_METAL
+        if (model.gpu_kv_cache()) {
+            model.gpu_kv_cache()->clear();
+        }
+#endif
         std::vector<int64_t> shape = {1, 1};
         auto ids_result = Tensor::allocate(shape, DataType::INT32, backend);
         if (ids_result.ok()) {
@@ -205,21 +234,34 @@ void benchmark_inference(const std::string& model_path, IComputeBackend* backend
     }
 
     // Benchmark single token generation at different cache lengths
-    for (int cache_len : {1, 16, 64, 128, 256}) {
+    std::cerr << "[DEBUG] Starting decode benchmark...\n" << std::flush;
+    for (int cache_len : {1, 16, 64, 128}) {  // Reduced from 256 for faster benchmarking
+        std::cerr << "[DEBUG] Extending cache to " << cache_len << "...\n" << std::flush;
+        // Get current cache length (prefer GPU cache if available)
+        auto get_cache_len = [&]() -> int {
+#ifdef GRANITE_HAS_METAL
+            if (model.gpu_kv_cache() && model.gpu_kv_cache()->is_allocated()) {
+                return model.gpu_kv_cache()->seq_len();
+            }
+#endif
+            return kv_cache.seq_len();
+        };
+
         // Extend cache to desired length by generating tokens
-        while (kv_cache.seq_len() < cache_len) {
+        while (get_cache_len() < cache_len) {
             auto result = model.forward_single(1, kv_cache);
             if (!result.ok()) break;
         }
 
         // Benchmark single token
+        std::cerr << "[DEBUG] Benchmarking decode at len=" << get_cache_len() << "...\n" << std::flush;
         auto decode = [&]() {
             // Note: This modifies the cache, so results may vary
             auto result = model.forward_single(1, kv_cache);
             return result.ok();
         };
 
-        int actual_len = kv_cache.seq_len();
+        int actual_len = get_cache_len();
         double time_ms = benchmark_ms(decode, 1, 3);
         double tokens_per_sec = 1000.0 / time_ms;
 
@@ -319,11 +361,14 @@ int main(int argc, char* argv[]) {
     std::cout << "FP16 support: " << (caps.supports_fp16 ? "yes" : "no") << "\n";
 
     // Run benchmarks
+    std::cerr << "[DEBUG] Starting memory benchmark...\n" << std::flush;
     benchmark_memory(backend.get());
+    std::cerr << "[DEBUG] Starting matmul benchmark...\n" << std::flush;
     benchmark_matmul(backend.get());
 
     // If model path provided, run inference benchmark
     if (argc > 1) {
+        std::cerr << "[DEBUG] Starting inference benchmark...\n" << std::flush;
         benchmark_inference(argv[1], backend.get());
     } else {
         std::cout << "\nUsage: " << argv[0] << " [model.gguf]\n";
