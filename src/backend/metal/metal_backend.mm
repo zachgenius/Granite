@@ -247,6 +247,14 @@ public:
         return {};
     }
 
+    void* get_native_buffer(BufferHandle handle) override {
+        auto it = buffers_.find(handle);
+        if (it == buffers_.end()) {
+            return nullptr;
+        }
+        return static_cast<void*>(it->second);
+    }
+
     Result<PipelineHandle> create_pipeline(const PipelineDesc& desc) override {
         if (!initialized_) {
             return Error(ErrorCode::BackendNotInitialized);

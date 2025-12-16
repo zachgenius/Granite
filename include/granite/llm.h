@@ -16,6 +16,17 @@
 namespace granite {
 
 // =============================================================================
+// Raw Quantized Weight (for GPU acceleration)
+// =============================================================================
+
+struct RawWeight {
+    BufferHandle buffer;          // Raw quantized data
+    GGMLType quant_type;          // Quantization type (Q4_K, Q8_0, etc.)
+    std::vector<int64_t> shape;   // Original shape
+    size_t size_bytes = 0;        // Size in bytes
+};
+
+// =============================================================================
 // Model Configuration
 // =============================================================================
 
@@ -237,12 +248,21 @@ public:
     /// Check if model is loaded
     [[nodiscard]] bool is_loaded() const { return !weights_.empty(); }
 
+    /// Enable/disable GPU acceleration
+    void set_use_gpu(bool use_gpu) { use_gpu_ = use_gpu; }
+    [[nodiscard]] bool use_gpu() const { return use_gpu_; }
+
+    /// Get raw weight by name (for GPU path)
+    [[nodiscard]] const RawWeight* get_raw_weight(const std::string& name) const;
+
 private:
     ModelConfig config_;
     std::unordered_map<std::string, Tensor> weights_;
+    std::unordered_map<std::string, RawWeight> raw_weights_;  // Raw quantized for GPU
     RoPECache rope_cache_;
     IComputeBackend* backend_ = nullptr;
     std::unique_ptr<GGUFFile> gguf_;
+    bool use_gpu_ = false;
 
     // Layer forward pass
     Result<Tensor> transformer_block(
@@ -260,6 +280,16 @@ private:
 
     // FFN forward (SwiGLU)
     Result<Tensor> feed_forward(const Tensor& hidden, int layer);
+
+    // GPU-accelerated FFN (uses raw Q4_K weights)
+    Result<Tensor> feed_forward_gpu(const Tensor& hidden, int layer);
+
+    // GPU-accelerated attention
+    Result<Tensor> attention_gpu(
+        const Tensor& hidden,
+        int layer,
+        KVCache* kv_cache,
+        int start_pos);
 
     // Helper functions
     Tensor apply_rms_norm(const Tensor& input, const Tensor* weight);

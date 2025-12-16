@@ -108,6 +108,7 @@ if(APPLE AND GRANITE_BUILD_METAL)
         src/backend/metal/metal_backend.mm
         src/backend/metal/metal_buffer.mm
         src/backend/metal/metal_pipeline.mm
+        src/backend/metal/metal_compute.mm
         src/operators/metal/metal_operators.mm
     )
 

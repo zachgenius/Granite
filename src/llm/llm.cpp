@@ -24,6 +24,12 @@
 #define USE_GCD 1
 #endif
 
+// Metal GPU compute (Apple platforms only)
+#ifdef GRANITE_HAS_METAL
+#include <Metal/Metal.hpp>
+#include "granite/metal_compute.h"
+#endif
+
 namespace granite {
 
 // =============================================================================
@@ -679,7 +685,7 @@ Result<TransformerModel> TransformerModel::load(
         model.config_.head_dim,
         model.config_.rope_theta);
 
-    // Load weights
+    // Load weights (dequantized for CPU path)
     ModelLoader loader(backend);
     auto weights_result = loader.load_weights(*model.gguf_);
     if (!weights_result.ok()) {
@@ -687,7 +693,63 @@ Result<TransformerModel> TransformerModel::load(
     }
     model.weights_ = std::move(weights_result).take();
 
-    GRANITE_LOG_INFO("Loaded model: {} weights", model.weights_.size());
+    // Also load raw quantized weights for GPU path
+    // Only load Q4_K weights that are used in matmul operations
+    for (const auto& info : model.gguf_->tensors()) {
+        // Only keep raw weights for quantized types used in projections
+        if (info.type != GGMLType::Q4_K && info.type != GGMLType::Q6_K) {
+            continue;
+        }
+
+        // Skip non-projection weights (embeddings, norms)
+        if (info.name.find(".weight") == std::string::npos ||
+            info.name.find("_norm") != std::string::npos ||
+            info.name.find("embd") != std::string::npos) {
+            continue;
+        }
+
+        // Create buffer for raw quantized data
+        BufferDesc desc;
+        desc.size = info.size_bytes();
+        desc.memory_type = MemoryType::Shared;
+
+        auto buf_result = backend->create_buffer(desc);
+        if (!buf_result.ok()) {
+            GRANITE_LOG_WARN("Failed to create raw weight buffer for {}", info.name);
+            continue;
+        }
+
+        // Copy raw data to buffer
+        auto write_result = backend->write_buffer(
+            buf_result.value(),
+            model.gguf_->tensor_data(info),
+            info.size_bytes());
+
+        if (!write_result.ok()) {
+            backend->destroy_buffer(buf_result.value());
+            continue;
+        }
+
+        // Store raw weight info
+        RawWeight raw;
+        raw.buffer = buf_result.value();
+        raw.quant_type = info.type;
+        raw.shape = std::vector<int64_t>(info.dimensions.rbegin(), info.dimensions.rend());
+        raw.size_bytes = info.size_bytes();
+
+        model.raw_weights_[info.name] = raw;
+    }
+
+    GRANITE_LOG_INFO("Loaded model: {} weights ({} raw for GPU)",
+                     model.weights_.size(), model.raw_weights_.size());
+
+    // Enable GPU if Metal backend and raw weights available
+#ifdef GRANITE_HAS_METAL
+    if (backend->get_type() == BackendType::Metal && !model.raw_weights_.empty()) {
+        model.use_gpu_ = true;
+        GRANITE_LOG_INFO("GPU acceleration enabled");
+    }
+#endif
 
     return model;
 }
@@ -695,6 +757,14 @@ Result<TransformerModel> TransformerModel::load(
 const Tensor* TransformerModel::get_weight(const std::string& name) const {
     auto it = weights_.find(name);
     if (it == weights_.end()) {
+        return nullptr;
+    }
+    return &it->second;
+}
+
+const RawWeight* TransformerModel::get_raw_weight(const std::string& name) const {
+    auto it = raw_weights_.find(name);
+    if (it == raw_weights_.end()) {
         return nullptr;
     }
     return &it->second;
@@ -1095,8 +1165,13 @@ Result<Tensor> TransformerModel::transformer_block(
     // 4. RMSNorm for FFN
     auto ffn_input = apply_rms_norm(post_attn, ffn_norm_weight);
 
-    // 5. Feed forward (SwiGLU)
+    // 5. Feed forward (SwiGLU) - use GPU if available
+#ifdef GRANITE_HAS_METAL
+    auto ffn_result = use_gpu_ ? feed_forward_gpu(ffn_input, layer)
+                               : feed_forward(ffn_input, layer);
+#else
     auto ffn_result = feed_forward(ffn_input, layer);
+#endif
     if (!ffn_result.ok()) {
         return ffn_result.error();
     }
@@ -1512,6 +1587,135 @@ Result<Tensor> TransformerModel::feed_forward(const Tensor& hidden, int layer) {
 
     return output;
 }
+
+#ifdef GRANITE_HAS_METAL
+Result<Tensor> TransformerModel::feed_forward_gpu(const Tensor& hidden, int layer) {
+    std::string prefix = "blk." + std::to_string(layer) + ".";
+
+    // Get raw Q4_K weights for GPU
+    const RawWeight* w_gate = get_raw_weight(prefix + "ffn_gate.weight");
+    const RawWeight* w_up = get_raw_weight(prefix + "ffn_up.weight");
+    const RawWeight* w_down = get_raw_weight(prefix + "ffn_down.weight");
+
+    // Fall back to CPU if raw weights not available
+    if (!w_gate || !w_up || !w_down) {
+        GRANITE_LOG_DEBUG("GPU weights not available for layer {}, falling back to CPU", layer);
+        return feed_forward(hidden, layer);
+    }
+
+    // Only support Q4_K for now
+    if (w_gate->quant_type != GGMLType::Q4_K) {
+        return feed_forward(hidden, layer);
+    }
+
+    auto* gpu = get_metal_compute();
+    if (!gpu || !gpu->is_initialized()) {
+        return feed_forward(hidden, layer);
+    }
+
+    int batch = static_cast<int>(hidden.size(0));
+    int seq_len = static_cast<int>(hidden.size(1));
+    int hidden_dim = config_.hidden_dim;
+    int intermediate_dim = config_.intermediate_dim;
+    int total_tokens = batch * seq_len;
+
+    // Allocate output tensor
+    std::vector<int64_t> output_shape = {
+        static_cast<int64_t>(batch),
+        static_cast<int64_t>(seq_len),
+        static_cast<int64_t>(hidden_dim)
+    };
+    auto output_result = Tensor::allocate(output_shape, DataType::FP32, backend_);
+    if (!output_result.ok()) {
+        return output_result.error();
+    }
+    auto output = std::move(output_result).take();
+
+    // Get Metal buffers
+    auto* h_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(hidden.buffer()));
+    auto* o_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(output.buffer()));
+    auto* wg_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(w_gate->buffer));
+    auto* wu_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(w_up->buffer));
+    auto* wd_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(w_down->buffer));
+
+    if (!h_buf || !o_buf || !wg_buf || !wu_buf || !wd_buf) {
+        GRANITE_LOG_WARN("Failed to get Metal buffers, falling back to CPU");
+        return feed_forward(hidden, layer);
+    }
+
+    // Create intermediate buffers on GPU
+    MTL::Buffer* gate_buf = gpu->create_buffer(total_tokens * intermediate_dim * sizeof(float));
+    MTL::Buffer* up_buf = gpu->create_buffer(total_tokens * intermediate_dim * sizeof(float));
+
+    if (!gate_buf || !up_buf) {
+        if (gate_buf) gate_buf->release();
+        if (up_buf) up_buf->release();
+        return feed_forward(hidden, layer);
+    }
+
+    // FFN computation on GPU:
+    // gate = hidden @ w_gate.T (Q4_K)
+    // up = hidden @ w_up.T (Q4_K)
+    // gate = silu(gate)
+    // intermediate = gate * up
+    // output = intermediate @ w_down.T (Q4_K)
+
+    // For single token (decode), use matvec_q4k
+    if (total_tokens == 1) {
+        // gate = x @ W_gate^T
+        gpu->matvec_q4k(h_buf, wg_buf, gate_buf, hidden_dim, intermediate_dim);
+        // up = x @ W_up^T
+        gpu->matvec_q4k(h_buf, wu_buf, up_buf, hidden_dim, intermediate_dim);
+        // silu(gate)
+        gpu->silu(gate_buf, intermediate_dim);
+        // gate = gate * up (reuse gate_buf for result)
+        gpu->elementwise_mul(gate_buf, up_buf, gate_buf, intermediate_dim);
+        // output = intermediate @ W_down^T
+        gpu->matvec_q4k(gate_buf, wd_buf, o_buf, intermediate_dim, hidden_dim);
+    } else {
+        // Batched: use matmul_q4k
+        gpu->matmul_q4k(h_buf, wg_buf, gate_buf, total_tokens, hidden_dim, intermediate_dim);
+        gpu->matmul_q4k(h_buf, wu_buf, up_buf, total_tokens, hidden_dim, intermediate_dim);
+        gpu->silu(gate_buf, total_tokens * intermediate_dim);
+        gpu->elementwise_mul(gate_buf, up_buf, gate_buf, total_tokens * intermediate_dim);
+        gpu->matmul_q4k(gate_buf, wd_buf, o_buf, total_tokens, intermediate_dim, hidden_dim);
+    }
+
+    // Sync to ensure computation is complete
+    gpu->sync();
+
+    // Clean up intermediate buffers
+    gate_buf->release();
+    up_buf->release();
+
+    return output;
+}
+
+Result<Tensor> TransformerModel::attention_gpu(
+    const Tensor& hidden,
+    int layer,
+    KVCache* kv_cache,
+    int start_pos)
+{
+    // For now, fall back to CPU attention
+    // GPU attention requires more complex implementation with KV cache handling
+    return attention(hidden, layer, kv_cache, start_pos);
+}
+#else
+// Non-Metal stubs
+Result<Tensor> TransformerModel::feed_forward_gpu(const Tensor& hidden, int layer) {
+    return feed_forward(hidden, layer);
+}
+
+Result<Tensor> TransformerModel::attention_gpu(
+    const Tensor& hidden,
+    int layer,
+    KVCache* kv_cache,
+    int start_pos)
+{
+    return attention(hidden, layer, kv_cache, start_pos);
+}
+#endif
 
 // =============================================================================
 // LLMRunner Implementation

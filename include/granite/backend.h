@@ -89,6 +89,10 @@ public:
                                       size_t src_offset = 0,
                                       size_t dst_offset = 0) = 0;
 
+    /// Get native buffer pointer (e.g., MTL::Buffer* for Metal)
+    /// Returns nullptr if not supported or handle is invalid
+    virtual void* get_native_buffer(BufferHandle handle) { (void)handle; return nullptr; }
+
     // -------------------------------------------------------------------------
     // Compute Pipeline
     // -------------------------------------------------------------------------
