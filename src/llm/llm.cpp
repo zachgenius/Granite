@@ -1208,71 +1208,98 @@ Result<Tensor> TransformerModel::transformer_block(
             auto* ffn_norm_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(ffn_norm_weight->buffer()));
 
             if (h_buf && attn_norm_buf && ffn_norm_buf) {
-                // Allocate output and temp buffers
-                std::vector<int64_t> output_shape = {1, 1, static_cast<int64_t>(hidden_dim)};
-                auto attn_in_result = Tensor::allocate(output_shape, DataType::FP32, backend_);
-                auto post_attn_result = Tensor::allocate(output_shape, DataType::FP32, backend_);
-                auto ffn_in_result = Tensor::allocate(output_shape, DataType::FP32, backend_);
-                auto output_result = Tensor::allocate(output_shape, DataType::FP32, backend_);
+                // Use pooled buffers if available
+                MTL::Buffer* attn_in_buf;
+                MTL::Buffer* post_attn_buf;
+                MTL::Buffer* ffn_in_buf;
+                MTL::Buffer* out_buf;
 
-                if (attn_in_result.ok() && post_attn_result.ok() && ffn_in_result.ok() && output_result.ok()) {
-                    auto attn_input = std::move(attn_in_result).take();
-                    auto post_attn = std::move(post_attn_result).take();
-                    auto ffn_input = std::move(ffn_in_result).take();
-                    auto output = std::move(output_result).take();
+                Tensor attn_input, post_attn, ffn_input, output;
+                bool use_pool = decode_pool_ && decode_pool_->initialized;
 
-                    auto* attn_in_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(attn_input.buffer()));
-                    auto* post_attn_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(post_attn.buffer()));
-                    auto* ffn_in_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(ffn_input.buffer()));
-                    auto* out_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(output.buffer()));
+                if (use_pool) {
+                    // Use preallocated buffers
+                    attn_in_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(decode_pool_->attn_input.buffer()));
+                    post_attn_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(decode_pool_->post_attn.buffer()));
+                    ffn_in_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(decode_pool_->ffn_input.buffer()));
+                    out_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(decode_pool_->block_output.buffer()));
 
-                    // 1. GPU RMSNorm for attention
-                    bool is_f16_weight = (attn_norm_weight->dtype() == DataType::FP16);
-                    if (is_f16_weight) {
-                        gpu->rms_norm_f16(h_buf, attn_norm_buf, attn_in_buf,
-                                         hidden_dim, config_.rms_norm_eps);
-                    } else {
-                        gpu->rms_norm(h_buf, attn_norm_buf, attn_in_buf,
-                                     hidden_dim, config_.rms_norm_eps);
+                    // Reference the tensors (not taking ownership)
+                    attn_input = decode_pool_->attn_input;
+                    post_attn = decode_pool_->post_attn;
+                    ffn_input = decode_pool_->ffn_input;
+                    output = decode_pool_->block_output;
+                } else {
+                    // Fallback to allocation
+                    std::vector<int64_t> output_shape = {1, 1, static_cast<int64_t>(hidden_dim)};
+                    auto attn_in_result = Tensor::allocate(output_shape, DataType::FP32, backend_);
+                    auto post_attn_result = Tensor::allocate(output_shape, DataType::FP32, backend_);
+                    auto ffn_in_result = Tensor::allocate(output_shape, DataType::FP32, backend_);
+                    auto output_result = Tensor::allocate(output_shape, DataType::FP32, backend_);
+
+                    if (!attn_in_result.ok() || !post_attn_result.ok() ||
+                        !ffn_in_result.ok() || !output_result.ok()) {
+                        goto cpu_path;  // Fallback to CPU
                     }
 
-                    // 2. GPU Attention
-                    auto attn_result = attention_gpu(attn_input, layer, kv_cache, start_pos);
-                    if (!attn_result.ok()) {
-                        return attn_result.error();
-                    }
-                    auto attn_output = std::move(attn_result).take();
-                    auto* attn_out_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(attn_output.buffer()));
+                    attn_input = std::move(attn_in_result).take();
+                    post_attn = std::move(post_attn_result).take();
+                    ffn_input = std::move(ffn_in_result).take();
+                    output = std::move(output_result).take();
 
-                    // 3. GPU Residual add: post_attn = hidden + attn_output
-                    gpu->elementwise_add(h_buf, attn_out_buf, post_attn_buf, hidden_dim);
-
-                    // 4. GPU RMSNorm for FFN
-                    is_f16_weight = (ffn_norm_weight->dtype() == DataType::FP16);
-                    if (is_f16_weight) {
-                        gpu->rms_norm_f16(post_attn_buf, ffn_norm_buf, ffn_in_buf,
-                                         hidden_dim, config_.rms_norm_eps);
-                    } else {
-                        gpu->rms_norm(post_attn_buf, ffn_norm_buf, ffn_in_buf,
-                                     hidden_dim, config_.rms_norm_eps);
-                    }
-
-                    // 5. GPU Feed forward
-                    auto ffn_result = feed_forward_gpu(ffn_input, layer);
-                    if (!ffn_result.ok()) {
-                        return ffn_result.error();
-                    }
-                    auto ffn_output = std::move(ffn_result).take();
-                    auto* ffn_out_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(ffn_output.buffer()));
-
-                    // 6. GPU Residual add: output = post_attn + ffn_output
-                    gpu->elementwise_add(post_attn_buf, ffn_out_buf, out_buf, hidden_dim);
-
-                    return output;
+                    attn_in_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(attn_input.buffer()));
+                    post_attn_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(post_attn.buffer()));
+                    ffn_in_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(ffn_input.buffer()));
+                    out_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(output.buffer()));
                 }
+
+                // 1. GPU RMSNorm for attention
+                bool is_f16_weight = (attn_norm_weight->dtype() == DataType::FP16);
+                if (is_f16_weight) {
+                    gpu->rms_norm_f16(h_buf, attn_norm_buf, attn_in_buf,
+                                     hidden_dim, config_.rms_norm_eps);
+                } else {
+                    gpu->rms_norm(h_buf, attn_norm_buf, attn_in_buf,
+                                 hidden_dim, config_.rms_norm_eps);
+                }
+
+                // 2. GPU Attention
+                auto attn_result = attention_gpu(attn_input, layer, kv_cache, start_pos);
+                if (!attn_result.ok()) {
+                    return attn_result.error();
+                }
+                auto attn_output = std::move(attn_result).take();
+                auto* attn_out_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(attn_output.buffer()));
+
+                // 3. GPU Residual add: post_attn = hidden + attn_output
+                gpu->elementwise_add(h_buf, attn_out_buf, post_attn_buf, hidden_dim);
+
+                // 4. GPU RMSNorm for FFN
+                is_f16_weight = (ffn_norm_weight->dtype() == DataType::FP16);
+                if (is_f16_weight) {
+                    gpu->rms_norm_f16(post_attn_buf, ffn_norm_buf, ffn_in_buf,
+                                     hidden_dim, config_.rms_norm_eps);
+                } else {
+                    gpu->rms_norm(post_attn_buf, ffn_norm_buf, ffn_in_buf,
+                                 hidden_dim, config_.rms_norm_eps);
+                }
+
+                // 5. GPU Feed forward
+                auto ffn_result = feed_forward_gpu(ffn_input, layer);
+                if (!ffn_result.ok()) {
+                    return ffn_result.error();
+                }
+                auto ffn_output = std::move(ffn_result).take();
+                auto* ffn_out_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(ffn_output.buffer()));
+
+                // 6. GPU Residual add: output = post_attn + ffn_output
+                gpu->elementwise_add(post_attn_buf, ffn_out_buf, out_buf, hidden_dim);
+
+                return output;
             }
         }
     }
+cpu_path:
 #endif
 
     // CPU path (or fallback)
@@ -1870,6 +1897,48 @@ Result<void> TransformerModel::allocate_gpu_kv_cache(int max_seq_len) {
         gpu_kv_cache_->layers[layer].v_cache = v_cache;
     }
 
+    // Also initialize decode buffer pool
+    auto pool_result = init_decode_pool();
+    if (!pool_result.ok()) {
+        GRANITE_LOG_WARN("Failed to initialize decode buffer pool: {}", pool_result.error().message());
+    }
+
+    return {};
+}
+
+// Initialize decode buffer pool for single-token decode
+Result<void> TransformerModel::init_decode_pool() {
+    if (decode_pool_ && decode_pool_->initialized) {
+        return {};  // Already initialized
+    }
+
+    decode_pool_ = std::make_unique<DecodeBufferPool>();
+
+    std::vector<int64_t> hidden_shape = {1, 1, static_cast<int64_t>(config_.hidden_dim)};
+    std::vector<int64_t> logits_shape = {1, 1, static_cast<int64_t>(config_.vocab_size)};
+
+    // Allocate buffers
+    auto attn_in = Tensor::allocate(hidden_shape, DataType::FP32, backend_);
+    auto post_attn = Tensor::allocate(hidden_shape, DataType::FP32, backend_);
+    auto ffn_in = Tensor::allocate(hidden_shape, DataType::FP32, backend_);
+    auto block_out = Tensor::allocate(hidden_shape, DataType::FP32, backend_);
+    auto norm_out = Tensor::allocate(hidden_shape, DataType::FP32, backend_);
+    auto logits = Tensor::allocate(logits_shape, DataType::FP32, backend_);
+
+    if (!attn_in.ok() || !post_attn.ok() || !ffn_in.ok() ||
+        !block_out.ok() || !norm_out.ok() || !logits.ok()) {
+        return Error(ErrorCode::OutOfMemory, "Failed to allocate decode buffer pool");
+    }
+
+    decode_pool_->attn_input = std::move(attn_in).take();
+    decode_pool_->post_attn = std::move(post_attn).take();
+    decode_pool_->ffn_input = std::move(ffn_in).take();
+    decode_pool_->block_output = std::move(block_out).take();
+    decode_pool_->norm_out = std::move(norm_out).take();
+    decode_pool_->logits = std::move(logits).take();
+    decode_pool_->initialized = true;
+
+    GRANITE_LOG_DEBUG("Decode buffer pool initialized");
     return {};
 }
 

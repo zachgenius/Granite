@@ -306,6 +306,21 @@ private:
 
 #ifdef GRANITE_HAS_METAL
     std::unique_ptr<GPUKVCache> gpu_kv_cache_;
+
+    // Decode buffer pool - preallocated buffers for single-token decode
+    struct DecodeBufferPool {
+        bool initialized = false;
+        Tensor attn_input;      // [1, 1, hidden_dim]
+        Tensor post_attn;       // [1, 1, hidden_dim]
+        Tensor ffn_input;       // [1, 1, hidden_dim]
+        Tensor block_output;    // [1, 1, hidden_dim]
+        Tensor norm_out;        // [1, 1, hidden_dim]
+        Tensor logits;          // [1, 1, vocab_size]
+    };
+    std::unique_ptr<DecodeBufferPool> decode_pool_;
+
+    // Initialize decode buffer pool
+    Result<void> init_decode_pool();
 #endif
 
     // Layer forward pass

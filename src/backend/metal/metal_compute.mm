@@ -42,8 +42,11 @@ inline void get_scale_min_k4(int j, const device uint8_t* q, thread uint8_t& sc,
     }
 }
 
-// SIMD-optimized matvec for Q4_K
-// Each SIMD group (32 threads) processes one output row together
+// Optimized matvec for Q4_K using SIMD groups
+// Each SIMD group (32 threads) handles one output row
+// All 32 lanes work together on each Q4_K block (8 elements per lane)
+constant constexpr uint ROWS_PER_TG = 8;
+
 kernel void matvec_q4k(
     device const float* x          [[buffer(0)]],
     device const void* W           [[buffer(1)]],
@@ -55,57 +58,84 @@ kernel void matvec_q4k(
     uint simd_lane                 [[thread_index_in_simdgroup]],
     uint simd_id                   [[simdgroup_index_in_threadgroup]]
 ) {
-    // Each threadgroup handles one output row
-    uint row = tgid;
+    // Each SIMD group handles one row
+    uint row = tgid * ROWS_PER_TG + simd_id;
     if (row >= N) return;
 
     const uint num_blocks_k = K / QK_K;
     const device block_q4_K* weights = (const device block_q4_K*)W;
 
-    // Each thread in the SIMD group handles different blocks
     float local_sum = 0.0f;
 
-    // 32 threads, each handles different K blocks
-    for (uint kb = simd_lane; kb < num_blocks_k; kb += 32) {
+    // Process all K blocks - all 32 lanes work on each block together
+    // Each lane handles 8 elements per block (256/32 = 8)
+    for (uint kb = 0; kb < num_blocks_k; kb++) {
         const device block_q4_K* block = &weights[row * num_blocks_k + kb];
         float d = float(block->d);
         float dmin = float(block->dmin);
         const device uint8_t* scales = block->scales;
         const device uint8_t* qs = block->qs;
 
-        float block_sum = 0.0f;
-        int is = 0;
-        for (int j = 0; j < 256; j += 64) {
-            uint8_t sc1, m1, sc2, m2;
-            get_scale_min_k4(is, scales, sc1, m1);
-            get_scale_min_k4(is + 1, scales, sc2, m2);
+        // Each lane processes 8 consecutive elements
+        // Lane i handles elements [i*8, i*8+7]
+        uint elem_offset = simd_lane * 8;
+        uint x_base = kb * QK_K + elem_offset;
 
-            float d1 = d * float(sc1);
-            float dm1 = dmin * float(m1);
-            float d2 = d * float(sc2);
-            float dm2 = dmin * float(m2);
+        // Determine which 64-element sub-block this lane is in
+        uint sub_block = elem_offset / 64;  // 0, 1, 2, or 3
+        uint sub_offset = elem_offset % 64; // 0-63 within sub-block
 
-            uint base_idx = kb * QK_K + j;
+        // Get scale and min for this sub-block
+        uint8_t sc1, m1, sc2, m2;
+        get_scale_min_k4(sub_block * 2, scales, sc1, m1);
+        get_scale_min_k4(sub_block * 2 + 1, scales, sc2, m2);
 
-            // Unrolled inner loops for better performance
-            for (int l = 0; l < 32; l += 4) {
-                block_sum += x[base_idx + l] * (d1 * float(qs[l] & 0xF) - dm1);
-                block_sum += x[base_idx + l + 1] * (d1 * float(qs[l + 1] & 0xF) - dm1);
-                block_sum += x[base_idx + l + 2] * (d1 * float(qs[l + 2] & 0xF) - dm1);
-                block_sum += x[base_idx + l + 3] * (d1 * float(qs[l + 3] & 0xF) - dm1);
-            }
+        float d1 = d * float(sc1);
+        float dm1 = dmin * float(m1);
+        float d2 = d * float(sc2);
+        float dm2 = dmin * float(m2);
 
-            for (int l = 0; l < 32; l += 4) {
-                block_sum += x[base_idx + 32 + l] * (d2 * float(qs[l] >> 4) - dm2);
-                block_sum += x[base_idx + 32 + l + 1] * (d2 * float(qs[l + 1] >> 4) - dm2);
-                block_sum += x[base_idx + 32 + l + 2] * (d2 * float(qs[l + 2] >> 4) - dm2);
-                block_sum += x[base_idx + 32 + l + 3] * (d2 * float(qs[l + 3] >> 4) - dm2);
-            }
+        const device uint8_t* qs_ptr = qs + sub_block * 32;
+        float lane_sum = 0.0f;
 
-            qs += 32;
-            is += 2;
+        if (sub_offset < 32) {
+            // First half of sub-block: low nibbles
+            uint qs_idx = sub_offset;
+            float4 x_vec1 = float4(x[x_base], x[x_base + 1], x[x_base + 2], x[x_base + 3]);
+            float4 x_vec2 = float4(x[x_base + 4], x[x_base + 5], x[x_base + 6], x[x_base + 7]);
+            float4 w_vec1 = float4(
+                d1 * float(qs_ptr[qs_idx] & 0xF) - dm1,
+                d1 * float(qs_ptr[qs_idx + 1] & 0xF) - dm1,
+                d1 * float(qs_ptr[qs_idx + 2] & 0xF) - dm1,
+                d1 * float(qs_ptr[qs_idx + 3] & 0xF) - dm1
+            );
+            float4 w_vec2 = float4(
+                d1 * float(qs_ptr[qs_idx + 4] & 0xF) - dm1,
+                d1 * float(qs_ptr[qs_idx + 5] & 0xF) - dm1,
+                d1 * float(qs_ptr[qs_idx + 6] & 0xF) - dm1,
+                d1 * float(qs_ptr[qs_idx + 7] & 0xF) - dm1
+            );
+            lane_sum = dot(x_vec1, w_vec1) + dot(x_vec2, w_vec2);
+        } else {
+            // Second half of sub-block: high nibbles
+            uint qs_idx = sub_offset - 32;
+            float4 x_vec1 = float4(x[x_base], x[x_base + 1], x[x_base + 2], x[x_base + 3]);
+            float4 x_vec2 = float4(x[x_base + 4], x[x_base + 5], x[x_base + 6], x[x_base + 7]);
+            float4 w_vec1 = float4(
+                d2 * float(qs_ptr[qs_idx] >> 4) - dm2,
+                d2 * float(qs_ptr[qs_idx + 1] >> 4) - dm2,
+                d2 * float(qs_ptr[qs_idx + 2] >> 4) - dm2,
+                d2 * float(qs_ptr[qs_idx + 3] >> 4) - dm2
+            );
+            float4 w_vec2 = float4(
+                d2 * float(qs_ptr[qs_idx + 4] >> 4) - dm2,
+                d2 * float(qs_ptr[qs_idx + 5] >> 4) - dm2,
+                d2 * float(qs_ptr[qs_idx + 6] >> 4) - dm2,
+                d2 * float(qs_ptr[qs_idx + 7] >> 4) - dm2
+            );
+            lane_sum = dot(x_vec1, w_vec1) + dot(x_vec2, w_vec2);
         }
-        local_sum += block_sum;
+        local_sum += lane_sum;
     }
 
     // SIMD reduction - sum across all 32 lanes
@@ -550,12 +580,13 @@ kernel void kv_cache_append(
     cache[dst_idx] = new_kv[src_idx];
 }
 
-// Multi-head attention kernel for decode (seq_q = 1)
+// Optimized multi-head attention kernel for decode (seq_q = 1)
+// Uses SIMD operations for better parallelization
 // Q: [num_heads, 1, head_dim]
 // K: [num_kv_heads, seq_kv, head_dim]
 // V: [num_kv_heads, seq_kv, head_dim]
 // output: [num_heads, 1, head_dim]
-// Each threadgroup handles one head
+// Each threadgroup handles one head with 128 threads (4 SIMD groups)
 kernel void multihead_attention_decode(
     device const float* Q          [[buffer(0)]],
     device const float* K          [[buffer(1)]],
@@ -568,7 +599,8 @@ kernel void multihead_attention_decode(
     constant float& scale          [[buffer(8)]],
     uint head_idx                  [[threadgroup_position_in_grid]],
     uint tid                       [[thread_position_in_threadgroup]],
-    uint tg_size                   [[threads_per_threadgroup]]
+    uint simd_lane                 [[thread_index_in_simdgroup]],
+    uint simd_id                   [[simdgroup_index_in_threadgroup]]
 ) {
     if (head_idx >= num_heads) return;
 
@@ -582,33 +614,51 @@ kernel void multihead_attention_decode(
     device const float* v_head = V + kv_head * seq_kv * head_dim;
     device float* out_head = output + head_idx * head_dim;
 
-    // Shared memory for attention scores
-    threadgroup float scores[2048];  // Max seq_kv = 2048
-    threadgroup float shared_max;
-    threadgroup float shared_sum;
+    // Shared memory for attention scores and reductions
+    threadgroup float scores[2048];
+    threadgroup float reduction_scratch[4];  // One per SIMD group
 
-    // Step 1: Compute attention scores (Q @ K^T) in parallel
-    // Each thread handles multiple K positions
-    float local_max = -INFINITY;
-    for (uint k = tid; k < seq_kv; k += tg_size) {
-        float dot = 0.0f;
-        for (uint d = 0; d < head_dim; d++) {
-            dot += q_head[d] * k_head[k * head_dim + d];
-        }
-        scores[k] = dot * scale;
-        local_max = max(local_max, scores[k]);
+    // Cache Q in registers (head_dim is typically 64)
+    float q_cache[64];
+    for (uint d = tid; d < head_dim; d += 128) {
+        q_cache[d] = q_head[d];
     }
 
-    // Reduce to find global max
-    threadgroup float thread_maxes[256];
-    thread_maxes[tid] = local_max;
+    // Step 1: Compute attention scores (Q @ K^T) using SIMD parallelism
+    // Each thread computes one score, SIMD groups work in parallel
+    float local_max = -INFINITY;
+
+    for (uint k = tid; k < seq_kv; k += 128) {
+        device const float* k_vec = k_head + k * head_dim;
+
+        // Vectorized dot product
+        float dot_sum = 0.0f;
+        for (uint d = 0; d < head_dim; d += 4) {
+            float4 q_v = float4(q_head[d], q_head[d+1], q_head[d+2], q_head[d+3]);
+            float4 k_v = float4(k_vec[d], k_vec[d+1], k_vec[d+2], k_vec[d+3]);
+            dot_sum += dot(q_v, k_v);
+        }
+
+        float score = dot_sum * scale;
+        scores[k] = score;
+        local_max = max(local_max, score);
+    }
+
+    // SIMD reduction for max within each SIMD group
+    float simd_max_val = simd_max(local_max);
+
+    // Store SIMD group maxes
+    if (simd_lane == 0) {
+        reduction_scratch[simd_id] = simd_max_val;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Simple reduction for max
+    // Final reduction across SIMD groups (thread 0)
+    threadgroup float shared_max;
     if (tid == 0) {
-        float global_max = thread_maxes[0];
-        for (uint i = 1; i < min(tg_size, 256u); i++) {
-            global_max = max(global_max, thread_maxes[i]);
+        float global_max = reduction_scratch[0];
+        for (uint i = 1; i < 4; i++) {
+            global_max = max(global_max, reduction_scratch[i]);
         }
         shared_max = global_max;
     }
@@ -616,40 +666,52 @@ kernel void multihead_attention_decode(
 
     // Step 2: Compute exp(score - max) and sum
     float local_sum = 0.0f;
-    for (uint k = tid; k < seq_kv; k += tg_size) {
-        scores[k] = exp(scores[k] - shared_max);
-        local_sum += scores[k];
+    for (uint k = tid; k < seq_kv; k += 128) {
+        float exp_score = exp(scores[k] - shared_max);
+        scores[k] = exp_score;
+        local_sum += exp_score;
     }
 
-    // Reduce to find global sum
-    threadgroup float thread_sums[256];
-    thread_sums[tid] = local_sum;
+    // SIMD reduction for sum
+    float simd_sum_val = simd_sum(local_sum);
+
+    if (simd_lane == 0) {
+        reduction_scratch[simd_id] = simd_sum_val;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    threadgroup float shared_sum;
     if (tid == 0) {
         float global_sum = 0.0f;
-        for (uint i = 0; i < min(tg_size, 256u); i++) {
-            global_sum += thread_sums[i];
+        for (uint i = 0; i < 4; i++) {
+            global_sum += reduction_scratch[i];
         }
         shared_sum = global_sum;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Step 3: Normalize scores
+    // Step 3: Normalize scores in-place
     float inv_sum = 1.0f / shared_sum;
-    for (uint k = tid; k < seq_kv; k += tg_size) {
+    for (uint k = tid; k < seq_kv; k += 128) {
         scores[k] *= inv_sum;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Step 4: Compute output = scores @ V
-    // Each thread handles multiple output dimensions
-    for (uint d = tid; d < head_dim; d += tg_size) {
+    // Use SIMD groups: each group computes a subset of output dimensions
+    // head_dim=64, 4 SIMD groups -> 16 dims per SIMD group
+    uint dims_per_simd = (head_dim + 3) / 4;
+    uint d_start = simd_id * dims_per_simd;
+    uint d_end = min(d_start + dims_per_simd, head_dim);
+
+    for (uint d = d_start + simd_lane; d < d_end; d += 32) {
         float out_val = 0.0f;
         for (uint k = 0; k < seq_kv; k++) {
             out_val += scores[k] * v_head[k * head_dim + d];
         }
-        out_head[d] = out_val;
+        if (d < head_dim) {
+            out_head[d] = out_val;
+        }
     }
 }
 )";
@@ -841,10 +903,11 @@ Result<void> MetalCompute::matvec_q4k(
     encoder->setBytes(&K, sizeof(K), 3);
     encoder->setBytes(&N, sizeof(N), 4);
 
-    // Each threadgroup (32 threads = 1 SIMD group) handles one output row
-    // N threadgroups total, one per output dimension
-    MTL::Size grid_size = MTL::Size::Make(N, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(32, 1, 1);  // One SIMD group
+    // 8 SIMD groups per threadgroup (256 threads), each SIMD group handles one row
+    uint32_t rows_per_tg = 8;
+    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
+    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(32 * rows_per_tg, 1, 1);  // 8 SIMD groups = 256 threads
     encoder->dispatchThreadgroups(grid_size, threadgroup_size);
 
     return {};
