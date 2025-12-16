@@ -581,7 +581,7 @@ kernel void kv_cache_append(
 }
 
 // Optimized multi-head attention kernel for decode (seq_q = 1)
-// Uses SIMD operations for better parallelization
+// Uses FP16 for attention scores to reduce memory bandwidth
 // Q: [num_heads, 1, head_dim]
 // K: [num_kv_heads, seq_kv, head_dim]
 // V: [num_kv_heads, seq_kv, head_dim]
@@ -614,24 +614,17 @@ kernel void multihead_attention_decode(
     device const float* v_head = V + kv_head * seq_kv * head_dim;
     device float* out_head = output + head_idx * head_dim;
 
-    // Shared memory for attention scores and reductions
-    threadgroup float scores[2048];
-    threadgroup float reduction_scratch[4];  // One per SIMD group
-
-    // Cache Q in registers (head_dim is typically 64)
-    float q_cache[64];
-    for (uint d = tid; d < head_dim; d += 128) {
-        q_cache[d] = q_head[d];
-    }
+    // FP16 scores use half the threadgroup memory - can fit 4096 scores
+    threadgroup half scores_h[4096];
+    threadgroup float reduction_scratch[4];
 
     // Step 1: Compute attention scores (Q @ K^T) using SIMD parallelism
-    // Each thread computes one score, SIMD groups work in parallel
     float local_max = -INFINITY;
 
     for (uint k = tid; k < seq_kv; k += 128) {
         device const float* k_vec = k_head + k * head_dim;
 
-        // Vectorized dot product
+        // Vectorized dot product using half4 for K access
         float dot_sum = 0.0f;
         for (uint d = 0; d < head_dim; d += 4) {
             float4 q_v = float4(q_head[d], q_head[d+1], q_head[d+2], q_head[d+3]);
@@ -640,20 +633,17 @@ kernel void multihead_attention_decode(
         }
 
         float score = dot_sum * scale;
-        scores[k] = score;
+        scores_h[k] = half(score);
         local_max = max(local_max, score);
     }
 
-    // SIMD reduction for max within each SIMD group
+    // SIMD reduction for max
     float simd_max_val = simd_max(local_max);
-
-    // Store SIMD group maxes
     if (simd_lane == 0) {
         reduction_scratch[simd_id] = simd_max_val;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Final reduction across SIMD groups (thread 0)
     threadgroup float shared_max;
     if (tid == 0) {
         float global_max = reduction_scratch[0];
@@ -667,14 +657,12 @@ kernel void multihead_attention_decode(
     // Step 2: Compute exp(score - max) and sum
     float local_sum = 0.0f;
     for (uint k = tid; k < seq_kv; k += 128) {
-        float exp_score = exp(scores[k] - shared_max);
-        scores[k] = exp_score;
+        float exp_score = exp(float(scores_h[k]) - shared_max);
+        scores_h[k] = half(exp_score);
         local_sum += exp_score;
     }
 
-    // SIMD reduction for sum
     float simd_sum_val = simd_sum(local_sum);
-
     if (simd_lane == 0) {
         reduction_scratch[simd_id] = simd_sum_val;
     }
@@ -693,21 +681,145 @@ kernel void multihead_attention_decode(
     // Step 3: Normalize scores in-place
     float inv_sum = 1.0f / shared_sum;
     for (uint k = tid; k < seq_kv; k += 128) {
-        scores[k] *= inv_sum;
+        scores_h[k] = half(float(scores_h[k]) * inv_sum);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Step 4: Compute output = scores @ V
     // Use SIMD groups: each group computes a subset of output dimensions
-    // head_dim=64, 4 SIMD groups -> 16 dims per SIMD group
     uint dims_per_simd = (head_dim + 3) / 4;
     uint d_start = simd_id * dims_per_simd;
     uint d_end = min(d_start + dims_per_simd, head_dim);
 
     for (uint d = d_start + simd_lane; d < d_end; d += 32) {
         float out_val = 0.0f;
-        for (uint k = 0; k < seq_kv; k++) {
-            out_val += scores[k] * v_head[k * head_dim + d];
+        // Process 4 scores at a time for better throughput
+        uint k = 0;
+        for (; k + 3 < seq_kv; k += 4) {
+            half4 s = half4(scores_h[k], scores_h[k+1], scores_h[k+2], scores_h[k+3]);
+            float4 v = float4(
+                v_head[k * head_dim + d],
+                v_head[(k+1) * head_dim + d],
+                v_head[(k+2) * head_dim + d],
+                v_head[(k+3) * head_dim + d]
+            );
+            out_val += dot(float4(s), v);
+        }
+        for (; k < seq_kv; k++) {
+            out_val += float(scores_h[k]) * v_head[k * head_dim + d];
+        }
+        if (d < head_dim) {
+            out_head[d] = out_val;
+        }
+    }
+}
+// FP16 KV cache version - reads K/V from half precision
+// Q stays FP32 (output of Q4_K projection), K/V are FP16
+kernel void multihead_attention_decode_f16kv(
+    device const float* Q          [[buffer(0)]],
+    device const half* K           [[buffer(1)]],
+    device const half* V           [[buffer(2)]],
+    device float* output           [[buffer(3)]],
+    constant uint& num_heads       [[buffer(4)]],
+    constant uint& num_kv_heads    [[buffer(5)]],
+    constant uint& seq_kv          [[buffer(6)]],
+    constant uint& head_dim        [[buffer(7)]],
+    constant float& scale          [[buffer(8)]],
+    uint head_idx                  [[threadgroup_position_in_grid]],
+    uint tid                       [[thread_position_in_threadgroup]],
+    uint simd_lane                 [[thread_index_in_simdgroup]],
+    uint simd_id                   [[simdgroup_index_in_threadgroup]]
+) {
+    if (head_idx >= num_heads) return;
+
+    uint heads_per_kv = num_heads / num_kv_heads;
+    uint kv_head = head_idx / heads_per_kv;
+
+    device const float* q_head = Q + head_idx * head_dim;
+    device const half* k_head = K + kv_head * seq_kv * head_dim;
+    device const half* v_head = V + kv_head * seq_kv * head_dim;
+    device float* out_head = output + head_idx * head_dim;
+
+    threadgroup half scores_h[4096];
+    threadgroup float reduction_scratch[4];
+
+    // Step 1: Q @ K^T with FP16 K reads
+    float local_max = -INFINITY;
+    for (uint k = tid; k < seq_kv; k += 128) {
+        device const half* k_vec = k_head + k * head_dim;
+
+        float dot_sum = 0.0f;
+        for (uint d = 0; d < head_dim; d += 4) {
+            float4 q_v = float4(q_head[d], q_head[d+1], q_head[d+2], q_head[d+3]);
+            // Read K as FP16, convert to FP32 for computation
+            half4 k_h = half4(k_vec[d], k_vec[d+1], k_vec[d+2], k_vec[d+3]);
+            dot_sum += dot(q_v, float4(k_h));
+        }
+
+        float score = dot_sum * scale;
+        scores_h[k] = half(score);
+        local_max = max(local_max, score);
+    }
+
+    float simd_max_val = simd_max(local_max);
+    if (simd_lane == 0) reduction_scratch[simd_id] = simd_max_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float shared_max;
+    if (tid == 0) {
+        float m = reduction_scratch[0];
+        for (uint i = 1; i < 4; i++) m = max(m, reduction_scratch[i]);
+        shared_max = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 2: Softmax
+    float local_sum = 0.0f;
+    for (uint k = tid; k < seq_kv; k += 128) {
+        float exp_score = exp(float(scores_h[k]) - shared_max);
+        scores_h[k] = half(exp_score);
+        local_sum += exp_score;
+    }
+
+    float simd_sum_val = simd_sum(local_sum);
+    if (simd_lane == 0) reduction_scratch[simd_id] = simd_sum_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float shared_sum;
+    if (tid == 0) {
+        float s = 0.0f;
+        for (uint i = 0; i < 4; i++) s += reduction_scratch[i];
+        shared_sum = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float inv_sum = 1.0f / shared_sum;
+    for (uint k = tid; k < seq_kv; k += 128) {
+        scores_h[k] = half(float(scores_h[k]) * inv_sum);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 3: Output = scores @ V (with FP16 V reads)
+    uint dims_per_simd = (head_dim + 3) / 4;
+    uint d_start = simd_id * dims_per_simd;
+    uint d_end = min(d_start + dims_per_simd, head_dim);
+
+    for (uint d = d_start + simd_lane; d < d_end; d += 32) {
+        float out_val = 0.0f;
+        uint k = 0;
+        for (; k + 3 < seq_kv; k += 4) {
+            half4 s = half4(scores_h[k], scores_h[k+1], scores_h[k+2], scores_h[k+3]);
+            // Read V as FP16
+            half4 v = half4(
+                v_head[k * head_dim + d],
+                v_head[(k+1) * head_dim + d],
+                v_head[(k+2) * head_dim + d],
+                v_head[(k+3) * head_dim + d]
+            );
+            out_val += dot(float4(s), float4(v));
+        }
+        for (; k < seq_kv; k++) {
+            out_val += float(scores_h[k]) * float(v_head[k * head_dim + d]);
         }
         if (d < head_dim) {
             out_head[d] = out_val;

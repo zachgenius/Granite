@@ -316,6 +316,14 @@ private:
         Tensor block_output;    // [1, 1, hidden_dim]
         Tensor norm_out;        // [1, 1, hidden_dim]
         Tensor logits;          // [1, 1, vocab_size]
+        // Attention-specific GPU buffers (raw Metal buffers)
+        void* q_buf = nullptr;       // [num_heads * head_dim]
+        void* k_buf = nullptr;       // [num_kv_heads * head_dim]
+        void* v_buf = nullptr;       // [num_kv_heads * head_dim]
+        void* attn_out_buf = nullptr; // [num_heads * head_dim]
+        // FFN-specific GPU buffers
+        void* ffn_gate_buf = nullptr; // [intermediate_dim]
+        void* ffn_up_buf = nullptr;   // [intermediate_dim]
     };
     std::unique_ptr<DecodeBufferPool> decode_pool_;
 
