@@ -54,12 +54,34 @@ Result<ModelConfig> parse_model_config(const GGUFFile& gguf) {
         config.vocab_size = static_cast<int>(std::max(emb->dimensions[0], emb->dimensions[1]));
     }
 
-    // Compute derived values
+    // Try to get head_dim from metadata first (some models like Gemma have head_dim != hidden_dim / num_heads)
+    if (auto v = gguf.get_metadata_as<uint32_t>(prefix + "attention.key_length")) {
+        config.head_dim = static_cast<int>(*v);
+    } else if (auto v = gguf.get_metadata_as<uint32_t>(prefix + "attention.value_length")) {
+        config.head_dim = static_cast<int>(*v);
+    }
+
+    // If head_dim still not set, compute from Q weight shape
+    // Q weight shape is [q_output_dim, hidden_dim] where q_output_dim = num_heads * head_dim
+    if (config.head_dim == 0) {
+        if (auto* q_weight = gguf.find_tensor("blk.0.attn_q.weight")) {
+            // GGUF stores dimensions in reverse order (innermost first)
+            // For [4096, 5376], dimensions[0]=5376 (K), dimensions[1]=4096 (N)
+            int q_output_dim = static_cast<int>(q_weight->dimensions[1]);
+            if (config.num_heads > 0 && q_output_dim > 0) {
+                config.head_dim = q_output_dim / config.num_heads;
+                GRANITE_LOG_DEBUG("Computed head_dim from Q weight: {} (Q output dim: {})",
+                                  config.head_dim, q_output_dim);
+            }
+        }
+    }
+
+    // Fallback: compute derived values (head_dim = hidden_dim / num_heads)
     config.compute_derived();
 
-    GRANITE_LOG_INFO("Model config: arch={}, layers={}, hidden={}, heads={}/{}, vocab={}",
+    GRANITE_LOG_INFO("Model config: arch={}, layers={}, hidden={}, heads={}/{}, head_dim={}, vocab={}",
                      config.architecture, config.num_layers, config.hidden_dim,
-                     config.num_heads, config.num_kv_heads, config.vocab_size);
+                     config.num_heads, config.num_kv_heads, config.head_dim, config.vocab_size);
 
     return config;
 }
