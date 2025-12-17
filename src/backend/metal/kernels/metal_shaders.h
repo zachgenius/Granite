@@ -991,7 +991,12 @@ kernel void matvec_iq4_xs(
     }
 }
 
-// IQ4_XS Matrix Multiplication (Batched - Prefill)
+// IQ4_XS Matrix Multiplication (Batched - Prefill) - Optimized with SIMD groups
+// Each threadgroup processes one input row and COLS_PER_TG output columns
+// Each SIMD group handles 2 output columns with K-reduction cooperation
+constant constexpr uint IQ4_XS_MATMUL_COLS_PER_SIMD = 2;  // Columns per SIMD group
+constant constexpr uint IQ4_XS_MATMUL_SIMD_GROUPS = 8;    // SIMD groups per threadgroup
+
 kernel void matmul_iq4_xs(
     device const float* X          [[buffer(0)]],
     device const void* W           [[buffer(1)]],
@@ -999,43 +1004,77 @@ kernel void matmul_iq4_xs(
     constant uint& M               [[buffer(3)]],
     constant uint& K               [[buffer(4)]],
     constant uint& N               [[buffer(5)]],
-    uint2 gid                      [[thread_position_in_grid]]
+    uint2 tgid                     [[threadgroup_position_in_grid]],
+    uint tiisg                     [[thread_index_in_simdgroup]],
+    uint sgitg                     [[simdgroup_index_in_threadgroup]]
 ) {
-    uint row = gid.y;
-    uint col = gid.x;
+    // Row is determined by threadgroup y position
+    const uint row = tgid.y;
+    if (row >= M) return;
 
-    if (row >= M || col >= N) return;
+    // Each SIMD group handles 2 columns
+    const uint col_base = (tgid.x * IQ4_XS_MATMUL_SIMD_GROUPS + sgitg) * IQ4_XS_MATMUL_COLS_PER_SIMD;
 
-    const uint num_blocks_k = K / QK_IQ4_XS;
+    const uint nb = K / QK_IQ4_XS;  // Number of super-blocks per row
     const device block_iq4_xs* weights = (const device block_iq4_xs*)W;
 
-    float sum = 0.0f;
+    // Each thread accumulates for 2 columns
+    float sumf[IQ4_XS_MATMUL_COLS_PER_SIMD] = {0.f, 0.f};
 
-    for (uint kb = 0; kb < num_blocks_k; kb++) {
-        const device block_iq4_xs& block = weights[col * num_blocks_k + kb];
-        float d = float(block.d);
+    // Thread indexing for IQ4_XS (256-element super-blocks)
+    // 32 threads cooperate: each handles different sub-blocks
+    const short ix = tiisg / 16;  // 0 or 1 (which half of super-block)
+    const short it = tiisg % 16;
+    const short ib = it / 2;      // sub-block index within half (0...7)
+    const short il = it % 2;      // which 16 elements within sub-block
 
-        uint base_idx = kb * QK_IQ4_XS;
+    // Process all blocks with strided access
+    for (uint ibl = ix; ibl < nb; ibl += 2) {
+        // Calculate base position in input
+        uint x_base = row * K + ibl * QK_IQ4_XS + ib * 32 + il * 16;
 
-        // Process 8 sub-blocks of 32 elements each
-        for (int ib32 = 0; ib32 < 8; ib32++) {
-            // Extract 6-bit scale
-            int ls = ((block.scales_l[ib32 / 2] >> (4 * (ib32 % 2))) & 0xf) |
-                     (((block.scales_h >> (2 * ib32)) & 3) << 4);
+        // Cache 16 input values in registers
+        float xl[16];
+        for (int i = 0; i < 16; i++) {
+            xl[i] = X[x_base + i];
+        }
+
+        // Process each output column
+        for (short c = 0; c < IQ4_XS_MATMUL_COLS_PER_SIMD; c++) {
+            uint col = col_base + c;
+            if (col >= N) continue;
+
+            device const block_iq4_xs& block = weights[col * nb + ibl];
+            float d = float(block.d);
+
+            // Extract 6-bit scale for this sub-block
+            int ls = ((block.scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) |
+                     (((block.scales_h >> (2 * ib)) & 3) << 4);
             float scale = d * float(ls - 32);
 
-            // Dequantize and accumulate 32 elements (16 bytes)
-            for (int i = 0; i < 16; i++) {
-                uint8_t qbyte = block.qs[ib32 * 16 + i];
+            // Dequantize and accumulate using lookup table
+            float acc = 0.f;
+            for (int i = 0; i < 8; i++) {
+                uint8_t qbyte = block.qs[ib * 16 + il * 8 + i];
                 int q0 = kvalues_iq4nl[qbyte & 0xF];
                 int q1 = kvalues_iq4nl[qbyte >> 4];
-                sum += scale * float(q0) * X[row * K + base_idx + ib32 * 32 + i * 2 + 0];
-                sum += scale * float(q1) * X[row * K + base_idx + ib32 * 32 + i * 2 + 1];
+                acc += xl[i * 2 + 0] * float(q0);
+                acc += xl[i * 2 + 1] * float(q1);
             }
+            sumf[c] += scale * acc;
         }
     }
 
-    Y[row * N + col] = sum;
+    // SIMD reduction and output
+    for (short c = 0; c < IQ4_XS_MATMUL_COLS_PER_SIMD; c++) {
+        uint col = col_base + c;
+        if (col < N) {
+            float sum = simd_sum(sumf[c]);
+            if (tiisg == 0) {
+                Y[row * N + col] = sum;
+            }
+        }
+    }
 }
 
 // Fused RMSNorm + IQ4_XS MatVec
@@ -1277,7 +1316,6 @@ kernel void matvec_iq3_s(
             // Get grid index and values
             int grid_idx = qs_ptr[j] | (((qh_byte >> (3 - j)) & 1) << 8);
             uint32_t grid_val = iq3s_grid[grid_idx];
-            constant uint8_t* grid = (constant uint8_t*)&grid_val;
 
             // Get sign byte
             uint8_t sign_byte = signs_ptr[j / 2];
@@ -1296,13 +1334,14 @@ kernel void matvec_iq3_s(
                     j = cur_j;
                     grid_idx = qs_ptr[j] | (((qh_byte >> (3 - j)) & 1) << 8);
                     grid_val = iq3s_grid[grid_idx];
-                    grid = (constant uint8_t*)&grid_val;
                     sign_byte = signs_ptr[j / 2];
                 }
 
+                // Extract byte from grid_val using bit shifts (avoiding address space cast)
+                uint8_t grid_byte = (grid_val >> (8 * cur_k)) & 0xFF;
                 int sign_bit_idx = (j % 2) * 4 + cur_k;
                 float sign = (sign_byte & kmask_iq2xs[sign_bit_idx]) ? -1.0f : 1.0f;
-                acc += xl[i] * dl * float(grid[cur_k]) * sign;
+                acc += xl[i] * dl * float(grid_byte) * sign;
             }
             sumf[row] += acc;
         }
@@ -1320,7 +1359,12 @@ kernel void matvec_iq3_s(
     }
 }
 
-// IQ3_S Matrix Multiplication (Batched - Prefill)
+// IQ3_S Matrix Multiplication (Batched - Prefill) - Optimized with SIMD groups
+// Each threadgroup processes one input row and multiple output columns
+// Each SIMD group handles 2 output columns with K-reduction cooperation
+constant constexpr uint IQ3_S_MATMUL_COLS_PER_SIMD = 2;
+constant constexpr uint IQ3_S_MATMUL_SIMD_GROUPS = 8;
+
 kernel void matmul_iq3_s(
     device const float* X          [[buffer(0)]],
     device const void* W           [[buffer(1)]],
@@ -1328,55 +1372,83 @@ kernel void matmul_iq3_s(
     constant uint& M               [[buffer(3)]],
     constant uint& K               [[buffer(4)]],
     constant uint& N               [[buffer(5)]],
-    uint2 gid                      [[thread_position_in_grid]]
+    uint2 tgid                     [[threadgroup_position_in_grid]],
+    uint tiisg                     [[thread_index_in_simdgroup]],
+    uint sgitg                     [[simdgroup_index_in_threadgroup]]
 ) {
-    uint row = gid.y;
-    uint col = gid.x;
+    const uint row = tgid.y;
+    if (row >= M) return;
 
-    if (row >= M || col >= N) return;
+    const uint col_base = (tgid.x * IQ3_S_MATMUL_SIMD_GROUPS + sgitg) * IQ3_S_MATMUL_COLS_PER_SIMD;
 
-    const uint num_blocks_k = K / QK_IQ3_S;
+    const uint nb = K / QK_IQ3_S;
     const device block_iq3_s* weights = (const device block_iq3_s*)W;
 
-    float sum = 0.0f;
+    float sumf[IQ3_S_MATMUL_COLS_PER_SIMD] = {0.f, 0.f};
 
-    for (uint kb = 0; kb < num_blocks_k; kb++) {
-        const device block_iq3_s& block = weights[col * num_blocks_k + kb];
-        float d = float(block.d);
+    // Thread indexing: 32 threads cooperate on K dimension
+    // Each thread handles a different sub-block position
+    const short ix = tiisg / 16;   // 0 or 1 (which half of super-block)
+    const short it = tiisg % 16;
+    const short ib = it / 2;       // sub-block index (0...7)
+    const short il = it % 2;       // which 16 elements within sub-block
 
-        uint base_idx = kb * QK_IQ3_S;
+    // Process all blocks with strided access
+    for (uint ibl = ix; ibl < nb; ibl += 2) {
+        // Calculate base position in input
+        uint x_base = row * K + ibl * QK_IQ3_S + ib * 32 + il * 16;
 
-        // Process 8 sub-blocks of 32 elements each
-        for (int ib32 = 0; ib32 < 8; ib32++) {
+        // Cache 16 input values in registers
+        float xl[16];
+        for (int i = 0; i < 16; i++) {
+            xl[i] = X[x_base + i];
+        }
+
+        // Process each output column
+        for (short c = 0; c < IQ3_S_MATMUL_COLS_PER_SIMD; c++) {
+            uint col = col_base + c;
+            if (col >= N) continue;
+
+            device const block_iq3_s& block = weights[col * nb + ibl];
+            float d = float(block.d);
+
             // Extract 4-bit scale
-            int scale_val = (block.scales[ib32 / 2] >> (4 * (ib32 % 2))) & 0xf;
+            int scale_val = (block.scales[ib / 2] >> (4 * (ib % 2))) & 0xf;
             float dl = d * float(1 + 2 * scale_val);
 
-            // Process 2 halves of 16 elements each
-            for (int il = 0; il < 2; il++) {
-                device const uint8_t* qs_ptr = block.qs + 8 * ib32 + 4 * il;
-                device const uint8_t* signs_ptr = block.signs + 4 * ib32 + 2 * il;
-                uint8_t qh_byte = block.qh[ib32] >> (4 * il);
+            // Get pointers for this half
+            device const uint8_t* qs_ptr = block.qs + 8 * ib + 4 * il;
+            device const uint8_t* signs_ptr = block.signs + 4 * ib + 2 * il;
+            uint8_t qh_byte = block.qh[ib] >> (4 * il);
 
-                // Process 4 grid entries of 4 elements each
-                for (int j = 0; j < 4; j++) {
-                    int grid_idx = qs_ptr[j] | (((qh_byte >> (3 - j)) & 1) << 8);
-                    uint32_t grid_val = iq3s_grid[grid_idx];
-                    constant uint8_t* grid = (constant uint8_t*)&grid_val;
-                    uint8_t sign_byte = signs_ptr[j / 2];
+            // Accumulate 16 elements
+            float acc = 0.f;
+            for (int j = 0; j < 4; j++) {
+                int grid_idx = qs_ptr[j] | (((qh_byte >> (3 - j)) & 1) << 8);
+                uint32_t grid_val = iq3s_grid[grid_idx];
+                uint8_t sign_byte = signs_ptr[j / 2];
 
-                    for (int k = 0; k < 4; k++) {
-                        int sign_bit_idx = (j % 2) * 4 + k;
-                        float sign = (sign_byte & kmask_iq2xs[sign_bit_idx]) ? -1.0f : 1.0f;
-                        uint idx = base_idx + ib32 * 32 + il * 16 + j * 4 + k;
-                        sum += dl * float(grid[k]) * sign * X[row * K + idx];
-                    }
+                for (int k = 0; k < 4; k++) {
+                    uint8_t grid_byte = (grid_val >> (8 * k)) & 0xFF;
+                    int sign_bit_idx = (j % 2) * 4 + k;
+                    float sign = (sign_byte & kmask_iq2xs[sign_bit_idx]) ? -1.0f : 1.0f;
+                    acc += xl[j * 4 + k] * float(grid_byte) * sign;
                 }
             }
+            sumf[c] += dl * acc;
         }
     }
 
-    Y[row * N + col] = sum;
+    // SIMD reduction and output
+    for (short c = 0; c < IQ3_S_MATMUL_COLS_PER_SIMD; c++) {
+        uint col = col_base + c;
+        if (col < N) {
+            float sum = simd_sum(sumf[c]);
+            if (tiisg == 0) {
+                Y[row * N + col] = sum;
+            }
+        }
+    }
 }
 
 // Fused RMSNorm + IQ3_S MatVec
@@ -1455,14 +1527,15 @@ kernel void rms_norm_matvec_iq3_s(
                 for (int j = 0; j < 4; j++) {
                     int grid_idx = qs_ptr[j] | (((qh_byte >> (3 - j)) & 1) << 8);
                     uint32_t grid_val = iq3s_grid[grid_idx];
-                    constant uint8_t* grid = (constant uint8_t*)&grid_val;
                     uint8_t sign_byte = signs_ptr[j / 2];
 
                     for (int k = 0; k < 4; k++) {
+                        // Extract byte from grid_val using bit shifts
+                        uint8_t grid_byte = (grid_val >> (8 * k)) & 0xFF;
                         int sign_bit_idx = (j % 2) * 4 + k;
                         float sign = (sign_byte & kmask_iq2xs[sign_bit_idx]) ? -1.0f : 1.0f;
                         uint idx = base_idx + ib32 * 32 + il * 16 + j * 4 + k;
-                        local_sum += dl * float(grid[k]) * sign * x_norm[idx];
+                        local_sum += dl * float(grid_byte) * sign * x_norm[idx];
                     }
                 }
             }

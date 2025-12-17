@@ -493,9 +493,12 @@ Result<void> MetalCompute::matmul_iq4_xs(
     encoder->setBytes(&K, sizeof(K), 4);
     encoder->setBytes(&N, sizeof(N), 5);
 
-    MTL::Size grid_size = MTL::Size::Make(N, M, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(16, 16, 1);
-    encoder->dispatchThreads(grid_size, threadgroup_size);
+    // Optimized dispatch: 8 SIMD groups × 32 threads = 256 threads per threadgroup
+    // Each threadgroup handles 1 row × 16 columns (8 SIMD groups × 2 cols each)
+    const uint32_t cols_per_threadgroup = 16;
+    MTL::Size grid_size = MTL::Size::Make((N + cols_per_threadgroup - 1) / cols_per_threadgroup, M, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
 
     return {};
 }
@@ -551,9 +554,12 @@ Result<void> MetalCompute::matmul_iq3_s(
     encoder->setBytes(&K, sizeof(K), 4);
     encoder->setBytes(&N, sizeof(N), 5);
 
-    MTL::Size grid_size = MTL::Size::Make(N, M, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(16, 16, 1);
-    encoder->dispatchThreads(grid_size, threadgroup_size);
+    // Optimized dispatch: 8 SIMD groups × 32 threads = 256 threads per threadgroup
+    // Each threadgroup handles 1 row × 16 columns (8 SIMD groups × 2 cols each)
+    const uint32_t cols_per_threadgroup = 16;
+    MTL::Size grid_size = MTL::Size::Make((N + cols_per_threadgroup - 1) / cols_per_threadgroup, M, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
 
     return {};
 }
