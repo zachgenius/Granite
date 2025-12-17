@@ -1348,6 +1348,53 @@ Result<Tensor> ModelLoader::dequantize_tensor(
             break;
         }
 
+        case GGMLType::Q2_K: {
+            // Q2_K: 256 elements per super-block, 84 bytes per block
+            // Structure (matching GGML's block_q2_K):
+            //   - scales[16]: 4-bit scales (low nibble) and mins (high nibble)
+            //   - qs[64]: 2-bit quants (4 per byte)
+            //   - d: fp16 scale (2 bytes)
+            //   - dmin: fp16 min (2 bytes)
+            // Dequantization: w = d * (scale & 0xF) * q2 - dmin * (scale >> 4)
+            const uint8_t* src = static_cast<const uint8_t*>(data);
+            size_t num_blocks = (numel + 255) / 256;
+
+            for (size_t b = 0; b < num_blocks; b++) {
+                const uint8_t* scales = src;           // 16 bytes
+                const uint8_t* qs = src + 16;          // 64 bytes
+                uint16_t d_bits, dmin_bits;
+                memcpy(&d_bits, src + 80, 2);
+                memcpy(&dmin_bits, src + 82, 2);
+                float d_all = fp16_to_fp32(d_bits);
+                float dmin = fp16_to_fp32(dmin_bits);
+
+                // Process 16 sub-blocks of 16 elements each
+                for (int is = 0; is < 16; is++) {
+                    // Each scale byte contains scale (low nibble) and min (high nibble)
+                    uint8_t scale_byte = scales[is];
+                    float dl = d_all * static_cast<float>(scale_byte & 0xF);
+                    float ml = dmin * static_cast<float>(scale_byte >> 4);
+
+                    // 16 elements from 4 bytes of qs (4 per byte)
+                    for (int j = 0; j < 4; j++) {
+                        uint8_t q_byte = qs[is * 4 + j];
+                        for (int k = 0; k < 4; k++) {
+                            size_t idx = b * 256 + is * 16 + j * 4 + k;
+                            if (idx < numel) {
+                                // Extract 2-bit quant
+                                int q2 = (q_byte >> (k * 2)) & 3;
+                                float val = dl * static_cast<float>(q2) - ml;
+                                output[idx] = fp32_to_fp16(val);
+                            }
+                        }
+                    }
+                }
+
+                src += 84;  // Move to next block
+            }
+            break;
+        }
+
         case GGMLType::Q3_K: {
             // Q3_K: 256 elements per super-block, 110 bytes per block
             // Structure (matching GGML's block_q3_K):
