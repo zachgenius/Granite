@@ -68,6 +68,7 @@ set(GRANITE_LLM_SOURCES
     src/llm/math_ops.cpp
     src/llm/kv_cache.cpp
     src/llm/kv_cache_pool.cpp
+    src/llm/paged_kv_cache.cpp
     src/llm/rope.cpp
     src/llm/tokenizer.cpp
     src/llm/model_config.cpp

@@ -703,6 +703,160 @@ private:
 };
 
 // =============================================================================
+// PagedAttention - Memory-Efficient KV Cache with Block-Based Paging
+// =============================================================================
+
+// Block configuration for PagedAttention
+struct PagedKVConfig {
+    int block_size = 16;         // Tokens per block (power of 2 recommended)
+    int num_blocks = 256;        // Total physical blocks in the pool
+    int num_layers = 0;          // Number of transformer layers
+    int num_kv_heads = 0;        // Number of KV heads
+    int head_dim = 0;            // Head dimension
+};
+
+// BlockManager: Manages physical KV cache blocks
+// Uses a simple free-list allocator for O(1) allocation/deallocation
+class BlockManager {
+public:
+    BlockManager() = default;
+
+    /// Initialize block manager with given config
+    [[nodiscard]] Result<void> initialize(
+        const PagedKVConfig& config,
+        IComputeBackend* backend);
+
+    /// Allocate a free block, returns block index (-1 if none available)
+    int allocate_block();
+
+    /// Free a block back to the pool
+    void free_block(int block_idx);
+
+    /// Get number of free blocks
+    [[nodiscard]] int num_free_blocks() const { return num_free_; }
+
+    /// Get total number of blocks
+    [[nodiscard]] int num_total_blocks() const { return num_blocks_; }
+
+    /// Get block size (tokens per block)
+    [[nodiscard]] int block_size() const { return block_size_; }
+
+    /// Get K cache buffer for a layer (all blocks contiguous)
+    /// Shape: [num_blocks, block_size, num_kv_heads, head_dim]
+    [[nodiscard]] Tensor& k_cache(int layer) { return k_blocks_[layer]; }
+    [[nodiscard]] const Tensor& k_cache(int layer) const { return k_blocks_[layer]; }
+
+    /// Get V cache buffer for a layer
+    [[nodiscard]] Tensor& v_cache(int layer) { return v_blocks_[layer]; }
+    [[nodiscard]] const Tensor& v_cache(int layer) const { return v_blocks_[layer]; }
+
+    /// Check if initialized
+    [[nodiscard]] bool is_initialized() const { return !k_blocks_.empty(); }
+
+    /// Get config
+    [[nodiscard]] const PagedKVConfig& config() const { return config_; }
+
+private:
+    PagedKVConfig config_;
+    int num_blocks_ = 0;
+    int block_size_ = 0;
+    int num_free_ = 0;
+    std::vector<int> free_list_;          // Stack of free block indices
+    std::vector<bool> block_allocated_;   // Track which blocks are allocated
+    std::vector<Tensor> k_blocks_;        // [num_layers] of [num_blocks, block_size, num_kv_heads, head_dim]
+    std::vector<Tensor> v_blocks_;        // [num_layers]
+    IComputeBackend* backend_ = nullptr;
+};
+
+// PagedKVCache: Per-sequence view into the shared block pool
+// Maintains a block table mapping logical positions to physical blocks
+class PagedKVCache {
+public:
+    PagedKVCache() = default;
+
+    /// Create a new paged cache using the given block manager
+    explicit PagedKVCache(BlockManager* block_manager);
+
+    /// Release all blocks back to manager
+    void release();
+
+    /// Append tokens to the cache (allocates new blocks as needed)
+    /// Returns false if allocation failed (out of blocks)
+    [[nodiscard]] bool append_tokens(int num_tokens);
+
+    /// Get current sequence length
+    [[nodiscard]] int seq_len() const { return seq_len_; }
+
+    /// Get number of allocated blocks
+    [[nodiscard]] int num_blocks() const { return static_cast<int>(block_table_.size()); }
+
+    /// Get the block table (maps logical block -> physical block)
+    [[nodiscard]] const std::vector<int>& block_table() const { return block_table_; }
+
+    /// Get physical block index for a given token position
+    [[nodiscard]] int get_physical_block(int token_pos) const;
+
+    /// Get position within block for a given token position
+    [[nodiscard]] int get_block_offset(int token_pos) const;
+
+    /// Clear the cache (release all blocks, reset seq_len)
+    void clear();
+
+    /// Truncate to a specific length (for speculative decoding rollback)
+    void truncate(int new_len);
+
+    /// Get block manager
+    [[nodiscard]] BlockManager* block_manager() { return block_manager_; }
+
+private:
+    BlockManager* block_manager_ = nullptr;
+    std::vector<int> block_table_;  // Logical block index -> Physical block index
+    int seq_len_ = 0;
+};
+
+// PagedKVPool: Pool of PagedKVCache instances for multiple concurrent requests
+class PagedKVPool {
+public:
+    PagedKVPool() = default;
+    ~PagedKVPool() = default;
+
+    /// Initialize pool with shared block manager
+    [[nodiscard]] Result<void> initialize(
+        const ModelConfig& config,
+        int max_sequences,          // Maximum concurrent sequences
+        int max_total_tokens,       // Total tokens across all sequences
+        int block_size,             // Tokens per block
+        IComputeBackend* backend);
+
+    /// Acquire a cache slot for a new sequence
+    [[nodiscard]] int acquire_slot();
+
+    /// Release a cache slot
+    void release_slot(int slot);
+
+    /// Get PagedKVCache for a slot
+    [[nodiscard]] PagedKVCache& get_cache(int slot) { return caches_[slot]; }
+    [[nodiscard]] const PagedKVCache& get_cache(int slot) const { return caches_[slot]; }
+
+    /// Get the shared block manager
+    [[nodiscard]] BlockManager& block_manager() { return block_manager_; }
+
+    /// Get number of available slots
+    [[nodiscard]] int num_free_slots() const;
+
+    /// Get number of free blocks in pool
+    [[nodiscard]] int num_free_blocks() const { return block_manager_.num_free_blocks(); }
+
+    /// Check if initialized
+    [[nodiscard]] bool is_initialized() const { return block_manager_.is_initialized(); }
+
+private:
+    BlockManager block_manager_;
+    std::vector<PagedKVCache> caches_;
+    std::vector<bool> slot_in_use_;
+};
+
+// =============================================================================
 // Continuous Batching - Generation Request
 // =============================================================================
 
@@ -738,11 +892,22 @@ public:
     BatchScheduler() = default;
     ~BatchScheduler() = default;
 
-    /// Initialize scheduler with model and cache pool
+    /// Initialize scheduler with model and cache pool (standard KV cache)
     [[nodiscard]] Result<void> initialize(
         TransformerModel* model,
         Tokenizer* tokenizer,
         int num_cache_slots,
+        int max_batch_tokens = 256);
+
+    /// Initialize scheduler with PagedKVPool for true batched decode
+    /// This enables memory-efficient KV caching with scattered physical blocks
+    /// and uses batched GPU kernels for decode
+    [[nodiscard]] Result<void> initialize_paged(
+        TransformerModel* model,
+        Tokenizer* tokenizer,
+        int num_cache_slots,
+        int max_total_tokens,      // Total tokens across all sequences
+        int block_size = 16,       // Tokens per physical block
         int max_batch_tokens = 256);
 
     /// Submit a new generation request
@@ -771,6 +936,9 @@ public:
     int prefill_queue_size() const { return static_cast<int>(prefill_queue_.size()); }
     int decode_queue_size() const { return static_cast<int>(decode_queue_.size()); }
 
+    /// Check if using paged attention
+    bool is_paged() const { return use_paged_; }
+
 private:
     // Batch assembly
     struct Batch {
@@ -784,11 +952,13 @@ private:
     Batch assemble_prefill_batch();
     Batch assemble_decode_batch();
     void process_batch(const Batch& batch);
+    void process_batch_paged(const Batch& batch);  // True batched decode with paged attention
 
     // Model and resources
     TransformerModel* model_ = nullptr;
     Tokenizer* tokenizer_ = nullptr;
     std::unique_ptr<KVCachePool> kv_pool_;
+    std::unique_ptr<PagedKVPool> paged_kv_pool_;
 
     // Request management
     std::deque<std::unique_ptr<GenerationRequest>> prefill_queue_;
@@ -798,6 +968,8 @@ private:
 
     // Configuration
     int max_batch_tokens_ = 256;
+    bool use_paged_ = false;
+    int block_size_ = 16;
 };
 
 // =============================================================================

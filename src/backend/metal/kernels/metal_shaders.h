@@ -5302,4 +5302,314 @@ kernel void attention_tree_nocontext_f16kv(
         out_head[d] = out_val;
     }
 }
+
+// =============================================================================
+// Paged Attention Kernels
+// =============================================================================
+// These kernels support PagedAttention where K/V are stored in scattered physical
+// blocks rather than contiguous memory. A block table maps logical positions to
+// physical block indices.
+//
+// Memory layout:
+//   K_cache/V_cache: [num_blocks * block_size, num_kv_heads, head_dim] (half)
+//   block_table: [num_logical_blocks] - maps logical block -> physical block
+//
+// For a token at position `pos`:
+//   logical_block = pos / block_size
+//   block_offset = pos % block_size
+//   physical_block = block_table[logical_block]
+//   physical_pos = physical_block * block_size + block_offset
+
+// Paged attention decode kernel for single query (seq_q = 1)
+// Q: [num_heads, head_dim]
+// K_cache: [num_blocks * block_size, num_kv_heads, head_dim] (half)
+// V_cache: [num_blocks * block_size, num_kv_heads, head_dim] (half)
+// block_table: [num_logical_blocks]
+// output: [num_heads, head_dim]
+// Each threadgroup handles one head with 128 threads (4 SIMD groups)
+kernel void paged_attention_decode(
+    device const float* Q              [[buffer(0)]],
+    device const half* K_cache         [[buffer(1)]],
+    device const half* V_cache         [[buffer(2)]],
+    device const int* block_table      [[buffer(3)]],
+    device float* output               [[buffer(4)]],
+    constant uint& num_heads           [[buffer(5)]],
+    constant uint& num_kv_heads        [[buffer(6)]],
+    constant uint& seq_len             [[buffer(7)]],
+    constant uint& head_dim            [[buffer(8)]],
+    constant uint& block_size          [[buffer(9)]],
+    constant uint& num_kv_heads_stride [[buffer(10)]],  // = num_blocks * block_size
+    constant float& scale              [[buffer(11)]],
+    uint head_idx                      [[threadgroup_position_in_grid]],
+    uint tid                           [[thread_position_in_threadgroup]],
+    uint simd_lane                     [[thread_index_in_simdgroup]],
+    uint simd_id                       [[simdgroup_index_in_threadgroup]]
+) {
+    if (head_idx >= num_heads) return;
+
+    uint heads_per_kv = num_heads / num_kv_heads;
+    uint kv_head = head_idx / heads_per_kv;
+
+    device const float* q_head = Q + head_idx * head_dim;
+    device float* out_head = output + head_idx * head_dim;
+
+    // K/V layout: [physical_pos, num_kv_heads, head_dim]
+    // To access K[kv_head, physical_pos, d]: K[physical_pos * num_kv_heads * head_dim + kv_head * head_dim + d]
+
+    threadgroup half scores_h[4096];
+    threadgroup float reduction_scratch[4];
+
+    // Step 1: Q @ K^T with scattered K reads
+    float local_max = -INFINITY;
+    for (uint k = tid; k < seq_len; k += 128) {
+        // Map logical position to physical position
+        uint logical_block = k / block_size;
+        uint block_offset = k % block_size;
+        int physical_block = block_table[logical_block];
+        uint physical_pos = physical_block * block_size + block_offset;
+
+        // K at [physical_pos, kv_head, :]
+        device const half* k_vec = K_cache + physical_pos * num_kv_heads * head_dim + kv_head * head_dim;
+
+        float dot_sum = 0.0f;
+        for (uint d = 0; d < head_dim; d += 4) {
+            float4 q_v = float4(q_head[d], q_head[d+1], q_head[d+2], q_head[d+3]);
+            half4 k_h = half4(k_vec[d], k_vec[d+1], k_vec[d+2], k_vec[d+3]);
+            dot_sum += dot(q_v, float4(k_h));
+        }
+
+        float score = dot_sum * scale;
+        scores_h[k] = half(score);
+        local_max = max(local_max, score);
+    }
+
+    float simd_max_val = simd_max(local_max);
+    if (simd_lane == 0) reduction_scratch[simd_id] = simd_max_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float shared_max;
+    if (tid == 0) {
+        float m = reduction_scratch[0];
+        for (uint i = 1; i < 4; i++) m = max(m, reduction_scratch[i]);
+        shared_max = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 2: Softmax
+    float local_sum = 0.0f;
+    for (uint k = tid; k < seq_len; k += 128) {
+        float exp_score = exp(float(scores_h[k]) - shared_max);
+        scores_h[k] = half(exp_score);
+        local_sum += exp_score;
+    }
+
+    float simd_sum_val = simd_sum(local_sum);
+    if (simd_lane == 0) reduction_scratch[simd_id] = simd_sum_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float shared_sum;
+    if (tid == 0) {
+        float s = 0.0f;
+        for (uint i = 0; i < 4; i++) s += reduction_scratch[i];
+        shared_sum = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float inv_sum = 1.0f / (shared_sum + 1e-6f);
+    for (uint k = tid; k < seq_len; k += 128) {
+        scores_h[k] = half(float(scores_h[k]) * inv_sum);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 3: Output = scores @ V (with scattered V reads)
+    uint dims_per_simd = (head_dim + 3) / 4;
+    uint d_start = simd_id * dims_per_simd;
+    uint d_end = min(d_start + dims_per_simd, head_dim);
+
+    for (uint d = d_start + simd_lane; d < d_end; d += 32) {
+        float out_val = 0.0f;
+        for (uint k = 0; k < seq_len; k++) {
+            // Map logical position to physical position
+            uint logical_block = k / block_size;
+            uint block_offset = k % block_size;
+            int physical_block = block_table[logical_block];
+            uint physical_pos = physical_block * block_size + block_offset;
+
+            // V at [physical_pos, kv_head, d]
+            half v_val = V_cache[physical_pos * num_kv_heads * head_dim + kv_head * head_dim + d];
+            out_val += float(scores_h[k]) * float(v_val);
+        }
+        if (d < head_dim) {
+            out_head[d] = out_val;
+        }
+    }
+}
+
+// Paged attention append kernel - copies new K/V to paged cache
+// new_k/new_v: [num_kv_heads, new_len, head_dim] (float)
+// K_cache/V_cache: [num_blocks * block_size, num_kv_heads, head_dim] (half)
+// block_table: [num_logical_blocks]
+// Appends new K/V starting at position `start_pos`
+kernel void paged_kv_cache_append(
+    device const float* new_k          [[buffer(0)]],
+    device const float* new_v          [[buffer(1)]],
+    device half* K_cache               [[buffer(2)]],
+    device half* V_cache               [[buffer(3)]],
+    device const int* block_table      [[buffer(4)]],
+    constant uint& num_kv_heads        [[buffer(5)]],
+    constant uint& head_dim            [[buffer(6)]],
+    constant uint& start_pos           [[buffer(7)]],
+    constant uint& new_len             [[buffer(8)]],
+    constant uint& block_size          [[buffer(9)]],
+    uint3 gid                          [[thread_position_in_grid]]
+) {
+    uint h = gid.z;   // KV head index
+    uint s = gid.y;   // Position in new sequence (0 to new_len-1)
+    uint d = gid.x;   // Dimension
+
+    if (h >= num_kv_heads || s >= new_len || d >= head_dim) return;
+
+    // Source index: new_k/v is [num_kv_heads, new_len, head_dim]
+    uint src_idx = h * new_len * head_dim + s * head_dim + d;
+
+    // Destination: map (start_pos + s) to physical position
+    uint logical_pos = start_pos + s;
+    uint logical_block = logical_pos / block_size;
+    uint block_offset = logical_pos % block_size;
+    int physical_block = block_table[logical_block];
+    uint physical_pos = physical_block * block_size + block_offset;
+
+    // Dest index: K/V_cache is [physical_pos, num_kv_heads, head_dim]
+    uint dst_idx = physical_pos * num_kv_heads * head_dim + h * head_dim + d;
+
+    K_cache[dst_idx] = half(new_k[src_idx]);
+    V_cache[dst_idx] = half(new_v[src_idx]);
+}
+
+// Batched paged attention decode - multiple sequences in one kernel launch
+// Handles multiple independent sequences, each with its own block table
+// Q: [batch_size, num_heads, head_dim]
+// K_cache/V_cache: [num_blocks * block_size, num_kv_heads, head_dim] (half) - shared pool
+// block_tables: [batch_size, max_blocks_per_seq] - each row is a sequence's block table
+// seq_lens: [batch_size] - actual sequence length for each batch entry
+// output: [batch_size, num_heads, head_dim]
+// Each threadgroup handles one (batch, head) pair
+kernel void batched_paged_attention_decode(
+    device const float* Q              [[buffer(0)]],
+    device const half* K_cache         [[buffer(1)]],
+    device const half* V_cache         [[buffer(2)]],
+    device const int* block_tables     [[buffer(3)]],
+    device const int* seq_lens         [[buffer(4)]],
+    device float* output               [[buffer(5)]],
+    constant uint& batch_size          [[buffer(6)]],
+    constant uint& num_heads           [[buffer(7)]],
+    constant uint& num_kv_heads        [[buffer(8)]],
+    constant uint& head_dim            [[buffer(9)]],
+    constant uint& block_size          [[buffer(10)]],
+    constant uint& max_blocks_per_seq  [[buffer(11)]],
+    constant float& scale              [[buffer(12)]],
+    uint2 tgid                         [[threadgroup_position_in_grid]],
+    uint tid                           [[thread_position_in_threadgroup]],
+    uint simd_lane                     [[thread_index_in_simdgroup]],
+    uint simd_id                       [[simdgroup_index_in_threadgroup]]
+) {
+    uint batch_idx = tgid.y;
+    uint head_idx = tgid.x;
+
+    if (batch_idx >= batch_size || head_idx >= num_heads) return;
+
+    uint heads_per_kv = num_heads / num_kv_heads;
+    uint kv_head = head_idx / heads_per_kv;
+    uint seq_len = seq_lens[batch_idx];
+
+    if (seq_len == 0) return;
+
+    device const float* q_head = Q + batch_idx * num_heads * head_dim + head_idx * head_dim;
+    device float* out_head = output + batch_idx * num_heads * head_dim + head_idx * head_dim;
+    device const int* block_table = block_tables + batch_idx * max_blocks_per_seq;
+
+    threadgroup half scores_h[4096];
+    threadgroup float reduction_scratch[4];
+
+    // Step 1: Q @ K^T
+    float local_max = -INFINITY;
+    for (uint k = tid; k < seq_len; k += 128) {
+        uint logical_block = k / block_size;
+        uint block_offset = k % block_size;
+        int physical_block = block_table[logical_block];
+        uint physical_pos = physical_block * block_size + block_offset;
+
+        device const half* k_vec = K_cache + physical_pos * num_kv_heads * head_dim + kv_head * head_dim;
+
+        float dot_sum = 0.0f;
+        for (uint d = 0; d < head_dim; d += 4) {
+            float4 q_v = float4(q_head[d], q_head[d+1], q_head[d+2], q_head[d+3]);
+            half4 k_h = half4(k_vec[d], k_vec[d+1], k_vec[d+2], k_vec[d+3]);
+            dot_sum += dot(q_v, float4(k_h));
+        }
+
+        float score = dot_sum * scale;
+        scores_h[k] = half(score);
+        local_max = max(local_max, score);
+    }
+
+    float simd_max_val = simd_max(local_max);
+    if (simd_lane == 0) reduction_scratch[simd_id] = simd_max_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float shared_max;
+    if (tid == 0) {
+        float m = reduction_scratch[0];
+        for (uint i = 1; i < 4; i++) m = max(m, reduction_scratch[i]);
+        shared_max = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 2: Softmax
+    float local_sum = 0.0f;
+    for (uint k = tid; k < seq_len; k += 128) {
+        float exp_score = exp(float(scores_h[k]) - shared_max);
+        scores_h[k] = half(exp_score);
+        local_sum += exp_score;
+    }
+
+    float simd_sum_val = simd_sum(local_sum);
+    if (simd_lane == 0) reduction_scratch[simd_id] = simd_sum_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float shared_sum;
+    if (tid == 0) {
+        float s = 0.0f;
+        for (uint i = 0; i < 4; i++) s += reduction_scratch[i];
+        shared_sum = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float inv_sum = 1.0f / (shared_sum + 1e-6f);
+    for (uint k = tid; k < seq_len; k += 128) {
+        scores_h[k] = half(float(scores_h[k]) * inv_sum);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 3: Output = scores @ V
+    uint dims_per_simd = (head_dim + 3) / 4;
+    uint d_start = simd_id * dims_per_simd;
+    uint d_end = min(d_start + dims_per_simd, head_dim);
+
+    for (uint d = d_start + simd_lane; d < d_end; d += 32) {
+        float out_val = 0.0f;
+        for (uint k = 0; k < seq_len; k++) {
+            uint logical_block = k / block_size;
+            uint block_offset = k % block_size;
+            int physical_block = block_table[logical_block];
+            uint physical_pos = physical_block * block_size + block_offset;
+
+            half v_val = V_cache[physical_pos * num_kv_heads * head_dim + kv_head * head_dim + d];
+            out_val += float(scores_h[k]) * float(v_val);
+        }
+        if (d < head_dim) {
+            out_head[d] = out_val;
+        }
+    }
+}
 )";

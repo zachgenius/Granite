@@ -172,7 +172,10 @@ private:
             // Prefill attention
             "attention_prefill", "attention_prefill_f16kv",
             // Tree attention (for speculative decoding)
-            "attention_tree_f16kv", "attention_tree_nocontext_f16kv"
+            "attention_tree_f16kv", "attention_tree_nocontext_f16kv",
+            // Paged attention (for continuous batching)
+            "paged_attention_decode", "paged_kv_cache_append",
+            "batched_paged_attention_decode"
         };
 
         for (const auto& name : kernels) {
@@ -1877,6 +1880,134 @@ Result<void> MetalCompute::attention_tree(
         MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
         encoder->dispatchThreadgroups(grid_size, threadgroup_size);
     }
+
+    return {};
+}
+
+// =============================================================================
+// Paged Attention Kernels
+// =============================================================================
+
+Result<void> MetalCompute::paged_attention_decode(
+    MTL::Buffer* Q,
+    MTL::Buffer* K_cache,
+    MTL::Buffer* V_cache,
+    MTL::Buffer* block_table,
+    MTL::Buffer* output,
+    uint32_t num_heads,
+    uint32_t num_kv_heads,
+    uint32_t seq_len,
+    uint32_t head_dim,
+    uint32_t block_size,
+    float scale)
+{
+    auto* encoder = impl_->get_encoder();
+    auto* pipeline = impl_->get_pipeline("paged_attention_decode");
+    if (!pipeline) {
+        return Error(ErrorCode::InternalError, "paged_attention_decode pipeline not found");
+    }
+
+    encoder->setComputePipelineState(pipeline);
+    encoder->setBuffer(Q, 0, 0);
+    encoder->setBuffer(K_cache, 0, 1);
+    encoder->setBuffer(V_cache, 0, 2);
+    encoder->setBuffer(block_table, 0, 3);
+    encoder->setBuffer(output, 0, 4);
+    encoder->setBytes(&num_heads, sizeof(uint32_t), 5);
+    encoder->setBytes(&num_kv_heads, sizeof(uint32_t), 6);
+    encoder->setBytes(&seq_len, sizeof(uint32_t), 7);
+    encoder->setBytes(&head_dim, sizeof(uint32_t), 8);
+    encoder->setBytes(&block_size, sizeof(uint32_t), 9);
+    uint32_t kv_stride = 0;  // Not used directly, computed in kernel
+    encoder->setBytes(&kv_stride, sizeof(uint32_t), 10);
+    encoder->setBytes(&scale, sizeof(float), 11);
+
+    // One threadgroup per head, 128 threads per threadgroup
+    MTL::Size grid_size = MTL::Size::Make(num_heads, 1, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
+    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
+
+    return {};
+}
+
+Result<void> MetalCompute::paged_kv_cache_append(
+    MTL::Buffer* new_k,
+    MTL::Buffer* new_v,
+    MTL::Buffer* K_cache,
+    MTL::Buffer* V_cache,
+    MTL::Buffer* block_table,
+    uint32_t num_kv_heads,
+    uint32_t head_dim,
+    uint32_t start_pos,
+    uint32_t new_len,
+    uint32_t block_size)
+{
+    auto* encoder = impl_->get_encoder();
+    auto* pipeline = impl_->get_pipeline("paged_kv_cache_append");
+    if (!pipeline) {
+        return Error(ErrorCode::InternalError, "paged_kv_cache_append pipeline not found");
+    }
+
+    encoder->setComputePipelineState(pipeline);
+    encoder->setBuffer(new_k, 0, 0);
+    encoder->setBuffer(new_v, 0, 1);
+    encoder->setBuffer(K_cache, 0, 2);
+    encoder->setBuffer(V_cache, 0, 3);
+    encoder->setBuffer(block_table, 0, 4);
+    encoder->setBytes(&num_kv_heads, sizeof(uint32_t), 5);
+    encoder->setBytes(&head_dim, sizeof(uint32_t), 6);
+    encoder->setBytes(&start_pos, sizeof(uint32_t), 7);
+    encoder->setBytes(&new_len, sizeof(uint32_t), 8);
+    encoder->setBytes(&block_size, sizeof(uint32_t), 9);
+
+    // Grid: [head_dim, new_len, num_kv_heads]
+    MTL::Size grid_size = MTL::Size::Make(head_dim, new_len, num_kv_heads);
+    MTL::Size threadgroup_size = MTL::Size::Make(32, 1, 1);
+    encoder->dispatchThreads(grid_size, threadgroup_size);
+
+    return {};
+}
+
+Result<void> MetalCompute::batched_paged_attention_decode(
+    MTL::Buffer* Q,
+    MTL::Buffer* K_cache,
+    MTL::Buffer* V_cache,
+    MTL::Buffer* block_tables,
+    MTL::Buffer* seq_lens,
+    MTL::Buffer* output,
+    uint32_t batch_size,
+    uint32_t num_heads,
+    uint32_t num_kv_heads,
+    uint32_t head_dim,
+    uint32_t block_size,
+    uint32_t max_blocks_per_seq,
+    float scale)
+{
+    auto* encoder = impl_->get_encoder();
+    auto* pipeline = impl_->get_pipeline("batched_paged_attention_decode");
+    if (!pipeline) {
+        return Error(ErrorCode::InternalError, "batched_paged_attention_decode pipeline not found");
+    }
+
+    encoder->setComputePipelineState(pipeline);
+    encoder->setBuffer(Q, 0, 0);
+    encoder->setBuffer(K_cache, 0, 1);
+    encoder->setBuffer(V_cache, 0, 2);
+    encoder->setBuffer(block_tables, 0, 3);
+    encoder->setBuffer(seq_lens, 0, 4);
+    encoder->setBuffer(output, 0, 5);
+    encoder->setBytes(&batch_size, sizeof(uint32_t), 6);
+    encoder->setBytes(&num_heads, sizeof(uint32_t), 7);
+    encoder->setBytes(&num_kv_heads, sizeof(uint32_t), 8);
+    encoder->setBytes(&head_dim, sizeof(uint32_t), 9);
+    encoder->setBytes(&block_size, sizeof(uint32_t), 10);
+    encoder->setBytes(&max_blocks_per_seq, sizeof(uint32_t), 11);
+    encoder->setBytes(&scale, sizeof(float), 12);
+
+    // Grid: [num_heads, batch_size]
+    MTL::Size grid_size = MTL::Size::Make(num_heads, batch_size, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
+    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
 
     return {};
 }

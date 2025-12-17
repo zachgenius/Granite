@@ -686,6 +686,82 @@ public:
     );
 
     // =============================================================================
+    // Paged Attention Operations
+    // =============================================================================
+    // PagedAttention enables memory-efficient KV cache through block-based paging.
+    // K/V are stored in scattered physical blocks, and a block table maps logical
+    // sequence positions to physical block locations.
+    //
+    // Memory layout:
+    //   K_cache/V_cache: [num_blocks * block_size, num_kv_heads, head_dim] (half)
+    //   block_table: [num_logical_blocks] int32 - maps logical block -> physical block
+    //
+    // For a token at position `pos`:
+    //   logical_block = pos / block_size
+    //   block_offset = pos % block_size
+    //   physical_block = block_table[logical_block]
+    //   physical_pos = physical_block * block_size + block_offset
+
+    // Single-sequence paged attention decode (seq_q = 1)
+    // Q: [num_heads, head_dim] float
+    // K_cache: [num_blocks * block_size, num_kv_heads, head_dim] half
+    // V_cache: [num_blocks * block_size, num_kv_heads, head_dim] half
+    // block_table: [num_logical_blocks] int32
+    // output: [num_heads, head_dim] float
+    Result<void> paged_attention_decode(
+        MTL::Buffer* Q,
+        MTL::Buffer* K_cache,
+        MTL::Buffer* V_cache,
+        MTL::Buffer* block_table,
+        MTL::Buffer* output,
+        uint32_t num_heads,
+        uint32_t num_kv_heads,
+        uint32_t seq_len,
+        uint32_t head_dim,
+        uint32_t block_size,
+        float scale
+    );
+
+    // Append new K/V to paged cache
+    // new_k/new_v: [num_kv_heads, new_len, head_dim] float
+    // K_cache/V_cache: [num_blocks * block_size, num_kv_heads, head_dim] half
+    // block_table: [num_logical_blocks] int32
+    Result<void> paged_kv_cache_append(
+        MTL::Buffer* new_k,
+        MTL::Buffer* new_v,
+        MTL::Buffer* K_cache,
+        MTL::Buffer* V_cache,
+        MTL::Buffer* block_table,
+        uint32_t num_kv_heads,
+        uint32_t head_dim,
+        uint32_t start_pos,
+        uint32_t new_len,
+        uint32_t block_size
+    );
+
+    // Batched paged attention decode - multiple sequences in one kernel launch
+    // Q: [batch_size, num_heads, head_dim] float
+    // K_cache/V_cache: [num_blocks * block_size, num_kv_heads, head_dim] half - shared pool
+    // block_tables: [batch_size, max_blocks_per_seq] int32
+    // seq_lens: [batch_size] int32
+    // output: [batch_size, num_heads, head_dim] float
+    Result<void> batched_paged_attention_decode(
+        MTL::Buffer* Q,
+        MTL::Buffer* K_cache,
+        MTL::Buffer* V_cache,
+        MTL::Buffer* block_tables,
+        MTL::Buffer* seq_lens,
+        MTL::Buffer* output,
+        uint32_t batch_size,
+        uint32_t num_heads,
+        uint32_t num_kv_heads,
+        uint32_t head_dim,
+        uint32_t block_size,
+        uint32_t max_blocks_per_seq,
+        float scale
+    );
+
+    // =============================================================================
     // Embedding Operations
     // =============================================================================
 
