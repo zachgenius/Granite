@@ -165,6 +165,8 @@ private:
             // Phase 2 fused kernels (eliminates redundant computation)
             "rms_norm_dual_matvec_q4k", "rms_norm_dual_matvec_q3k", "rms_norm_dual_matvec_q2k",
             "matvec_residual_q4k", "matvec_residual_q3k", "matvec_residual_q2k",
+            // Fused QKV attention projection
+            "fused_qkv_matvec_q4k",
             // Flash attention
             "flash_attention_decode",
             // Prefill attention
@@ -1754,6 +1756,50 @@ Result<void> MetalCompute::matvec_residual_q2k(
     uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
     MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
+
+    return {};
+}
+
+// =============================================================================
+// Fused QKV Attention Projection
+// =============================================================================
+
+Result<void> MetalCompute::fused_qkv_matvec_q4k(
+    MTL::Buffer* x,
+    MTL::Buffer* Wq, MTL::Buffer* Wk, MTL::Buffer* Wv,
+    MTL::Buffer* yq, MTL::Buffer* yk, MTL::Buffer* yv,
+    uint32_t K, uint32_t Nq, uint32_t Nkv)
+{
+    auto* encoder = impl_->get_encoder();
+    auto* pipeline = impl_->get_pipeline("fused_qkv_matvec_q4k");
+    if (!pipeline) {
+        return Error(ErrorCode::InternalError, "fused_qkv_matvec_q4k pipeline not found");
+    }
+
+    encoder->setComputePipelineState(pipeline);
+    encoder->setBuffer(x, 0, 0);
+    encoder->setBuffer(Wq, 0, 1);
+    encoder->setBuffer(Wk, 0, 2);
+    encoder->setBuffer(Wv, 0, 3);
+    encoder->setBuffer(yq, 0, 4);
+    encoder->setBuffer(yk, 0, 5);
+    encoder->setBuffer(yv, 0, 6);
+    encoder->setBytes(&K, sizeof(K), 7);
+    encoder->setBytes(&Nq, sizeof(Nq), 8);
+    encoder->setBytes(&Nkv, sizeof(Nkv), 9);
+
+    // Calculate threadgroups: 8 SIMD groups per TG, 2 rows per SIMD = 16 rows per TG
+    uint32_t rows_per_tg = 16;
+    uint32_t q_threadgroups = (Nq + rows_per_tg - 1) / rows_per_tg;
+    uint32_t kv_threadgroups = (Nkv + rows_per_tg - 1) / rows_per_tg;
+    uint32_t total_threadgroups = q_threadgroups + 2 * kv_threadgroups;  // Q + K + V
+
+    encoder->setBytes(&q_threadgroups, sizeof(q_threadgroups), 10);
+    encoder->setBytes(&kv_threadgroups, sizeof(kv_threadgroups), 11);
+
+    MTL::Size grid_size = MTL::Size::Make(total_threadgroups, 1, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);  // 8 SIMD groups * 32 threads
     encoder->dispatchThreadgroups(grid_size, threadgroup_size);
 
     return {};

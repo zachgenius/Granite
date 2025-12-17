@@ -528,6 +528,25 @@ public:
         uint32_t N                // Output dimension (hidden_dim)
     );
 
+    // =============================================================================
+    // Fused QKV Attention Projection
+    // =============================================================================
+
+    // Fused Q/K/V projection - computes all 3 attention projections in single dispatch
+    // Reduces kernel launch overhead from 3 dispatches to 1
+    Result<void> fused_qkv_matvec_q4k(
+        MTL::Buffer* x,           // Input [K] float (hidden state)
+        MTL::Buffer* Wq,          // Q weight [Nq, K/256] Q4_K blocks
+        MTL::Buffer* Wk,          // K weight [Nkv, K/256] Q4_K blocks
+        MTL::Buffer* Wv,          // V weight [Nkv, K/256] Q4_K blocks
+        MTL::Buffer* yq,          // Q output [Nq] float
+        MTL::Buffer* yk,          // K output [Nkv] float
+        MTL::Buffer* yv,          // V output [Nkv] float
+        uint32_t K,               // Input dimension (hidden_dim)
+        uint32_t Nq,              // Q output dimension (num_heads * head_dim)
+        uint32_t Nkv              // KV output dimension (num_kv_heads * head_dim)
+    );
+
     // RoPE (Rotary Position Embedding)
     Result<void> rope(
         MTL::Buffer* x,

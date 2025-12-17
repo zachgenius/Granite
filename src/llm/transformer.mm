@@ -1876,10 +1876,10 @@ Result<Tensor> TransformerModel::attention_full_gpu(
         gpu->matvec_q2_k(h_buf, wk_buf, k_buf, hidden_dim, kv_dim);
         gpu->matvec_q2_k(h_buf, wv_buf, v_buf, hidden_dim, kv_dim);
     } else {
-        // Q4_K (default)
-        gpu->matvec_q4k(h_buf, wq_buf, q_buf, hidden_dim, q_dim);
-        gpu->matvec_q4k(h_buf, wk_buf, k_buf, hidden_dim, kv_dim);
-        gpu->matvec_q4k(h_buf, wv_buf, v_buf, hidden_dim, kv_dim);
+        // Q4_K (default) - Use fused QKV kernel (3 dispatches -> 1)
+        gpu->fused_qkv_matvec_q4k(h_buf, wq_buf, wk_buf, wv_buf,
+                                  q_buf, k_buf, v_buf,
+                                  hidden_dim, q_dim, kv_dim);
     }
 
     // 2. Apply RoPE to Q and K

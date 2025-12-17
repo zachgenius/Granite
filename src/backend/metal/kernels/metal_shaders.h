@@ -297,6 +297,138 @@ kernel void matvec_q4k(
     }
 }
 
+// Fused Q/K/V projection kernel - processes all 3 attention projections in single dispatch
+// This reduces kernel launch overhead from 3 dispatches to 1
+kernel void fused_qkv_matvec_q4k(
+    device const float* x           [[buffer(0)]],   // Input hidden state [hidden_dim]
+    device const void* Wq           [[buffer(1)]],   // Q weight [q_dim, hidden_dim]
+    device const void* Wk           [[buffer(2)]],   // K weight [kv_dim, hidden_dim]
+    device const void* Wv           [[buffer(3)]],   // V weight [kv_dim, hidden_dim]
+    device float* yq                [[buffer(4)]],   // Q output [q_dim]
+    device float* yk                [[buffer(5)]],   // K output [kv_dim]
+    device float* yv                [[buffer(6)]],   // V output [kv_dim]
+    constant uint& K                [[buffer(7)]],   // Input dimension (hidden_dim)
+    constant uint& Nq               [[buffer(8)]],   // Q output dimension (num_heads * head_dim)
+    constant uint& Nkv              [[buffer(9)]],   // KV output dimension (num_kv_heads * head_dim)
+    constant uint& q_threadgroups   [[buffer(10)]],  // Number of threadgroups for Q
+    constant uint& kv_threadgroups  [[buffer(11)]],  // Number of threadgroups for K (and V)
+    uint tgid                       [[threadgroup_position_in_grid]],
+    uint tiisg                      [[thread_index_in_simdgroup]],
+    uint sgitg                      [[simdgroup_index_in_threadgroup]]
+) {
+    const uint nb = K / QK_K;
+
+    // Determine which output (Q=0, K=1, V=2) and local row offset
+    uint which_output;
+    uint local_tgid;
+    uint N;
+    device const void* W;
+    device float* y;
+
+    if (tgid < q_threadgroups) {
+        which_output = 0;
+        local_tgid = tgid;
+        N = Nq;
+        W = Wq;
+        y = yq;
+    } else if (tgid < q_threadgroups + kv_threadgroups) {
+        which_output = 1;
+        local_tgid = tgid - q_threadgroups;
+        N = Nkv;
+        W = Wk;
+        y = yk;
+    } else {
+        which_output = 2;
+        local_tgid = tgid - q_threadgroups - kv_threadgroups;
+        N = Nkv;
+        W = Wv;
+        y = yv;
+    }
+
+    // Thread indexing (same as matvec_q4k)
+    const short ix = tiisg / 8;
+    const short it = tiisg % 8;
+    const short iq = it / 4;
+    const short ir = it % 4;
+
+    // Each SIMD group handles NR0_Q4K rows
+    const uint first_row = (local_tgid * ROWS_PER_TG + sgitg) * NR0_Q4K;
+
+    device const block_q4_K* weights = (const device block_q4_K*)W;
+
+    // Register-based input caching
+    float yl[16];
+    float yh[16];
+    float sumf[NR0_Q4K] = {0.f, 0.f};
+
+    device const float* y4 = x + ix * QK_K + 64 * iq + 8 * ir;
+
+    ushort sc16[4];
+    thread const uchar* sc8 = (thread const uchar*)sc16;
+
+    for (uint ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+
+        for (short i = 0; i < 8; ++i) {
+            yl[i+0] = y4[i+  0]; sumy[0] += yl[i+0];
+            yl[i+8] = y4[i+ 32]; sumy[1] += yl[i+8];
+            yh[i+0] = y4[i+128]; sumy[2] += yh[i+0];
+            yh[i+8] = y4[i+160]; sumy[3] += yh[i+8];
+        }
+
+        for (short row = 0; row < NR0_Q4K; row++) {
+            uint row_idx = first_row + row;
+            if (row_idx >= N) continue;
+
+            device const block_q4_K* block = &weights[row_idx * nb + ib];
+            device const ushort* sc = (device const ushort*)block->scales + iq;
+            device const ushort* q1 = (device const ushort*)block->qs + 16 * iq + 4 * ir;
+            device const half* dh = &block->d;
+
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+            device const ushort* q2 = q1 + 32;
+
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2*i + 0] * (q1[i] & 0x000F);
+                acc1[1] += yl[2*i + 1] * (q1[i] & 0x0F00);
+                acc1[2] += yl[2*i + 8] * (q1[i] & 0x00F0);
+                acc1[3] += yl[2*i + 9] * (q1[i] & 0xF000);
+                acc2[0] += yh[2*i + 0] * (q2[i] & 0x000F);
+                acc2[1] += yh[2*i + 1] * (q2[i] & 0x0F00);
+                acc2[2] += yh[2*i + 8] * (q2[i] & 0x00F0);
+                acc2[3] += yh[2*i + 9] * (q2[i] & 0xF000);
+            }
+
+            sumf[row] += dh[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
+                                  (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
+                                  (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
+                                  (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
+                         dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] +
+                                  sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+        }
+
+        y4 += 4 * QK_K;
+    }
+
+    // SIMD reduction and output
+    for (short row = 0; row < NR0_Q4K; row++) {
+        uint row_idx = first_row + row;
+        if (row_idx < N) {
+            float sum = simd_sum(sumf[row]);
+            if (tiisg == 0) {
+                y[row_idx] = sum;
+            }
+        }
+    }
+}
+
 kernel void matmul_q4k(
     device const float* X          [[buffer(0)]],
     device const void* W           [[buffer(1)]],
