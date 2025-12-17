@@ -492,19 +492,30 @@ Result<Tensor> TransformerModel::forward_tree(
 
     int num_nodes = static_cast<int>(tokens.size());
 
-    // Build ancestor mask: ancestors[i] = set of node indices that node i can attend to
-    // Node i can attend to itself and all ancestors up to root
-    std::vector<std::vector<bool>> tree_mask(num_nodes, std::vector<bool>(num_nodes, false));
+    // Check if GPU path is available
+    bool use_gpu = false;
+#ifdef GRANITE_HAS_METAL
+    auto* mc = get_metal_compute();
+    use_gpu = mc && mc->is_initialized();
+#endif
 
-    for (int i = 0; i < num_nodes; i++) {
-        // Each node attends to itself
-        tree_mask[i][i] = true;
+    // Build tree_mask only if using CPU path
+    std::vector<std::vector<bool>> tree_mask;
+    if (!use_gpu) {
+        // Build ancestor mask: ancestors[i] = set of node indices that node i can attend to
+        // Node i can attend to itself and all ancestors up to root
+        tree_mask.resize(num_nodes, std::vector<bool>(num_nodes, false));
 
-        // Walk up the parent chain to find all ancestors
-        int current = parent_indices[i];
-        while (current >= 0 && current < num_nodes) {
-            tree_mask[i][current] = true;
-            current = parent_indices[current];
+        for (int i = 0; i < num_nodes; i++) {
+            // Each node attends to itself
+            tree_mask[i][i] = true;
+
+            // Walk up the parent chain to find all ancestors
+            int current = parent_indices[i];
+            while (current >= 0 && current < num_nodes) {
+                tree_mask[i][current] = true;
+                current = parent_indices[current];
+            }
         }
     }
 
@@ -534,11 +545,21 @@ Result<Tensor> TransformerModel::forward_tree(
 
     // Process through transformer layers with tree attention
     for (int layer = 0; layer < config_.num_layers; layer++) {
-        auto block_result = transformer_block_tree(hidden, layer, kv_cache, start_pos, tree_mask);
-        if (!block_result.ok()) {
-            return block_result.error();
+        if (use_gpu) {
+            // GPU path: use parent_indices directly
+            auto block_result = transformer_block_tree_gpu(hidden, layer, kv_cache, start_pos, parent_indices);
+            if (!block_result.ok()) {
+                return block_result.error();
+            }
+            hidden = std::move(block_result).take();
+        } else {
+            // CPU path: use precomputed tree_mask
+            auto block_result = transformer_block_tree(hidden, layer, kv_cache, start_pos, tree_mask);
+            if (!block_result.ok()) {
+                return block_result.error();
+            }
+            hidden = std::move(block_result).take();
         }
-        hidden = std::move(block_result).take();
     }
 
     // Final RMSNorm and output projection (same as regular forward)
@@ -1700,6 +1721,313 @@ Result<Tensor> TransformerModel::attention_tree(
     backend_->unmap_buffer(output.buffer());
     backend_->unmap_buffer(wo->buffer());
 
+    return output;
+}
+
+// =============================================================================
+// GPU-Accelerated Tree Attention
+// =============================================================================
+
+Result<Tensor> TransformerModel::attention_tree_gpu(
+    const Tensor& hidden,
+    int layer,
+    KVCache* kv_cache,
+    int start_pos,
+    const std::vector<int>& parent_indices)
+{
+#ifdef GRANITE_HAS_METAL
+    auto* mc = get_metal_compute();
+    if (!mc || !mc->is_initialized()) {
+        // Fall back to CPU path by building tree_mask
+        int num_nodes = static_cast<int>(parent_indices.size());
+        std::vector<std::vector<bool>> tree_mask(num_nodes, std::vector<bool>(num_nodes, false));
+        for (int i = 0; i < num_nodes; i++) {
+            tree_mask[i][i] = true;
+            int current = parent_indices[i];
+            while (current >= 0 && current < num_nodes) {
+                tree_mask[i][current] = true;
+                current = parent_indices[current];
+            }
+        }
+        return attention_tree(hidden, layer, kv_cache, start_pos, tree_mask);
+    }
+
+    std::string prefix = "blk." + std::to_string(layer) + ".";
+
+    // Get attention weights
+    const Tensor* wq = get_weight(prefix + "attn_q.weight");
+    const Tensor* wk = get_weight(prefix + "attn_k.weight");
+    const Tensor* wv = get_weight(prefix + "attn_v.weight");
+    const Tensor* wo = get_weight(prefix + "attn_output.weight");
+
+    if (!wq || !wk || !wv || !wo) {
+        GRANITE_FAIL(ErrorCode::InvalidState,
+                     "Missing attention weights for layer " + std::to_string(layer));
+    }
+
+    int batch = static_cast<int>(hidden.size(0));
+    int num_nodes = static_cast<int>(hidden.size(1));
+    int hidden_dim = config_.hidden_dim;
+    int num_heads = config_.num_heads;
+    int num_kv_heads = config_.num_kv_heads;
+    int head_dim = config_.head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+
+    // Allocate Q, K, V tensors
+    std::vector<int64_t> q_shape = {1, static_cast<int64_t>(num_nodes),
+                                    static_cast<int64_t>(num_heads), static_cast<int64_t>(head_dim)};
+    std::vector<int64_t> kv_shape = {1, static_cast<int64_t>(num_nodes),
+                                     static_cast<int64_t>(num_kv_heads), static_cast<int64_t>(head_dim)};
+
+    auto q_result = Tensor::allocate(q_shape, DataType::FP32, backend_);
+    auto k_result = Tensor::allocate(kv_shape, DataType::FP32, backend_);
+    auto v_result = Tensor::allocate(kv_shape, DataType::FP32, backend_);
+
+    if (!q_result.ok() || !k_result.ok() || !v_result.ok()) {
+        GRANITE_FAIL(ErrorCode::AllocationFailed, "Failed to allocate Q/K/V tensors");
+    }
+
+    auto q = std::move(q_result).take();
+    auto k = std::move(k_result).take();
+    auto v = std::move(v_result).take();
+
+    // QKV projection (CPU for now - could use GPU matvec kernels)
+    auto map_h = backend_->map_buffer(hidden.buffer());
+    auto map_q = backend_->map_buffer(q.buffer());
+    auto map_k = backend_->map_buffer(k.buffer());
+    auto map_v = backend_->map_buffer(v.buffer());
+    auto map_wq = backend_->map_buffer(wq->buffer());
+    auto map_wk = backend_->map_buffer(wk->buffer());
+    auto map_wv = backend_->map_buffer(wv->buffer());
+
+    if (!map_h.ok() || !map_q.ok() || !map_k.ok() || !map_v.ok() ||
+        !map_wq.ok() || !map_wk.ok() || !map_wv.ok()) {
+        GRANITE_FAIL(ErrorCode::InternalError, "Failed to map attention buffers");
+    }
+
+    const float* h_data = static_cast<const float*>(map_h.value());
+    float* q_data = static_cast<float*>(map_q.value());
+    float* k_data = static_cast<float*>(map_k.value());
+    float* v_data = static_cast<float*>(map_v.value());
+    const uint16_t* wq_data = static_cast<const uint16_t*>(map_wq.value());
+    const uint16_t* wk_data = static_cast<const uint16_t*>(map_wk.value());
+    const uint16_t* wv_data = static_cast<const uint16_t*>(map_wv.value());
+
+    int q_out_dim = num_heads * head_dim;
+    matmul_transb_fp16(h_data, wq_data, q_data, num_nodes, q_out_dim, hidden_dim);
+    matmul_transb_fp16(h_data, wk_data, k_data, num_nodes, kv_dim, hidden_dim);
+    matmul_transb_fp16(h_data, wv_data, v_data, num_nodes, kv_dim, hidden_dim);
+
+    backend_->unmap_buffer(hidden.buffer());
+    backend_->unmap_buffer(wq->buffer());
+    backend_->unmap_buffer(wk->buffer());
+    backend_->unmap_buffer(wv->buffer());
+    backend_->unmap_buffer(q.buffer());
+    backend_->unmap_buffer(k.buffer());
+    backend_->unmap_buffer(v.buffer());
+
+    // Apply RoPE
+    auto rope_result = rope_cache_.apply(q, k, start_pos, backend_);
+    if (!rope_result.ok()) {
+        GRANITE_LOG_WARN("RoPE failed: {}", rope_result.error().message());
+    }
+
+    // Prepare GPU buffers for tree attention
+    // Q needs to be reshaped to [num_heads, num_nodes, head_dim]
+    size_t q_gpu_size = num_heads * num_nodes * head_dim * sizeof(float);
+    size_t kv_tree_size = num_kv_heads * num_nodes * head_dim * sizeof(uint16_t);  // FP16
+    size_t parent_size = num_nodes * sizeof(int);
+    size_t output_size = num_heads * num_nodes * head_dim * sizeof(float);
+
+    MTL::Buffer* q_gpu = mc->create_buffer(q_gpu_size, true);
+    MTL::Buffer* k_tree_gpu = mc->create_buffer(kv_tree_size, true);
+    MTL::Buffer* v_tree_gpu = mc->create_buffer(kv_tree_size, true);
+    MTL::Buffer* parent_gpu = mc->create_buffer(parent_size, true);
+    MTL::Buffer* output_gpu = mc->create_buffer(output_size, true);
+
+    if (!q_gpu || !k_tree_gpu || !v_tree_gpu || !parent_gpu || !output_gpu) {
+        if (q_gpu) q_gpu->release();
+        if (k_tree_gpu) k_tree_gpu->release();
+        if (v_tree_gpu) v_tree_gpu->release();
+        if (parent_gpu) parent_gpu->release();
+        if (output_gpu) output_gpu->release();
+        GRANITE_FAIL(ErrorCode::AllocationFailed, "Failed to allocate GPU buffers for tree attention");
+    }
+
+    // Copy and reshape Q: [1, num_nodes, num_heads, head_dim] -> [num_heads, num_nodes, head_dim]
+    map_q = backend_->map_buffer(q.buffer());
+    q_data = static_cast<float*>(map_q.value());
+    float* q_gpu_ptr = static_cast<float*>(q_gpu->contents());
+    for (int h = 0; h < num_heads; h++) {
+        for (int n = 0; n < num_nodes; n++) {
+            for (int d = 0; d < head_dim; d++) {
+                int src_idx = n * num_heads * head_dim + h * head_dim + d;
+                int dst_idx = h * num_nodes * head_dim + n * head_dim + d;
+                q_gpu_ptr[dst_idx] = q_data[src_idx];
+            }
+        }
+    }
+    backend_->unmap_buffer(q.buffer());
+
+    // Copy and convert K/V to FP16: [1, num_nodes, num_kv_heads, head_dim] -> [num_kv_heads, num_nodes, head_dim]
+    map_k = backend_->map_buffer(k.buffer());
+    map_v = backend_->map_buffer(v.buffer());
+    k_data = static_cast<float*>(map_k.value());
+    v_data = static_cast<float*>(map_v.value());
+    uint16_t* k_gpu_ptr = static_cast<uint16_t*>(k_tree_gpu->contents());
+    uint16_t* v_gpu_ptr = static_cast<uint16_t*>(v_tree_gpu->contents());
+
+    for (int kv_h = 0; kv_h < num_kv_heads; kv_h++) {
+        for (int n = 0; n < num_nodes; n++) {
+            for (int d = 0; d < head_dim; d++) {
+                int src_idx = n * num_kv_heads * head_dim + kv_h * head_dim + d;
+                int dst_idx = kv_h * num_nodes * head_dim + n * head_dim + d;
+                k_gpu_ptr[dst_idx] = fp32_to_fp16(k_data[src_idx]);
+                v_gpu_ptr[dst_idx] = fp32_to_fp16(v_data[src_idx]);
+            }
+        }
+    }
+    backend_->unmap_buffer(k.buffer());
+    backend_->unmap_buffer(v.buffer());
+
+    // Copy parent indices
+    int* parent_ptr = static_cast<int*>(parent_gpu->contents());
+    std::memcpy(parent_ptr, parent_indices.data(), parent_size);
+
+    // Get KV cache buffers
+    int cache_len = kv_cache ? kv_cache->seq_len() : 0;
+    MTL::Buffer* k_cache_gpu = nullptr;
+    MTL::Buffer* v_cache_gpu = nullptr;
+
+    if (kv_cache && cache_len > 0) {
+        auto [cached_k, cached_v] = kv_cache->get(layer);
+        k_cache_gpu = static_cast<MTL::Buffer*>(backend_->get_native_buffer(cached_k.buffer()));
+        v_cache_gpu = static_cast<MTL::Buffer*>(backend_->get_native_buffer(cached_v.buffer()));
+    }
+
+    // Call GPU tree attention kernel
+    float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    auto attn_result = mc->attention_tree(
+        q_gpu, k_cache_gpu, v_cache_gpu, k_tree_gpu, v_tree_gpu, parent_gpu, output_gpu,
+        num_heads, num_kv_heads, num_nodes, cache_len, head_dim, scale);
+
+    mc->sync();
+
+    if (!attn_result.ok()) {
+        q_gpu->release();
+        k_tree_gpu->release();
+        v_tree_gpu->release();
+        parent_gpu->release();
+        output_gpu->release();
+        return attn_result.error();
+    }
+
+    // Allocate final output tensor
+    std::vector<int64_t> output_shape = {1, static_cast<int64_t>(num_nodes),
+                                          static_cast<int64_t>(hidden_dim)};
+    auto output_result = Tensor::allocate(output_shape, DataType::FP32, backend_);
+    if (!output_result.ok()) {
+        q_gpu->release();
+        k_tree_gpu->release();
+        v_tree_gpu->release();
+        parent_gpu->release();
+        output_gpu->release();
+        return output_result.error();
+    }
+    auto output = std::move(output_result).take();
+
+    // Copy attention output and reshape: [num_heads, num_nodes, head_dim] -> [1, num_nodes, num_heads * head_dim]
+    auto map_out = backend_->map_buffer(output.buffer());
+    auto map_wo = backend_->map_buffer(wo->buffer());
+    float* out_data = static_cast<float*>(map_out.value());
+    const uint16_t* wo_data = static_cast<const uint16_t*>(map_wo.value());
+    float* attn_out = static_cast<float*>(output_gpu->contents());
+
+    // Reshape attention output for output projection
+    std::vector<float> context(num_nodes * num_heads * head_dim);
+    for (int n = 0; n < num_nodes; n++) {
+        for (int h = 0; h < num_heads; h++) {
+            for (int d = 0; d < head_dim; d++) {
+                int src_idx = h * num_nodes * head_dim + n * head_dim + d;
+                int dst_idx = n * num_heads * head_dim + h * head_dim + d;
+                context[dst_idx] = attn_out[src_idx];
+            }
+        }
+    }
+
+    // Output projection
+    int attn_out_dim = num_heads * head_dim;
+    matmul_transb_fp16(context.data(), wo_data, out_data, num_nodes, hidden_dim, attn_out_dim);
+
+    backend_->unmap_buffer(output.buffer());
+    backend_->unmap_buffer(wo->buffer());
+
+    // Cleanup GPU buffers
+    q_gpu->release();
+    k_tree_gpu->release();
+    v_tree_gpu->release();
+    parent_gpu->release();
+    output_gpu->release();
+
+    return output;
+#else
+    // No Metal - fall back to CPU path
+    int num_nodes = static_cast<int>(parent_indices.size());
+    std::vector<std::vector<bool>> tree_mask(num_nodes, std::vector<bool>(num_nodes, false));
+    for (int i = 0; i < num_nodes; i++) {
+        tree_mask[i][i] = true;
+        int current = parent_indices[i];
+        while (current >= 0 && current < num_nodes) {
+            tree_mask[i][current] = true;
+            current = parent_indices[current];
+        }
+    }
+    return attention_tree(hidden, layer, kv_cache, start_pos, tree_mask);
+#endif
+}
+
+// GPU-accelerated transformer block for tree speculation
+Result<Tensor> TransformerModel::transformer_block_tree_gpu(
+    const Tensor& hidden,
+    int layer,
+    KVCache* kv_cache,
+    int start_pos,
+    const std::vector<int>& parent_indices)
+{
+    std::string prefix = "blk." + std::to_string(layer) + ".";
+
+    // Get weights
+    const Tensor* attn_norm_weight = get_weight(prefix + "attn_norm.weight");
+    const Tensor* ffn_norm_weight = get_weight(prefix + "ffn_norm.weight");
+
+    // Save residual for later
+    Tensor residual = hidden;
+
+    // 1. RMSNorm for attention
+    auto attn_input = apply_rms_norm(hidden, attn_norm_weight);
+
+    // 2. GPU-accelerated tree attention
+    auto attn_result = attention_tree_gpu(attn_input, layer, kv_cache, start_pos, parent_indices);
+    if (!attn_result.ok()) {
+        return attn_result.error();
+    }
+    auto attn_output = std::move(attn_result).take();
+
+    // 3. Residual add: hidden = residual + attn_output
+    auto post_attn = add_tensors(residual, attn_output);
+
+    // 4. RMSNorm for FFN
+    auto ffn_input = apply_rms_norm(post_attn, ffn_norm_weight);
+
+    // 5. Feed forward (SwiGLU)
+    auto ffn_result = feed_forward(ffn_input, layer);
+    if (!ffn_result.ok()) {
+        return ffn_result.error();
+    }
+    auto ffn_output = std::move(ffn_result).take();
+
+    // 6. Residual add: output = post_attn + ffn_output
+    auto output = add_tensors(post_attn, ffn_output);
     return output;
 }
 

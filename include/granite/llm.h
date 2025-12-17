@@ -496,6 +496,23 @@ private:
         int start_pos,
         const std::vector<std::vector<bool>>& tree_mask);
 
+    // GPU-accelerated tree attention using parent_indices directly
+    // Returns empty optional if GPU not available, falls back to CPU
+    Result<Tensor> attention_tree_gpu(
+        const Tensor& hidden,
+        int layer,
+        KVCache* kv_cache,
+        int start_pos,
+        const std::vector<int>& parent_indices);
+
+    // GPU-accelerated transformer block for tree speculation
+    Result<Tensor> transformer_block_tree_gpu(
+        const Tensor& hidden,
+        int layer,
+        KVCache* kv_cache,
+        int start_pos,
+        const std::vector<int>& parent_indices);
+
     // Helper functions
     Tensor apply_rms_norm(const Tensor& input, const Tensor* weight);
     Tensor add_tensors(const Tensor& a, const Tensor& b);

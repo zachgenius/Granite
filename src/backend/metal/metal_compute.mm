@@ -170,7 +170,9 @@ private:
             // Flash attention
             "flash_attention_decode",
             // Prefill attention
-            "attention_prefill", "attention_prefill_f16kv"
+            "attention_prefill", "attention_prefill_f16kv",
+            // Tree attention (for speculative decoding)
+            "attention_tree_f16kv", "attention_tree_nocontext_f16kv"
         };
 
         for (const auto& name : kernels) {
@@ -1801,6 +1803,80 @@ Result<void> MetalCompute::fused_qkv_matvec_q4k(
     MTL::Size grid_size = MTL::Size::Make(total_threadgroups, 1, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);  // 8 SIMD groups * 32 threads
     encoder->dispatchThreadgroups(grid_size, threadgroup_size);
+
+    return {};
+}
+
+// =============================================================================
+// Tree Attention Dispatch Functions (for Speculative Decoding)
+// =============================================================================
+
+Result<void> MetalCompute::attention_tree(
+    MTL::Buffer* Q,
+    MTL::Buffer* K_cache,
+    MTL::Buffer* V_cache,
+    MTL::Buffer* K_tree,
+    MTL::Buffer* V_tree,
+    MTL::Buffer* parent_indices,
+    MTL::Buffer* output,
+    uint32_t num_heads,
+    uint32_t num_kv_heads,
+    uint32_t num_nodes,
+    uint32_t cache_len,
+    uint32_t head_dim,
+    float scale)
+{
+    auto* encoder = impl_->get_encoder();
+
+    if (cache_len > 0) {
+        // Use full tree attention with cache
+        auto* pipeline = impl_->get_pipeline("attention_tree_f16kv");
+        if (!pipeline) {
+            return Error(ErrorCode::InternalError, "attention_tree_f16kv pipeline not found");
+        }
+
+        encoder->setComputePipelineState(pipeline);
+        encoder->setBuffer(Q, 0, 0);
+        encoder->setBuffer(K_cache, 0, 1);
+        encoder->setBuffer(V_cache, 0, 2);
+        encoder->setBuffer(K_tree, 0, 3);
+        encoder->setBuffer(V_tree, 0, 4);
+        encoder->setBuffer(parent_indices, 0, 5);
+        encoder->setBuffer(output, 0, 6);
+        encoder->setBytes(&num_heads, sizeof(num_heads), 7);
+        encoder->setBytes(&num_kv_heads, sizeof(num_kv_heads), 8);
+        encoder->setBytes(&num_nodes, sizeof(num_nodes), 9);
+        encoder->setBytes(&cache_len, sizeof(cache_len), 10);
+        encoder->setBytes(&head_dim, sizeof(head_dim), 11);
+        encoder->setBytes(&scale, sizeof(scale), 12);
+
+        // Each threadgroup handles one (head, node) pair
+        MTL::Size grid_size = MTL::Size::Make(num_heads, num_nodes, 1);
+        MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
+        encoder->dispatchThreadgroups(grid_size, threadgroup_size);
+    } else {
+        // Use simpler no-context version
+        auto* pipeline = impl_->get_pipeline("attention_tree_nocontext_f16kv");
+        if (!pipeline) {
+            return Error(ErrorCode::InternalError, "attention_tree_nocontext_f16kv pipeline not found");
+        }
+
+        encoder->setComputePipelineState(pipeline);
+        encoder->setBuffer(Q, 0, 0);
+        encoder->setBuffer(K_tree, 0, 1);
+        encoder->setBuffer(V_tree, 0, 2);
+        encoder->setBuffer(parent_indices, 0, 3);
+        encoder->setBuffer(output, 0, 4);
+        encoder->setBytes(&num_heads, sizeof(num_heads), 5);
+        encoder->setBytes(&num_kv_heads, sizeof(num_kv_heads), 6);
+        encoder->setBytes(&num_nodes, sizeof(num_nodes), 7);
+        encoder->setBytes(&head_dim, sizeof(head_dim), 8);
+        encoder->setBytes(&scale, sizeof(scale), 9);
+
+        MTL::Size grid_size = MTL::Size::Make(num_heads, num_nodes, 1);
+        MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
+        encoder->dispatchThreadgroups(grid_size, threadgroup_size);
+    }
 
     return {};
 }

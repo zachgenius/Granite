@@ -658,6 +658,34 @@ public:
     );
 
     // =============================================================================
+    // Tree Attention (for Speculative Decoding)
+    // =============================================================================
+
+    // Tree attention with ancestor-based masking for speculative decoding
+    // Each tree node attends to its ancestors (determined by parent_indices) + KV cache
+    //
+    // Q: [num_heads, num_nodes, head_dim] - Query for each tree node
+    // K_cache/V_cache: [num_kv_heads, cache_len, head_dim] - Past context (FP16)
+    // K_tree/V_tree: [num_kv_heads, num_nodes, head_dim] - Tree node K/V (FP16)
+    // parent_indices: [num_nodes] - Parent index for each node (-1 for root)
+    // output: [num_heads, num_nodes, head_dim] - Output for each tree node
+    Result<void> attention_tree(
+        MTL::Buffer* Q,
+        MTL::Buffer* K_cache,
+        MTL::Buffer* V_cache,
+        MTL::Buffer* K_tree,
+        MTL::Buffer* V_tree,
+        MTL::Buffer* parent_indices,
+        MTL::Buffer* output,
+        uint32_t num_heads,
+        uint32_t num_kv_heads,
+        uint32_t num_nodes,       // Number of tree nodes
+        uint32_t cache_len,       // Length of KV cache (0 if no context)
+        uint32_t head_dim,
+        float scale
+    );
+
+    // =============================================================================
     // Embedding Operations
     // =============================================================================
 

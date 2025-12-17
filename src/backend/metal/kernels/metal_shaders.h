@@ -4969,4 +4969,337 @@ kernel void attention_prefill_f16kv(
         out_head[d] = out_val;
     }
 }
+
+// =============================================================================
+// Tree Attention Kernel - For Speculative Decoding with Tree-Based Verification
+// =============================================================================
+//
+// Tree attention allows each node in a speculation tree to attend only to its
+// ancestors, enabling efficient parallel verification of multiple speculation paths.
+//
+// Key difference from causal attention:
+// - Causal: position i attends to positions [0, i]
+// - Tree: node i attends to its ancestors + KV cache positions
+//
+// The parent_indices buffer encodes the tree structure:
+// - parent_indices[i] = parent node of node i (-1 for root)
+// - Ancestor mask is computed by walking up the parent chain
+
+kernel void attention_tree_f16kv(
+    device const float* Q              [[buffer(0)]],   // [num_heads, num_nodes, head_dim]
+    device const half* K_cache         [[buffer(1)]],   // [num_kv_heads, cache_len, head_dim]
+    device const half* V_cache         [[buffer(2)]],   // [num_kv_heads, cache_len, head_dim]
+    device const half* K_tree          [[buffer(3)]],   // [num_kv_heads, num_nodes, head_dim]
+    device const half* V_tree          [[buffer(4)]],   // [num_kv_heads, num_nodes, head_dim]
+    device const int* parent_indices   [[buffer(5)]],   // [num_nodes] parent index for each node
+    device float* output               [[buffer(6)]],   // [num_heads, num_nodes, head_dim]
+    constant uint& num_heads           [[buffer(7)]],
+    constant uint& num_kv_heads        [[buffer(8)]],
+    constant uint& num_nodes           [[buffer(9)]],   // Number of tree nodes
+    constant uint& cache_len           [[buffer(10)]],  // Length of KV cache (past context)
+    constant uint& head_dim            [[buffer(11)]],
+    constant float& scale              [[buffer(12)]],
+    uint2 tgid                         [[threadgroup_position_in_grid]],  // (head_idx, node_idx)
+    uint2 tid_vec                      [[thread_position_in_threadgroup]]
+) {
+    uint head_idx = tgid.x;
+    uint node_idx = tgid.y;
+    uint tid = tid_vec.x;
+    uint simd_lane = tid % 32;
+    uint simd_id = tid / 32;
+
+    if (head_idx >= num_heads || node_idx >= num_nodes) return;
+
+    // GQA: map Q head to KV head
+    uint heads_per_kv = num_heads / num_kv_heads;
+    uint kv_head = head_idx / heads_per_kv;
+
+    // Pointers to this head's data
+    device const float* q_head = Q + head_idx * num_nodes * head_dim + node_idx * head_dim;
+    device const half* k_cache_head = K_cache + kv_head * cache_len * head_dim;
+    device const half* v_cache_head = V_cache + kv_head * cache_len * head_dim;
+    device const half* k_tree_head = K_tree + kv_head * num_nodes * head_dim;
+    device const half* v_tree_head = V_tree + kv_head * num_nodes * head_dim;
+    device float* out_head = output + head_idx * num_nodes * head_dim + node_idx * head_dim;
+
+    // Build ancestor mask for this node
+    // ancestor_mask[i] = true if tree node i is an ancestor of current node
+    threadgroup bool ancestor_mask[64];  // Max 64 tree nodes
+    threadgroup half scores_cache[2048]; // For cache positions
+    threadgroup half scores_tree[64];    // For tree positions
+    threadgroup float reduction_scratch[4];
+
+    // Initialize ancestor mask (cooperatively)
+    if (tid < num_nodes) {
+        ancestor_mask[tid] = false;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Thread 0 walks up parent chain to find ancestors
+    if (tid == 0) {
+        // Current node always attends to itself
+        ancestor_mask[node_idx] = true;
+
+        // Walk up parent chain
+        int current = parent_indices[node_idx];
+        while (current >= 0 && current < (int)num_nodes) {
+            ancestor_mask[current] = true;
+            current = parent_indices[current];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Total attention length = cache_len + num ancestors in tree
+    uint total_kv_len = cache_len + num_nodes;
+
+    // Step 1: Compute attention scores
+    // First: scores for KV cache positions (attend to all of them)
+    float local_max = -INFINITY;
+
+    for (uint k = tid; k < cache_len; k += 128) {
+        device const half* k_vec = k_cache_head + k * head_dim;
+
+        float dot_sum = 0.0f;
+        for (uint d = 0; d < head_dim; d += 4) {
+            float4 q_v = float4(q_head[d], q_head[d+1], q_head[d+2], q_head[d+3]);
+            half4 k_h = half4(k_vec[d], k_vec[d+1], k_vec[d+2], k_vec[d+3]);
+            dot_sum += dot(q_v, float4(k_h));
+        }
+
+        float score = dot_sum * scale;
+        scores_cache[k] = half(score);
+        local_max = max(local_max, score);
+    }
+
+    // Then: scores for tree positions (only ancestors)
+    for (uint k = tid; k < num_nodes; k += 128) {
+        if (ancestor_mask[k]) {
+            device const half* k_vec = k_tree_head + k * head_dim;
+
+            float dot_sum = 0.0f;
+            for (uint d = 0; d < head_dim; d += 4) {
+                float4 q_v = float4(q_head[d], q_head[d+1], q_head[d+2], q_head[d+3]);
+                half4 k_h = half4(k_vec[d], k_vec[d+1], k_vec[d+2], k_vec[d+3]);
+                dot_sum += dot(q_v, float4(k_h));
+            }
+
+            float score = dot_sum * scale;
+            scores_tree[k] = half(score);
+            local_max = max(local_max, score);
+        } else {
+            scores_tree[k] = half(-INFINITY);  // Masked out
+        }
+    }
+
+    // SIMD reduction for max
+    float simd_max_val = simd_max(local_max);
+    if (simd_lane == 0) {
+        reduction_scratch[simd_id] = simd_max_val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float shared_max;
+    if (tid == 0) {
+        float global_max = reduction_scratch[0];
+        for (uint i = 1; i < 4; i++) {
+            global_max = max(global_max, reduction_scratch[i]);
+        }
+        shared_max = global_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 2: Softmax
+    float local_sum = 0.0f;
+
+    for (uint k = tid; k < cache_len; k += 128) {
+        float exp_score = exp(float(scores_cache[k]) - shared_max);
+        scores_cache[k] = half(exp_score);
+        local_sum += exp_score;
+    }
+
+    for (uint k = tid; k < num_nodes; k += 128) {
+        if (ancestor_mask[k]) {
+            float exp_score = exp(float(scores_tree[k]) - shared_max);
+            scores_tree[k] = half(exp_score);
+            local_sum += exp_score;
+        }
+    }
+
+    float simd_sum_val = simd_sum(local_sum);
+    if (simd_lane == 0) {
+        reduction_scratch[simd_id] = simd_sum_val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float shared_sum;
+    if (tid == 0) {
+        float global_sum = 0.0f;
+        for (uint i = 0; i < 4; i++) {
+            global_sum += reduction_scratch[i];
+        }
+        shared_sum = global_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Normalize
+    float inv_sum = 1.0f / (shared_sum + 1e-6f);
+    for (uint k = tid; k < cache_len; k += 128) {
+        scores_cache[k] = half(float(scores_cache[k]) * inv_sum);
+    }
+    for (uint k = tid; k < num_nodes; k += 128) {
+        scores_tree[k] = half(float(scores_tree[k]) * inv_sum);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 3: Compute weighted sum of V
+    uint dims_per_thread = (head_dim + 127) / 128;
+    uint d_start = tid * dims_per_thread;
+    uint d_end = min(d_start + dims_per_thread, head_dim);
+
+    for (uint d = d_start; d < d_end; d++) {
+        float out_val = 0.0f;
+
+        // Contribution from cache
+        for (uint k = 0; k < cache_len; k++) {
+            out_val += float(scores_cache[k]) * float(v_cache_head[k * head_dim + d]);
+        }
+
+        // Contribution from tree (only ancestors)
+        for (uint k = 0; k < num_nodes; k++) {
+            if (ancestor_mask[k]) {
+                out_val += float(scores_tree[k]) * float(v_tree_head[k * head_dim + d]);
+            }
+        }
+
+        out_head[d] = out_val;
+    }
+}
+
+// Simpler tree attention kernel when there's no prior KV cache
+// (Fresh generation without context)
+kernel void attention_tree_nocontext_f16kv(
+    device const float* Q              [[buffer(0)]],   // [num_heads, num_nodes, head_dim]
+    device const half* K_tree          [[buffer(1)]],   // [num_kv_heads, num_nodes, head_dim]
+    device const half* V_tree          [[buffer(2)]],   // [num_kv_heads, num_nodes, head_dim]
+    device const int* parent_indices   [[buffer(3)]],   // [num_nodes] parent index for each node
+    device float* output               [[buffer(4)]],   // [num_heads, num_nodes, head_dim]
+    constant uint& num_heads           [[buffer(5)]],
+    constant uint& num_kv_heads        [[buffer(6)]],
+    constant uint& num_nodes           [[buffer(7)]],
+    constant uint& head_dim            [[buffer(8)]],
+    constant float& scale              [[buffer(9)]],
+    uint2 tgid                         [[threadgroup_position_in_grid]],
+    uint2 tid_vec                      [[thread_position_in_threadgroup]]
+) {
+    uint head_idx = tgid.x;
+    uint node_idx = tgid.y;
+    uint tid = tid_vec.x;
+    uint simd_lane = tid % 32;
+    uint simd_id = tid / 32;
+
+    if (head_idx >= num_heads || node_idx >= num_nodes) return;
+
+    uint heads_per_kv = num_heads / num_kv_heads;
+    uint kv_head = head_idx / heads_per_kv;
+
+    device const float* q_head = Q + head_idx * num_nodes * head_dim + node_idx * head_dim;
+    device const half* k_tree_head = K_tree + kv_head * num_nodes * head_dim;
+    device const half* v_tree_head = V_tree + kv_head * num_nodes * head_dim;
+    device float* out_head = output + head_idx * num_nodes * head_dim + node_idx * head_dim;
+
+    threadgroup bool ancestor_mask[64];
+    threadgroup half scores[64];
+    threadgroup float reduction_scratch[4];
+
+    // Initialize mask
+    if (tid < num_nodes) {
+        ancestor_mask[tid] = false;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Build ancestor mask
+    if (tid == 0) {
+        ancestor_mask[node_idx] = true;
+        int current = parent_indices[node_idx];
+        while (current >= 0 && current < (int)num_nodes) {
+            ancestor_mask[current] = true;
+            current = parent_indices[current];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Compute scores
+    float local_max = -INFINITY;
+    for (uint k = tid; k < num_nodes; k += 128) {
+        if (ancestor_mask[k]) {
+            device const half* k_vec = k_tree_head + k * head_dim;
+            float dot_sum = 0.0f;
+            for (uint d = 0; d < head_dim; d += 4) {
+                float4 q_v = float4(q_head[d], q_head[d+1], q_head[d+2], q_head[d+3]);
+                half4 k_h = half4(k_vec[d], k_vec[d+1], k_vec[d+2], k_vec[d+3]);
+                dot_sum += dot(q_v, float4(k_h));
+            }
+            float score = dot_sum * scale;
+            scores[k] = half(score);
+            local_max = max(local_max, score);
+        } else {
+            scores[k] = half(-INFINITY);
+        }
+    }
+
+    float simd_max_val = simd_max(local_max);
+    if (simd_lane == 0) reduction_scratch[simd_id] = simd_max_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float shared_max;
+    if (tid == 0) {
+        float m = reduction_scratch[0];
+        for (uint i = 1; i < 4; i++) m = max(m, reduction_scratch[i]);
+        shared_max = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Softmax
+    float local_sum = 0.0f;
+    for (uint k = tid; k < num_nodes; k += 128) {
+        if (ancestor_mask[k]) {
+            float exp_score = exp(float(scores[k]) - shared_max);
+            scores[k] = half(exp_score);
+            local_sum += exp_score;
+        }
+    }
+
+    float simd_sum_val = simd_sum(local_sum);
+    if (simd_lane == 0) reduction_scratch[simd_id] = simd_sum_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float shared_sum;
+    if (tid == 0) {
+        float s = 0.0f;
+        for (uint i = 0; i < 4; i++) s += reduction_scratch[i];
+        shared_sum = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float inv_sum = 1.0f / (shared_sum + 1e-6f);
+    for (uint k = tid; k < num_nodes; k += 128) {
+        scores[k] = half(float(scores[k]) * inv_sum);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Output
+    uint dims_per_thread = (head_dim + 127) / 128;
+    uint d_start = tid * dims_per_thread;
+    uint d_end = min(d_start + dims_per_thread, head_dim);
+
+    for (uint d = d_start; d < d_end; d++) {
+        float out_val = 0.0f;
+        for (uint k = 0; k < num_nodes; k++) {
+            if (ancestor_mask[k]) {
+                out_val += float(scores[k]) * float(v_tree_head[k * head_dim + d]);
+            }
+        }
+        out_head[d] = out_val;
+    }
+}
 )";
