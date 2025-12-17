@@ -396,6 +396,9 @@ public:
     /// Get raw weight by name (for GPU path)
     [[nodiscard]] const RawWeight* get_raw_weight(const std::string& name) const;
 
+    /// Get the compute backend used by this model
+    [[nodiscard]] IComputeBackend* backend() const { return backend_; }
+
 #ifdef GRANITE_HAS_METAL
     /// Allocate GPU KV cache
     Result<void> allocate_gpu_kv_cache(int max_seq_len);
@@ -769,7 +772,6 @@ private:
     TransformerModel* model_ = nullptr;
     Tokenizer* tokenizer_ = nullptr;
     std::unique_ptr<KVCachePool> kv_pool_;
-    std::unique_ptr<IComputeBackend> backend_;
 
     // Request management
     std::deque<std::unique_ptr<GenerationRequest>> prefill_queue_;

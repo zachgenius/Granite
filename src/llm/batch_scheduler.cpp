@@ -20,24 +20,19 @@ Result<void> BatchScheduler::initialize(
     tokenizer_ = tokenizer;
     max_batch_tokens_ = max_batch_tokens;
 
-    // Create backend for the pool
-    backend_ = create_default_backend();
-    if (!backend_) {
-        GRANITE_FAIL(ErrorCode::InternalError, "Failed to create backend");
+    // Use the model's backend for KV cache pool
+    // This ensures buffer mapping works correctly
+    if (!model || !model->backend()) {
+        GRANITE_FAIL(ErrorCode::InvalidArgument, "Model or backend is null");
     }
 
-    auto init_result = backend_->initialize();
-    if (!init_result.ok()) {
-        return init_result.error();
-    }
-
-    // Allocate KV cache pool
+    // Allocate KV cache pool using model's backend
     kv_pool_ = std::make_unique<KVCachePool>();
     auto pool_result = kv_pool_->allocate(
         num_cache_slots,
         model->config(),
         model->config().max_seq_len,
-        backend_.get());
+        model->backend());
 
     if (!pool_result.ok()) {
         return pool_result.error();
@@ -259,9 +254,9 @@ void BatchScheduler::process_batch(const Batch& batch) {
                 continue;
             }
 
-            // Sample next token
+            // Sample next token using model's backend for buffer mapping
             auto& logits = logits_result.value();
-            auto map_result = backend_->map_buffer(logits.buffer());
+            auto map_result = model_->backend()->map_buffer(logits.buffer());
             if (!map_result.ok()) continue;
 
             const float* data = static_cast<const float*>(map_result.value());
@@ -277,7 +272,7 @@ void BatchScheduler::process_batch(const Batch& batch) {
                 }
             }
 
-            backend_->unmap_buffer(logits.buffer());
+            model_->backend()->unmap_buffer(logits.buffer());
 
             // Add generated token
             request->generated_tokens.push_back(next_token);
