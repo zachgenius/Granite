@@ -1271,19 +1271,21 @@ kernel void matvec_iq3_s(
 
     float sumf[NR0_IQ3_S] = {0.f, 0.f};
 
-    // Process all blocks
-    for (uint ibl = 0; ibl < nb; ibl++) {
-        // Thread indexing: 32 threads handle 256 elements
-        // Each thread handles 8 elements (256/32 = 8)
-        const uint elem_per_thread = 8;
-        const uint elem_offset = tiisg * elem_per_thread;
-        const uint ib32 = elem_offset / 32;  // Which 32-element sub-block
-        const uint local_offset = elem_offset % 32;  // Offset within sub-block
+    // Thread indexing for IQ3_S (256-element super-blocks)
+    // Same pattern as IQ4_XS: each thread handles 16 elements from a sub-block half
+    const short ix = tiisg / 16;  // 0 or 1 (which half of super-block to start - strided)
+    const short it = tiisg % 16;
+    const short ib = it / 2;      // sub-block index within half (0...7)
+    const short il = it % 2;      // which 16-element half within sub-block
 
-        // Cache input values
-        float xl[8];
-        uint x_base = ibl * QK_IQ3_S + elem_offset;
-        for (int i = 0; i < 8; i++) {
+    // Process blocks with strided access (ix=0 or 1, step by 2)
+    for (uint ibl = ix; ibl < nb; ibl += 2) {
+        // Calculate base position in input
+        uint x_base = ibl * QK_IQ3_S + ib * 32 + il * 16;
+
+        // Cache 16 input values in registers
+        float xl[16];
+        for (int i = 0; i < 16; i++) {
             xl[i] = x[x_base + i];
         }
 
@@ -1296,54 +1298,30 @@ kernel void matvec_iq3_s(
             float d = float(block.d);
 
             // Extract 4-bit scale for this sub-block: 1 + 2 * scale_value
-            int scale_val = (block.scales[ib32 / 2] >> (4 * (ib32 % 2))) & 0xf;
+            int scale_val = (block.scales[ib / 2] >> (4 * (ib % 2))) & 0xf;
             float dl = d * float(1 + 2 * scale_val);
 
-            // Determine which half we're in (il = 0 or 1)
-            int il = local_offset / 16;
-            int half_offset = local_offset % 16;
-
             // Get pointers for this half
-            device const uint8_t* qs_ptr = block.qs + 8 * ib32 + 4 * il;
-            device const uint8_t* signs_ptr = block.signs + 4 * ib32 + 2 * il;
-            uint8_t qh_byte = block.qh[ib32] >> (4 * il);
+            device const uint8_t* qs_ptr = block.qs + 8 * ib + 4 * il;
+            device const uint8_t* signs_ptr = block.signs + 4 * ib + 2 * il;
+            uint8_t qh_byte = block.qh[ib] >> (4 * il);
 
-            // Each element maps to a grid entry
-            // half_offset 0-15 maps to j=0-3, k=0-3 (4 grid entries of 4 values each)
-            int j = half_offset / 4;
-            int k_start = half_offset % 4;
+            // Process 4 grid entries × 4 elements each = 16 elements
+            float acc = 0.f;
+            for (int j = 0; j < 4; j++) {
+                int grid_idx = qs_ptr[j] | (((qh_byte >> (3 - j)) & 1) << 8);
+                uint32_t grid_val = iq3s_grid[grid_idx];
+                uint8_t sign_byte = signs_ptr[j / 2];
 
-            // Get grid index and values
-            int grid_idx = qs_ptr[j] | (((qh_byte >> (3 - j)) & 1) << 8);
-            uint32_t grid_val = iq3s_grid[grid_idx];
-
-            // Get sign byte
-            uint8_t sign_byte = signs_ptr[j / 2];
-
-            // Accumulate - each thread handles the next 8 elements
-            float acc = 0.0f;
-            for (int i = 0; i < 8; i++) {
-                int cur_offset = half_offset + i;
-                if (cur_offset >= 16) break;  // Stay within this half
-
-                int cur_j = cur_offset / 4;
-                int cur_k = cur_offset % 4;
-
-                // If we moved to a new grid entry, update
-                if (cur_j != j) {
-                    j = cur_j;
-                    grid_idx = qs_ptr[j] | (((qh_byte >> (3 - j)) & 1) << 8);
-                    grid_val = iq3s_grid[grid_idx];
-                    sign_byte = signs_ptr[j / 2];
+                // Unrolled inner loop for 4 elements
+                for (int k = 0; k < 4; k++) {
+                    uint8_t grid_byte = (grid_val >> (8 * k)) & 0xFF;
+                    int sign_bit_idx = (j % 2) * 4 + k;
+                    float sign = (sign_byte & kmask_iq2xs[sign_bit_idx]) ? -1.0f : 1.0f;
+                    acc += xl[j * 4 + k] * float(grid_byte) * sign;
                 }
-
-                // Extract byte from grid_val using bit shifts (avoiding address space cast)
-                uint8_t grid_byte = (grid_val >> (8 * cur_k)) & 0xFF;
-                int sign_bit_idx = (j % 2) * 4 + cur_k;
-                float sign = (sign_byte & kmask_iq2xs[sign_bit_idx]) ? -1.0f : 1.0f;
-                acc += xl[i] * dl * float(grid_byte) * sign;
             }
-            sumf[row] += acc;
+            sumf[row] += dl * acc;
         }
     }
 
