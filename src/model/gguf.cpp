@@ -34,6 +34,7 @@ const char* ggml_type_name(GGMLType type) {
         case GGMLType::Q6_K:    return "Q6_K";
         case GGMLType::Q8_K:    return "Q8_K";
         case GGMLType::IQ4_NL:  return "IQ4_NL";
+        case GGMLType::IQ4_XS:  return "IQ4_XS";
         case GGMLType::BF16:    return "BF16";
         case GGMLType::I8:      return "I8";
         case GGMLType::I16:     return "I16";
@@ -85,6 +86,7 @@ size_t ggml_type_block_size(GGMLType type) {
         case GGMLType::Q5_K:
         case GGMLType::Q6_K:
         case GGMLType::Q8_K:
+        case GGMLType::IQ4_XS:
             return 256;
 
         default:
@@ -131,6 +133,9 @@ size_t ggml_type_bytes_per_block(GGMLType type) {
 
         // IQ4_NL: 32 elements, 2 bytes scale + 16 bytes data = 18 bytes
         case GGMLType::IQ4_NL: return 18;
+
+        // IQ4_XS: 256 elements, 2 bytes d + 2 bytes scales_h + 4 bytes scales_l + 128 bytes qs = 136 bytes
+        case GGMLType::IQ4_XS: return 136;
 
         default:
             return 0;
@@ -1152,6 +1157,60 @@ Result<Tensor> ModelLoader::dequantize_tensor(
                 }
 
                 src += 18;  // Move to next block
+            }
+            break;
+        }
+
+        case GGMLType::IQ4_XS: {
+            // IQ4_XS: 256 elements per super-block, 136 bytes per block
+            // Structure: half d (2) + uint16_t scales_h (2) + uint8_t scales_l[4] (4) + uint8_t qs[128] (128)
+            // Uses non-linear lookup table with per-sub-block 6-bit scales
+            static const int8_t kvalues_iq4nl[16] = {
+                -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+            };
+
+            const uint8_t* src = static_cast<const uint8_t*>(data);
+            size_t num_blocks = (numel + 255) / 256;
+
+            for (size_t blk = 0; blk < num_blocks; blk++) {
+                // Read d (super-block scale)
+                uint16_t d_bits;
+                memcpy(&d_bits, src, 2);
+                float d = fp16_to_fp32(d_bits);
+
+                // Read scales_h (high 2 bits of scales)
+                uint16_t scales_h;
+                memcpy(&scales_h, src + 2, 2);
+
+                // scales_l is at src + 4 (4 bytes)
+                const uint8_t* scales_l = src + 4;
+
+                // qs is at src + 8 (128 bytes)
+                const uint8_t* qs = src + 8;
+
+                // Process 8 sub-blocks of 32 elements each
+                for (int ib32 = 0; ib32 < 8; ib32++) {
+                    // Extract 6-bit scale for this sub-block
+                    int ls = ((scales_l[ib32 / 2] >> (4 * (ib32 % 2))) & 0xf) |
+                             (((scales_h >> (2 * ib32)) & 3) << 4);
+                    float scale = d * static_cast<float>(ls - 32);
+
+                    // Dequantize 32 elements (16 bytes)
+                    for (int i = 0; i < 16; i++) {
+                        int q0 = qs[ib32 * 16 + i] & 0xF;
+                        int q1 = qs[ib32 * 16 + i] >> 4;
+
+                        size_t idx0 = blk * 256 + ib32 * 32 + 2 * i;
+                        size_t idx1 = blk * 256 + ib32 * 32 + 2 * i + 1;
+
+                        if (idx0 < numel)
+                            output[idx0] = fp32_to_fp16(scale * static_cast<float>(kvalues_iq4nl[q0]));
+                        if (idx1 < numel)
+                            output[idx1] = fp32_to_fp16(scale * static_cast<float>(kvalues_iq4nl[q1]));
+                    }
+                }
+
+                src += 136;  // Move to next block
             }
             break;
         }

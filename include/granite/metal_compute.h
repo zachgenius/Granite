@@ -132,6 +132,30 @@ public:
     );
 
     // =============================================================================
+    // LLM Operations - IQ4_XS Quantized Matrix Multiply (Non-linear 4-bit with scales)
+    // =============================================================================
+
+    // y = x @ W^T where W is IQ4_XS quantized
+    // IQ4_XS uses 256-element super-blocks with per-sub-block 6-bit scales
+    Result<void> matvec_iq4_xs(
+        MTL::Buffer* x,      // Input [K] float
+        MTL::Buffer* W,      // Weights [N, K/256] IQ4_XS blocks (136 bytes each)
+        MTL::Buffer* y,      // Output [N] float
+        uint32_t K,          // Input dimension
+        uint32_t N           // Output dimension
+    );
+
+    // Y = X @ W^T where W is IQ4_XS quantized (batched)
+    Result<void> matmul_iq4_xs(
+        MTL::Buffer* X,      // Input [M, K] float
+        MTL::Buffer* W,      // Weights [N, K/256] IQ4_XS blocks
+        MTL::Buffer* Y,      // Output [M, N] float
+        uint32_t M,          // Batch size (number of tokens)
+        uint32_t K,          // Input dimension
+        uint32_t N           // Output dimension
+    );
+
+    // =============================================================================
     // LLM Operations - Q6_K Quantized Matrix Multiply
     // =============================================================================
 
@@ -286,6 +310,17 @@ public:
         MTL::Buffer* x,           // Input [K] float
         MTL::Buffer* norm_weight, // RMSNorm weight [K] half
         MTL::Buffer* W,           // IQ4_NL weights [N, K/32] blocks
+        MTL::Buffer* y,           // Output [N] float
+        uint32_t K,               // Input dimension
+        uint32_t N,               // Output dimension
+        float eps                 // RMSNorm epsilon
+    );
+
+    // Fused RMSNorm + IQ4_XS MatVec: y = RMSNorm(x, weight) @ W^T
+    Result<void> rms_norm_matvec_iq4_xs(
+        MTL::Buffer* x,           // Input [K] float
+        MTL::Buffer* norm_weight, // RMSNorm weight [K] half
+        MTL::Buffer* W,           // IQ4_XS weights [N, K/256] blocks
         MTL::Buffer* y,           // Output [N] float
         uint32_t K,               // Input dimension
         uint32_t N,               // Output dimension

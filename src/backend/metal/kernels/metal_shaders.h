@@ -899,6 +899,231 @@ kernel void rms_norm_matvec_iq4_nl(
 }
 
 // =============================================================================
+// IQ4_XS Matrix-Vector Multiplication (Single Token Decode)
+// =============================================================================
+// IQ4_XS: 256 elements per super-block, 136 bytes
+// Layout: d (half) + scales_h (uint16) + scales_l[4] + qs[128]
+// Uses same lookup table as IQ4_NL but with per-sub-block 6-bit scales
+
+struct block_iq4_xs {
+    half d;              // super-block scale
+    uint16_t scales_h;   // high 2 bits of scales
+    uint8_t scales_l[4]; // low 4 bits of scales
+    uint8_t qs[128];     // 4-bit quants (uses lookup table)
+};
+
+constant constexpr uint QK_IQ4_XS = 256;  // IQ4_XS block size
+constant constexpr short NR0_IQ4_XS = 2;  // Rows per SIMD group
+constant constexpr uint IQ4_XS_ROWS_PER_TG = 8;  // SIMD groups per threadgroup
+
+kernel void matvec_iq4_xs(
+    device const float* x          [[buffer(0)]],
+    device const void* W           [[buffer(1)]],
+    device float* y                [[buffer(2)]],
+    constant uint& K               [[buffer(3)]],
+    constant uint& N               [[buffer(4)]],
+    uint tgid                      [[threadgroup_position_in_grid]],
+    uint tiisg                     [[thread_index_in_simdgroup]],
+    uint sgitg                     [[simdgroup_index_in_threadgroup]]
+) {
+    const uint nb = K / QK_IQ4_XS;  // Number of IQ4_XS blocks per row
+
+    // Each SIMD group handles NR0_IQ4_XS rows
+    const uint first_row = (tgid * IQ4_XS_ROWS_PER_TG + sgitg) * NR0_IQ4_XS;
+
+    device const block_iq4_xs* weights = (const device block_iq4_xs*)W;
+
+    float sumf[NR0_IQ4_XS] = {0.f, 0.f};
+
+    // Thread indexing for IQ4_XS (256-element super-blocks)
+    // Each thread handles 32 elements (1 sub-block) per iteration
+    const short ix = tiisg / 16;  // 0 or 1 (which half of super-block)
+    const short it = tiisg % 16;  // 0...15
+    const short ib = it / 2;      // sub-block index within half (0...7)
+    const short il = it % 2;      // which 16 elements within sub-block
+
+    // Process all blocks
+    for (uint ibl = ix; ibl < nb; ibl += 2) {
+        // Calculate base position in input
+        uint x_base = ibl * QK_IQ4_XS + ib * 32 + il * 16;
+
+        // Cache 16 input values (covers half of a 32-element sub-block)
+        float xl[16];
+        for (int i = 0; i < 16; i++) {
+            xl[i] = x[x_base + i];
+        }
+
+        // Process each row
+        for (short row = 0; row < NR0_IQ4_XS; row++) {
+            uint row_idx = first_row + row;
+            if (row_idx >= N) continue;
+
+            device const block_iq4_xs& block = weights[row_idx * nb + ibl];
+            float d = float(block.d);
+
+            // Extract 6-bit scale for this sub-block
+            int ls = ((block.scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) |
+                     (((block.scales_h >> (2 * ib)) & 3) << 4);
+            float scale = d * float(ls - 32);
+
+            // Dequantize and accumulate using lookup table
+            float acc = 0.f;
+            for (int i = 0; i < 8; i++) {
+                uint8_t qbyte = block.qs[ib * 16 + il * 8 + i];
+                int q0 = kvalues_iq4nl[qbyte & 0xF];
+                int q1 = kvalues_iq4nl[qbyte >> 4];
+                acc += xl[i * 2 + 0] * float(q0);
+                acc += xl[i * 2 + 1] * float(q1);
+            }
+            sumf[row] += scale * acc;
+        }
+    }
+
+    // SIMD reduction and output
+    for (short row = 0; row < NR0_IQ4_XS; row++) {
+        uint row_idx = first_row + row;
+        if (row_idx < N) {
+            float sum = simd_sum(sumf[row]);
+            if (tiisg == 0) {
+                y[row_idx] = sum;
+            }
+        }
+    }
+}
+
+// IQ4_XS Matrix Multiplication (Batched - Prefill)
+kernel void matmul_iq4_xs(
+    device const float* X          [[buffer(0)]],
+    device const void* W           [[buffer(1)]],
+    device float* Y                [[buffer(2)]],
+    constant uint& M               [[buffer(3)]],
+    constant uint& K               [[buffer(4)]],
+    constant uint& N               [[buffer(5)]],
+    uint2 gid                      [[thread_position_in_grid]]
+) {
+    uint row = gid.y;
+    uint col = gid.x;
+
+    if (row >= M || col >= N) return;
+
+    const uint num_blocks_k = K / QK_IQ4_XS;
+    const device block_iq4_xs* weights = (const device block_iq4_xs*)W;
+
+    float sum = 0.0f;
+
+    for (uint kb = 0; kb < num_blocks_k; kb++) {
+        const device block_iq4_xs& block = weights[col * num_blocks_k + kb];
+        float d = float(block.d);
+
+        uint base_idx = kb * QK_IQ4_XS;
+
+        // Process 8 sub-blocks of 32 elements each
+        for (int ib32 = 0; ib32 < 8; ib32++) {
+            // Extract 6-bit scale
+            int ls = ((block.scales_l[ib32 / 2] >> (4 * (ib32 % 2))) & 0xf) |
+                     (((block.scales_h >> (2 * ib32)) & 3) << 4);
+            float scale = d * float(ls - 32);
+
+            // Dequantize and accumulate 32 elements (16 bytes)
+            for (int i = 0; i < 16; i++) {
+                uint8_t qbyte = block.qs[ib32 * 16 + i];
+                int q0 = kvalues_iq4nl[qbyte & 0xF];
+                int q1 = kvalues_iq4nl[qbyte >> 4];
+                sum += scale * float(q0) * X[row * K + base_idx + ib32 * 32 + i * 2 + 0];
+                sum += scale * float(q1) * X[row * K + base_idx + ib32 * 32 + i * 2 + 1];
+            }
+        }
+    }
+
+    Y[row * N + col] = sum;
+}
+
+// Fused RMSNorm + IQ4_XS MatVec
+kernel void rms_norm_matvec_iq4_xs(
+    device const float* x          [[buffer(0)]],
+    device const half* norm_weight [[buffer(1)]],
+    device const void* W           [[buffer(2)]],
+    device float* y                [[buffer(3)]],
+    constant uint& K               [[buffer(4)]],
+    constant uint& N               [[buffer(5)]],
+    constant float& eps            [[buffer(6)]],
+    uint tgid                      [[threadgroup_position_in_grid]],
+    uint tid                       [[thread_position_in_threadgroup]],
+    uint simd_lane                 [[thread_index_in_simdgroup]],
+    uint simd_id                   [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup float x_norm[4096];
+    threadgroup float reduction_scratch[8];
+
+    // Step 1: RMSNorm
+    float local_sum_sq = 0.0f;
+    for (uint i = tid; i < K; i += 256) {
+        float val = x[i];
+        local_sum_sq += val * val;
+    }
+
+    float simd_sum_sq = simd_sum(local_sum_sq);
+    if (simd_lane == 0) {
+        reduction_scratch[simd_id] = simd_sum_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float rms_inv;
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint i = 0; i < 8; i++) {
+            total += reduction_scratch[i];
+        }
+        rms_inv = rsqrt(total / float(K) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < K; i += 256) {
+        x_norm[i] = x[i] * rms_inv * float(norm_weight[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 2: IQ4_XS MatVec
+    uint row = tgid * 8 + simd_id;
+    if (row >= N) return;
+
+    const uint num_blocks_k = K / QK_IQ4_XS;
+    const device block_iq4_xs* weights = (const device block_iq4_xs*)W;
+
+    float local_sum = 0.0f;
+
+    for (uint kb = simd_lane; kb < num_blocks_k; kb += 32) {
+        const device block_iq4_xs& block = weights[row * num_blocks_k + kb];
+        float d = float(block.d);
+
+        uint base_idx = kb * QK_IQ4_XS;
+
+        // Process 8 sub-blocks of 32 elements each
+        for (int ib32 = 0; ib32 < 8; ib32++) {
+            // Extract 6-bit scale
+            int ls = ((block.scales_l[ib32 / 2] >> (4 * (ib32 % 2))) & 0xf) |
+                     (((block.scales_h >> (2 * ib32)) & 3) << 4);
+            float scale = d * float(ls - 32);
+
+            float acc = 0.f;
+            for (int i = 0; i < 16; i++) {
+                uint8_t qbyte = block.qs[ib32 * 16 + i];
+                int q0 = kvalues_iq4nl[qbyte & 0xF];
+                int q1 = kvalues_iq4nl[qbyte >> 4];
+                acc += x_norm[base_idx + ib32 * 32 + i * 2 + 0] * float(q0);
+                acc += x_norm[base_idx + ib32 * 32 + i * 2 + 1] * float(q1);
+            }
+            local_sum += scale * acc;
+        }
+    }
+
+    float sum = simd_sum(local_sum);
+    if (simd_lane == 0) {
+        y[row] = sum;
+    }
+}
+
+// =============================================================================
 // Q6_K Matrix-Vector Multiplication (Single Token Decode)
 // =============================================================================
 // Q6_K: 256 elements per super-block, 210 bytes
