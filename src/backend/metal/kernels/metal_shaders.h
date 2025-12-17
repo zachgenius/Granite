@@ -3440,6 +3440,533 @@ kernel void rms_norm_matvec_f16(
 }
 
 // =============================================================================
+// Fused RMSNorm + Dual Q4_K MatVec (Gate + Up projections in one kernel)
+// =============================================================================
+// Optimization: Computes RMSNorm once, then performs two matrix-vector products
+// for gate and up projections simultaneously. Eliminates redundant RMSNorm.
+//
+// Current FFN path (2 kernel calls, RMSNorm computed twice):
+//   rms_norm_matvec_q4k(x, norm, Wg, gate)  // RMSNorm + gate projection
+//   rms_norm_matvec_q4k(x, norm, Wu, up)    // RMSNorm + up projection (redundant!)
+//
+// Fused path (1 kernel call, RMSNorm computed once):
+//   rms_norm_dual_matvec_q4k(x, norm, Wg, Wu, gate, up)
+//
+constant constexpr uint DUAL_ROWS_PER_TG = 4;  // 4 SIMD groups × 2 outputs = 8 output rows
+
+kernel void rms_norm_dual_matvec_q4k(
+    device const float* x          [[buffer(0)]],   // Input: [K] float
+    device const half* norm_weight [[buffer(1)]],   // RMSNorm weight: [K] half
+    device const void* W_gate      [[buffer(2)]],   // Gate Q4_K weights: [N, K/QK_K] blocks
+    device const void* W_up        [[buffer(3)]],   // Up Q4_K weights: [N, K/QK_K] blocks
+    device float* y_gate           [[buffer(4)]],   // Gate output: [N] float
+    device float* y_up             [[buffer(5)]],   // Up output: [N] float
+    constant uint& K               [[buffer(6)]],   // Input/hidden dimension
+    constant uint& N               [[buffer(7)]],   // Output dimension (intermediate_dim)
+    constant float& eps            [[buffer(8)]],   // RMSNorm epsilon
+    uint tgid                      [[threadgroup_position_in_grid]],
+    uint tid                       [[thread_position_in_threadgroup]],
+    uint simd_lane                 [[thread_index_in_simdgroup]],
+    uint simd_id                   [[simdgroup_index_in_threadgroup]]
+) {
+    // Threadgroup memory for normalized input (max 4096 floats = 16KB)
+    threadgroup float x_norm[4096];
+    threadgroup float reduction_scratch[8];
+
+    // =========================================================================
+    // Step 1: Compute RMSNorm cooperatively across all threads (ONCE!)
+    // =========================================================================
+
+    float local_sum_sq = 0.0f;
+    for (uint i = tid; i < K; i += 256) {
+        float val = x[i];
+        local_sum_sq += val * val;
+    }
+
+    float simd_sum_sq = simd_sum(local_sum_sq);
+    if (simd_lane == 0) {
+        reduction_scratch[simd_id] = simd_sum_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float rms_inv;
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint i = 0; i < 8; i++) {
+            total += reduction_scratch[i];
+        }
+        rms_inv = rsqrt(total / float(K) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Normalize and store to threadgroup memory
+    for (uint i = tid; i < K; i += 256) {
+        x_norm[i] = x[i] * rms_inv * float(norm_weight[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // =========================================================================
+    // Step 2: Dual Q4_K MatVec - each SIMD group computes one gate and one up row
+    // =========================================================================
+
+    uint row = tgid * DUAL_ROWS_PER_TG + simd_id;
+    if (row >= N) return;
+
+    const uint num_blocks_k = K / QK_K;
+    const device block_q4_K* weights_gate = (const device block_q4_K*)W_gate;
+    const device block_q4_K* weights_up = (const device block_q4_K*)W_up;
+
+    float sum_gate = 0.0f;
+    float sum_up = 0.0f;
+
+    // Process all K blocks - same normalized input for both gate and up
+    for (uint kb = 0; kb < num_blocks_k; kb++) {
+        // Load from normalized input (shared by both projections)
+        uint elem_offset = simd_lane * 8;
+        uint x_base = kb * QK_K + elem_offset;
+        uint sub_block = elem_offset / 64;
+        uint sub_offset = elem_offset % 64;
+
+        // Read normalized input once
+        float4 x_vec1 = float4(x_norm[x_base], x_norm[x_base + 1],
+                               x_norm[x_base + 2], x_norm[x_base + 3]);
+        float4 x_vec2 = float4(x_norm[x_base + 4], x_norm[x_base + 5],
+                               x_norm[x_base + 6], x_norm[x_base + 7]);
+
+        // === Gate projection ===
+        {
+            const device block_q4_K* block = &weights_gate[row * num_blocks_k + kb];
+            float d = float(block->d);
+            float dmin = float(block->dmin);
+            const device uint8_t* scales = block->scales;
+            const device uint8_t* qs = block->qs;
+
+            uint8_t sc1, m1, sc2, m2;
+            get_scale_min_k4(sub_block * 2, scales, sc1, m1);
+            get_scale_min_k4(sub_block * 2 + 1, scales, sc2, m2);
+
+            float d1 = d * float(sc1);
+            float dm1 = dmin * float(m1);
+            float d2 = d * float(sc2);
+            float dm2 = dmin * float(m2);
+
+            const device uint8_t* qs_ptr = qs + sub_block * 32;
+            float lane_sum = 0.0f;
+
+            if (sub_offset < 32) {
+                uint qs_idx = sub_offset;
+                float4 w_vec1 = float4(
+                    d1 * float(qs_ptr[qs_idx] & 0xF) - dm1,
+                    d1 * float(qs_ptr[qs_idx + 1] & 0xF) - dm1,
+                    d1 * float(qs_ptr[qs_idx + 2] & 0xF) - dm1,
+                    d1 * float(qs_ptr[qs_idx + 3] & 0xF) - dm1
+                );
+                float4 w_vec2 = float4(
+                    d1 * float(qs_ptr[qs_idx + 4] & 0xF) - dm1,
+                    d1 * float(qs_ptr[qs_idx + 5] & 0xF) - dm1,
+                    d1 * float(qs_ptr[qs_idx + 6] & 0xF) - dm1,
+                    d1 * float(qs_ptr[qs_idx + 7] & 0xF) - dm1
+                );
+                lane_sum = dot(x_vec1, w_vec1) + dot(x_vec2, w_vec2);
+            } else {
+                uint qs_idx = sub_offset - 32;
+                float4 w_vec1 = float4(
+                    d2 * float(qs_ptr[qs_idx] >> 4) - dm2,
+                    d2 * float(qs_ptr[qs_idx + 1] >> 4) - dm2,
+                    d2 * float(qs_ptr[qs_idx + 2] >> 4) - dm2,
+                    d2 * float(qs_ptr[qs_idx + 3] >> 4) - dm2
+                );
+                float4 w_vec2 = float4(
+                    d2 * float(qs_ptr[qs_idx + 4] >> 4) - dm2,
+                    d2 * float(qs_ptr[qs_idx + 5] >> 4) - dm2,
+                    d2 * float(qs_ptr[qs_idx + 6] >> 4) - dm2,
+                    d2 * float(qs_ptr[qs_idx + 7] >> 4) - dm2
+                );
+                lane_sum = dot(x_vec1, w_vec1) + dot(x_vec2, w_vec2);
+            }
+            sum_gate += lane_sum;
+        }
+
+        // === Up projection (same normalized input) ===
+        {
+            const device block_q4_K* block = &weights_up[row * num_blocks_k + kb];
+            float d = float(block->d);
+            float dmin = float(block->dmin);
+            const device uint8_t* scales = block->scales;
+            const device uint8_t* qs = block->qs;
+
+            uint8_t sc1, m1, sc2, m2;
+            get_scale_min_k4(sub_block * 2, scales, sc1, m1);
+            get_scale_min_k4(sub_block * 2 + 1, scales, sc2, m2);
+
+            float d1 = d * float(sc1);
+            float dm1 = dmin * float(m1);
+            float d2 = d * float(sc2);
+            float dm2 = dmin * float(m2);
+
+            const device uint8_t* qs_ptr = qs + sub_block * 32;
+            float lane_sum = 0.0f;
+
+            if (sub_offset < 32) {
+                uint qs_idx = sub_offset;
+                float4 w_vec1 = float4(
+                    d1 * float(qs_ptr[qs_idx] & 0xF) - dm1,
+                    d1 * float(qs_ptr[qs_idx + 1] & 0xF) - dm1,
+                    d1 * float(qs_ptr[qs_idx + 2] & 0xF) - dm1,
+                    d1 * float(qs_ptr[qs_idx + 3] & 0xF) - dm1
+                );
+                float4 w_vec2 = float4(
+                    d1 * float(qs_ptr[qs_idx + 4] & 0xF) - dm1,
+                    d1 * float(qs_ptr[qs_idx + 5] & 0xF) - dm1,
+                    d1 * float(qs_ptr[qs_idx + 6] & 0xF) - dm1,
+                    d1 * float(qs_ptr[qs_idx + 7] & 0xF) - dm1
+                );
+                lane_sum = dot(x_vec1, w_vec1) + dot(x_vec2, w_vec2);
+            } else {
+                uint qs_idx = sub_offset - 32;
+                float4 w_vec1 = float4(
+                    d2 * float(qs_ptr[qs_idx] >> 4) - dm2,
+                    d2 * float(qs_ptr[qs_idx + 1] >> 4) - dm2,
+                    d2 * float(qs_ptr[qs_idx + 2] >> 4) - dm2,
+                    d2 * float(qs_ptr[qs_idx + 3] >> 4) - dm2
+                );
+                float4 w_vec2 = float4(
+                    d2 * float(qs_ptr[qs_idx + 4] >> 4) - dm2,
+                    d2 * float(qs_ptr[qs_idx + 5] >> 4) - dm2,
+                    d2 * float(qs_ptr[qs_idx + 6] >> 4) - dm2,
+                    d2 * float(qs_ptr[qs_idx + 7] >> 4) - dm2
+                );
+                lane_sum = dot(x_vec1, w_vec1) + dot(x_vec2, w_vec2);
+            }
+            sum_up += lane_sum;
+        }
+    }
+
+    // SIMD reduction for both outputs
+    float gate_result = simd_sum(sum_gate);
+    float up_result = simd_sum(sum_up);
+
+    if (simd_lane == 0) {
+        y_gate[row] = gate_result;
+        y_up[row] = up_result;
+    }
+}
+
+// =============================================================================
+// Fused MatVec + Residual Add (Down projection + residual in one kernel)
+// =============================================================================
+// Optimization: Combines down projection with residual addition
+// Current: down_proj(x, W) -> y; elementwise_add(residual, y) -> out
+// Fused: matvec_residual(x, W, residual) -> out (= residual + x @ W)
+
+kernel void matvec_residual_q4k(
+    device const float* x          [[buffer(0)]],   // Input: [K] float
+    device const void* W           [[buffer(1)]],   // Q4_K weights: [N, K/QK_K] blocks
+    device const float* residual   [[buffer(2)]],   // Residual: [N] float
+    device float* y                [[buffer(3)]],   // Output: [N] float (= residual + x @ W)
+    constant uint& K               [[buffer(4)]],   // Input dimension
+    constant uint& N               [[buffer(5)]],   // Output dimension
+    uint tgid                      [[threadgroup_position_in_grid]],
+    uint simd_lane                 [[thread_index_in_simdgroup]],
+    uint simd_id                   [[simdgroup_index_in_threadgroup]]
+) {
+    const uint row = tgid * FUSED_ROWS_PER_TG + simd_id;
+    if (row >= N) return;
+
+    const uint num_blocks_k = K / QK_K;
+    const device block_q4_K* weights = (const device block_q4_K*)W;
+
+    float local_sum = 0.0f;
+
+    for (uint kb = 0; kb < num_blocks_k; kb++) {
+        const device block_q4_K* block = &weights[row * num_blocks_k + kb];
+        float d = float(block->d);
+        float dmin = float(block->dmin);
+        const device uint8_t* scales = block->scales;
+        const device uint8_t* qs = block->qs;
+
+        uint elem_offset = simd_lane * 8;
+        uint x_base = kb * QK_K + elem_offset;
+        uint sub_block = elem_offset / 64;
+        uint sub_offset = elem_offset % 64;
+
+        uint8_t sc1, m1, sc2, m2;
+        get_scale_min_k4(sub_block * 2, scales, sc1, m1);
+        get_scale_min_k4(sub_block * 2 + 1, scales, sc2, m2);
+
+        float d1 = d * float(sc1);
+        float dm1 = dmin * float(m1);
+        float d2 = d * float(sc2);
+        float dm2 = dmin * float(m2);
+
+        const device uint8_t* qs_ptr = qs + sub_block * 32;
+
+        float4 x_vec1 = float4(x[x_base], x[x_base + 1], x[x_base + 2], x[x_base + 3]);
+        float4 x_vec2 = float4(x[x_base + 4], x[x_base + 5], x[x_base + 6], x[x_base + 7]);
+
+        float lane_sum = 0.0f;
+        if (sub_offset < 32) {
+            uint qs_idx = sub_offset;
+            float4 w_vec1 = float4(
+                d1 * float(qs_ptr[qs_idx] & 0xF) - dm1,
+                d1 * float(qs_ptr[qs_idx + 1] & 0xF) - dm1,
+                d1 * float(qs_ptr[qs_idx + 2] & 0xF) - dm1,
+                d1 * float(qs_ptr[qs_idx + 3] & 0xF) - dm1
+            );
+            float4 w_vec2 = float4(
+                d1 * float(qs_ptr[qs_idx + 4] & 0xF) - dm1,
+                d1 * float(qs_ptr[qs_idx + 5] & 0xF) - dm1,
+                d1 * float(qs_ptr[qs_idx + 6] & 0xF) - dm1,
+                d1 * float(qs_ptr[qs_idx + 7] & 0xF) - dm1
+            );
+            lane_sum = dot(x_vec1, w_vec1) + dot(x_vec2, w_vec2);
+        } else {
+            uint qs_idx = sub_offset - 32;
+            float4 w_vec1 = float4(
+                d2 * float(qs_ptr[qs_idx] >> 4) - dm2,
+                d2 * float(qs_ptr[qs_idx + 1] >> 4) - dm2,
+                d2 * float(qs_ptr[qs_idx + 2] >> 4) - dm2,
+                d2 * float(qs_ptr[qs_idx + 3] >> 4) - dm2
+            );
+            float4 w_vec2 = float4(
+                d2 * float(qs_ptr[qs_idx + 4] >> 4) - dm2,
+                d2 * float(qs_ptr[qs_idx + 5] >> 4) - dm2,
+                d2 * float(qs_ptr[qs_idx + 6] >> 4) - dm2,
+                d2 * float(qs_ptr[qs_idx + 7] >> 4) - dm2
+            );
+            lane_sum = dot(x_vec1, w_vec1) + dot(x_vec2, w_vec2);
+        }
+        local_sum += lane_sum;
+    }
+
+    // SIMD reduction and add residual
+    float sum = simd_sum(local_sum);
+    if (simd_lane == 0) {
+        y[row] = residual[row] + sum;  // Fused residual add!
+    }
+}
+
+// =============================================================================
+// Fused MatVec + Residual Add for Q3_K (Down projection + residual)
+// =============================================================================
+kernel void matvec_residual_q3k(
+    device const float* x          [[buffer(0)]],
+    device const void* W           [[buffer(1)]],
+    device const float* residual   [[buffer(2)]],
+    device float* y                [[buffer(3)]],
+    constant uint& K               [[buffer(4)]],
+    constant uint& N               [[buffer(5)]],
+    uint tgid                      [[threadgroup_position_in_grid]],
+    uint tiisg                     [[thread_index_in_simdgroup]],
+    uint sgitg                     [[simdgroup_index_in_threadgroup]]
+) {
+    const uint nb = K / QK_K;
+
+    const short tid = tiisg / 4;
+    const short ix  = tiisg % 4;
+    const short ip  = tid / 4;
+    const short il  = 2 * ((tid % 4) / 2);
+    const short ir  = tid % 2;
+    const short l0  = 8 * ir;
+
+    const ushort4 mm[4] = {
+        ushort4(0x0001, 0x0100, 0x0002, 0x0200),
+        ushort4(0x0004, 0x0400, 0x0008, 0x0800),
+        ushort4(0x0010, 0x1000, 0x0020, 0x2000),
+        ushort4(0x0040, 0x4000, 0x0080, 0x8000)
+    };
+
+    const int4 qm[2] = {
+        int4(0x0003, 0x0300, 0x000c, 0x0c00),
+        int4(0x0030, 0x3000, 0x00c0, 0xc000)
+    };
+
+    const ushort4 hm = mm[2 * ip + il / 2];
+    const short shift = 2 * il;
+    const float v1 = il == 0 ? 4.f : 64.f;
+    const float v2 = 4.f * v1;
+
+    const ushort s_shift1 = 4 * ip;
+    const ushort s_shift2 = s_shift1 + il;
+
+    const short q_offset = 32 * ip + l0;
+    const short y_offset = 128 * ip + 32 * il + l0;
+
+    const uint first_row = (tgid * Q3K_ROWS_PER_TG + sgitg) * NR0_Q3K;
+
+    device const block_q3_K* weights = (const device block_q3_K*)W;
+
+    float yl[32];
+    float sumf1[NR0_Q3K] = {0.f, 0.f};
+    float sumf2[NR0_Q3K] = {0.f, 0.f};
+
+    device const float* y1_base = x + ix * QK_K + y_offset;
+
+    for (uint i = ix; i < nb; i += 4) {
+        device const float* y1 = y1_base + (i / 4) * 4 * QK_K;
+        for (short l = 0; l < 8; ++l) {
+            yl[l + 0] = y1[l + 0];
+            yl[l + 8] = y1[l + 16];
+            yl[l + 16] = y1[l + 32];
+            yl[l + 24] = y1[l + 48];
+        }
+
+        for (short row = 0; row < NR0_Q3K; ++row) {
+            uint row_idx = first_row + row;
+            if (row_idx >= N) continue;
+
+            device const block_q3_K* block = &weights[row_idx * nb + i];
+            device const ushort* q = (device const ushort*)(block->qs + q_offset);
+            device const ushort* h = (device const ushort*)(block->hmask + l0);
+            device const ushort* a = (device const ushort*)(block->scales);
+
+            const float d_all = float(block->d);
+
+            uint32_t scales32, aux32;
+            thread ushort* scales16 = (thread ushort*)&scales32;
+            thread const int8_t* scales = (thread const int8_t*)&scales32;
+
+            scales16[0] = a[4];
+            scales16[1] = a[5];
+            aux32 = ((scales32 >> s_shift2) << 4) & 0x30303030;
+            scales16[0] = a[il + 0];
+            scales16[1] = a[il + 1];
+            scales32 = ((scales32 >> s_shift1) & 0x0f0f0f0f) | aux32;
+
+            float s1 = 0, s2 = 0, s3 = 0, s4 = 0, s5 = 0, s6 = 0;
+            for (short l = 0; l < 8; l += 2) {
+                const int32_t qs = q[l / 2];
+                s1 += yl[l + 0] * (qs & qm[il / 2][0]);
+                s2 += yl[l + 1] * (qs & qm[il / 2][1]);
+                s3 += ((h[l / 2] & hm[0]) ? 0.f : yl[l + 0]) + ((h[l / 2] & hm[1]) ? 0.f : yl[l + 1]);
+                s4 += yl[l + 16] * (qs & qm[il / 2][2]);
+                s5 += yl[l + 17] * (qs & qm[il / 2][3]);
+                s6 += ((h[l / 2] & hm[2]) ? 0.f : yl[l + 16]) + ((h[l / 2] & hm[3]) ? 0.f : yl[l + 17]);
+            }
+            float d1 = d_all * (s1 + 1.f / 256.f * s2 - s3 * v1);
+            float d2 = d_all * (s4 + 1.f / 256.f * s5 - s6 * v2);
+            sumf1[row] += d1 * (scales[0] - 32);
+            sumf2[row] += d2 * (scales[2] - 32);
+
+            s1 = s2 = s3 = s4 = s5 = s6 = 0;
+            for (short l = 0; l < 8; l += 2) {
+                const int32_t qs = q[l / 2 + 8];
+                s1 += yl[l + 8] * (qs & qm[il / 2][0]);
+                s2 += yl[l + 9] * (qs & qm[il / 2][1]);
+                s3 += ((h[l / 2 + 8] & hm[0]) ? 0.f : yl[l + 8]) + ((h[l / 2 + 8] & hm[1]) ? 0.f : yl[l + 9]);
+                s4 += yl[l + 24] * (qs & qm[il / 2][2]);
+                s5 += yl[l + 25] * (qs & qm[il / 2][3]);
+                s6 += ((h[l / 2 + 8] & hm[2]) ? 0.f : yl[l + 24]) + ((h[l / 2 + 8] & hm[3]) ? 0.f : yl[l + 25]);
+            }
+            d1 = d_all * (s1 + 1.f / 256.f * s2 - s3 * v1);
+            d2 = d_all * (s4 + 1.f / 256.f * s5 - s6 * v2);
+            sumf1[row] += d1 * (scales[1] - 32);
+            sumf2[row] += d2 * (scales[3] - 32);
+        }
+    }
+
+    // SIMD reduction with fused residual add
+    for (short row = 0; row < NR0_Q3K; ++row) {
+        uint row_idx = first_row + row;
+        if (row_idx < N) {
+            float sum = simd_sum(sumf1[row]) + simd_sum(sumf2[row]);
+            if (tiisg == 0) {
+                y[row_idx] = residual[row_idx] + sum;  // Fused residual!
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Fused MatVec + Residual Add for Q2_K (Down projection + residual)
+// =============================================================================
+kernel void matvec_residual_q2k(
+    device const float* x          [[buffer(0)]],
+    device const void* W           [[buffer(1)]],
+    device const float* residual   [[buffer(2)]],
+    device float* y                [[buffer(3)]],
+    constant uint& K               [[buffer(4)]],
+    constant uint& N               [[buffer(5)]],
+    uint tgid                      [[threadgroup_position_in_grid]],
+    uint tiisg                     [[thread_index_in_simdgroup]],
+    uint sgitg                     [[simdgroup_index_in_threadgroup]]
+) {
+    const uint nb = K / QK_K;
+
+    const short ix = tiisg / 8;
+    const short it = tiisg % 8;
+    const short iq = it / 4;
+    const short ir = it % 4;
+    const short is = (8 * ir) / 16;
+
+    const uint first_row = (tgid * Q2K_ROWS_PER_TG + sgitg) * NR0_Q2K;
+
+    device const block_q2_K* weights = (const device block_q2_K*)W;
+
+    float yl[32];
+    float sumf[NR0_Q2K] = {0.f, 0.f};
+
+    device const float* y4 = x + ix * QK_K + 128 * iq + 8 * ir;
+
+    for (uint ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        for (short i = 0; i < 8; ++i) {
+            yl[i+ 0] = y4[i+ 0]; sumy[0] += yl[i+ 0];
+            yl[i+ 8] = y4[i+32]; sumy[1] += yl[i+ 8];
+            yl[i+16] = y4[i+64]; sumy[2] += yl[i+16];
+            yl[i+24] = y4[i+96]; sumy[3] += yl[i+24];
+        }
+
+        for (short row = 0; row < NR0_Q2K; row++) {
+            uint row_idx = first_row + row;
+            if (row_idx >= N) continue;
+
+            device const block_q2_K* block = &weights[row_idx * nb + ib];
+            device const uchar* sc = block->scales + 8 * iq + is;
+            device const ushort* qs = (device const ushort*)block->qs + 16 * iq + 4 * ir;
+            device const half* dh = &block->d;
+
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+
+            for (int i = 0; i < 8; i += 2) {
+                acc1[0] += yl[i+ 0] * (qs[i/2] & 0x0003);
+                acc2[0] += yl[i+ 1] * (qs[i/2] & 0x0300);
+                acc1[1] += yl[i+ 8] * (qs[i/2] & 0x000c);
+                acc2[1] += yl[i+ 9] * (qs[i/2] & 0x0c00);
+                acc1[2] += yl[i+16] * (qs[i/2] & 0x0030);
+                acc2[2] += yl[i+17] * (qs[i/2] & 0x3000);
+                acc1[3] += yl[i+24] * (qs[i/2] & 0x00c0);
+                acc2[3] += yl[i+25] * (qs[i/2] & 0xc000);
+            }
+
+            float dall = dh[0];
+            float dmin = dh[1] * 1.f/16.f;
+
+            sumf[row] += dall * ((acc1[0] + 1.f/256.f * acc2[0]) * (sc[0] & 0xF) * 1.f/ 1.f +
+                                 (acc1[1] + 1.f/256.f * acc2[1]) * (sc[2] & 0xF) * 1.f/ 4.f +
+                                 (acc1[2] + 1.f/256.f * acc2[2]) * (sc[4] & 0xF) * 1.f/16.f +
+                                 (acc1[3] + 1.f/256.f * acc2[3]) * (sc[6] & 0xF) * 1.f/64.f) -
+                         dmin * (sumy[0] * (sc[0] & 0xF0) + sumy[1] * (sc[2] & 0xF0) +
+                                 sumy[2] * (sc[4] & 0xF0) + sumy[3] * (sc[6] & 0xF0));
+        }
+
+        y4 += 4 * QK_K;
+    }
+
+    // SIMD reduction with fused residual add
+    for (short row = 0; row < NR0_Q2K; ++row) {
+        uint row_idx = first_row + row;
+        if (row_idx < N) {
+            float sum = simd_sum(sumf[row]);
+            if (tiisg == 0) {
+                y[row_idx] = residual[row_idx] + sum;  // Fused residual!
+            }
+        }
+    }
+}
+
+// =============================================================================
 // Flash Attention style decode kernel using online softmax
 // =============================================================================
 // Benefits:

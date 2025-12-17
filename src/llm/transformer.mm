@@ -685,6 +685,7 @@ Result<Tensor> TransformerModel::transformer_block(
                 GGMLType fused_qtype = can_fuse ? w_gate->quant_type : GGMLType::F32;
 
                 Tensor ffn_output;
+                bool residual_fused = false;  // Track if residual was fused into down projection
                 if (can_fuse) {
                     // Get weight buffers
                     auto* wg_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(w_gate->buffer));
@@ -765,17 +766,16 @@ Result<Tensor> TransformerModel::transformer_block(
                         gpu->rms_norm_matvec_q2_k(post_attn_buf, ffn_norm_buf, wu_buf, up_buf,
                                                 hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
                     } else {
-                        // Q4_K (default)
-                        gpu->rms_norm_matvec_q4k(post_attn_buf, ffn_norm_buf, wg_buf, gate_buf,
-                                                hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
-                        gpu->rms_norm_matvec_q4k(post_attn_buf, ffn_norm_buf, wu_buf, up_buf,
-                                                hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                        // Q4_K (default) - Use Phase 2 fused kernel (RMSNorm computed once!)
+                        gpu->rms_norm_dual_matvec_q4k(post_attn_buf, ffn_norm_buf, wg_buf, wu_buf,
+                                                     gate_buf, up_buf,
+                                                     hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
                     }
 
                     // Fused silu + mul
                     gpu->silu_mul(gate_buf, up_buf, gate_buf, config_.intermediate_dim);
 
-                    // Down projection
+                    // Down projection (+ fused residual for Q4_K)
                     if (fused_qtype == GGMLType::Q8_0) {
                         gpu->matvec_q8_0(gate_buf, wd_buf, ffn_out_buf, config_.intermediate_dim, hidden_dim);
                     } else if (fused_qtype == GGMLType::Q4_0) {
@@ -791,11 +791,20 @@ Result<Tensor> TransformerModel::transformer_block(
                     } else if (fused_qtype == GGMLType::Q5_K) {
                         gpu->matvec_q5_k(gate_buf, wd_buf, ffn_out_buf, config_.intermediate_dim, hidden_dim);
                     } else if (fused_qtype == GGMLType::Q3_K) {
-                        gpu->matvec_q3_k(gate_buf, wd_buf, ffn_out_buf, config_.intermediate_dim, hidden_dim);
+                        // Q3_K - Use Phase 2 fused kernel (down proj + residual in one!)
+                        gpu->matvec_residual_q3k(gate_buf, wd_buf, post_attn_buf, out_buf,
+                                                config_.intermediate_dim, hidden_dim);
+                        residual_fused = true;
                     } else if (fused_qtype == GGMLType::Q2_K) {
-                        gpu->matvec_q2_k(gate_buf, wd_buf, ffn_out_buf, config_.intermediate_dim, hidden_dim);
+                        // Q2_K - Use Phase 2 fused kernel (down proj + residual in one!)
+                        gpu->matvec_residual_q2k(gate_buf, wd_buf, post_attn_buf, out_buf,
+                                                config_.intermediate_dim, hidden_dim);
+                        residual_fused = true;
                     } else {
-                        gpu->matvec_q4k(gate_buf, wd_buf, ffn_out_buf, config_.intermediate_dim, hidden_dim);
+                        // Q4_K (default) - Use Phase 2 fused kernel (down proj + residual in one!)
+                        gpu->matvec_residual_q4k(gate_buf, wd_buf, post_attn_buf, out_buf,
+                                                config_.intermediate_dim, hidden_dim);
+                        residual_fused = true;
                     }
 
                     if (!use_ffn_pool) {
@@ -820,10 +829,12 @@ Result<Tensor> TransformerModel::transformer_block(
                     ffn_output = std::move(ffn_result).take();
                 }
 
-                auto* ffn_out_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(ffn_output.buffer()));
-
                 // 6. GPU Residual add: output = post_attn + ffn_output
-                gpu->elementwise_add(post_attn_buf, ffn_out_buf, out_buf, hidden_dim);
+                // (Skip for Q4_K - already fused into matvec_residual_q4k)
+                if (!residual_fused) {
+                    auto* ffn_out_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(ffn_output.buffer()));
+                    gpu->elementwise_add(post_attn_buf, ffn_out_buf, out_buf, hidden_dim);
+                }
 
                 return output;
             }

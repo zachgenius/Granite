@@ -452,6 +452,56 @@ public:
         float eps                 // RMSNorm epsilon
     );
 
+    // ==========================================================================
+    // Phase 2 Fused Kernels - Eliminates redundant computation
+    // ==========================================================================
+
+    // Fused RMSNorm + Dual Q4_K MatVec for gate and up projections
+    // Computes RMSNorm once and outputs both gate and up projections
+    // Eliminates redundant RMSNorm computation in FFN path
+    Result<void> rms_norm_dual_matvec_q4k(
+        MTL::Buffer* x,           // Input [K] float
+        MTL::Buffer* norm_weight, // RMSNorm weight [K] half
+        MTL::Buffer* W_gate,      // Gate Q4_K weights [N, K/256] blocks
+        MTL::Buffer* W_up,        // Up Q4_K weights [N, K/256] blocks
+        MTL::Buffer* y_gate,      // Gate output [N] float
+        MTL::Buffer* y_up,        // Up output [N] float
+        uint32_t K,               // Input dimension (hidden_dim)
+        uint32_t N,               // Output dimension (intermediate_dim)
+        float eps                 // RMSNorm epsilon
+    );
+
+    // Fused MatVec + Residual Add for down projection
+    // Combines down projection with residual connection in one kernel
+    Result<void> matvec_residual_q4k(
+        MTL::Buffer* x,           // Input [K] float (intermediate activations)
+        MTL::Buffer* W,           // Q4_K weights [N, K/256] blocks
+        MTL::Buffer* residual,    // Residual input [N] float
+        MTL::Buffer* y,           // Output [N] float (= residual + x @ W)
+        uint32_t K,               // Input dimension (intermediate_dim)
+        uint32_t N                // Output dimension (hidden_dim)
+    );
+
+    // Fused MatVec + Residual Add for Q3_K
+    Result<void> matvec_residual_q3k(
+        MTL::Buffer* x,           // Input [K] float (intermediate activations)
+        MTL::Buffer* W,           // Q3_K weights [N, K/256] blocks
+        MTL::Buffer* residual,    // Residual input [N] float
+        MTL::Buffer* y,           // Output [N] float (= residual + x @ W)
+        uint32_t K,               // Input dimension (intermediate_dim)
+        uint32_t N                // Output dimension (hidden_dim)
+    );
+
+    // Fused MatVec + Residual Add for Q2_K
+    Result<void> matvec_residual_q2k(
+        MTL::Buffer* x,           // Input [K] float (intermediate activations)
+        MTL::Buffer* W,           // Q2_K weights [N, K/256] blocks
+        MTL::Buffer* residual,    // Residual input [N] float
+        MTL::Buffer* y,           // Output [N] float (= residual + x @ W)
+        uint32_t K,               // Input dimension (intermediate_dim)
+        uint32_t N                // Output dimension (hidden_dim)
+    );
+
     // RoPE (Rotary Position Embedding)
     Result<void> rope(
         MTL::Buffer* x,
