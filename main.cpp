@@ -3,6 +3,7 @@
 #include <string>
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
 
 // Simple FP16 to FP32 conversion for debugging
 inline float debug_fp16_to_fp32(uint16_t h) {
@@ -32,19 +33,113 @@ inline float debug_fp16_to_fp32(uint16_t h) {
     return result;
 }
 
+void print_usage(const char* program) {
+    std::cerr << "Usage: " << program << " <model.gguf> [options] [prompt]\n";
+    std::cerr << "\nOptions:\n";
+    std::cerr << "  --draft-model <path>  Enable speculative decoding with draft model\n";
+    std::cerr << "  --max-tokens <n>      Maximum tokens to generate (default: 20)\n";
+    std::cerr << "  --spec-k <n>          Initial speculation depth (default: 4)\n";
+    std::cerr << "\nExamples:\n";
+    std::cerr << "  " << program << " model.gguf \"Hello\"\n";
+    std::cerr << "  " << program << " large.gguf --draft-model small.gguf \"Hello\"\n";
+}
+
 int main(int argc, char* argv[]) {
     granite::init_logging(spdlog::level::info);
 
     GRANITE_LOG_INFO("Granite Embedded Inference Framework v{}", granite::version_string());
 
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <model.gguf> [prompt]\n";
-        std::cerr << "Example: " << argv[0] << " model.gguf \"Hello\"\n";
+        print_usage(argv[0]);
         return 1;
     }
 
-    std::string model_path = argv[1];
-    std::string prompt = argc > 2 ? argv[2] : "Hello";
+    // Parse arguments
+    std::string model_path;
+    std::string draft_model_path;
+    std::string prompt = "Hello";
+    int max_tokens = 20;
+    int spec_k = 4;
+
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+
+        if (arg == "--draft-model" && i + 1 < argc) {
+            draft_model_path = argv[++i];
+        } else if (arg == "--max-tokens" && i + 1 < argc) {
+            max_tokens = std::atoi(argv[++i]);
+        } else if (arg == "--spec-k" && i + 1 < argc) {
+            spec_k = std::atoi(argv[++i]);
+        } else if (arg == "--help" || arg == "-h") {
+            print_usage(argv[0]);
+            return 0;
+        } else if (arg[0] != '-') {
+            if (model_path.empty()) {
+                model_path = arg;
+            } else {
+                prompt = arg;
+            }
+        }
+    }
+
+    if (model_path.empty()) {
+        print_usage(argv[0]);
+        return 1;
+    }
+
+    // Speculative decoding mode
+    if (!draft_model_path.empty()) {
+        GRANITE_LOG_INFO("Speculative decoding mode:");
+        GRANITE_LOG_INFO("  Target model: {}", model_path);
+        GRANITE_LOG_INFO("  Draft model:  {}", draft_model_path);
+        GRANITE_LOG_INFO("  Initial K:    {}", spec_k);
+
+        auto runner_result = granite::SpeculativeRunner::load(model_path, draft_model_path);
+        if (!runner_result.ok()) {
+            GRANITE_LOG_ERROR("Failed to load models: {}", runner_result.error().message());
+            return 1;
+        }
+        auto runner = std::move(runner_result).take();
+
+        granite::GenerationConfig gen_config;
+        gen_config.max_tokens = max_tokens;
+        gen_config.do_sample = false;  // Greedy for speculative
+
+        granite::SpeculativeConfig spec_config;
+        spec_config.initial_k = spec_k;
+
+        GRANITE_LOG_INFO("Generating with speculative decoding...");
+        std::cout << prompt << std::flush;
+
+        auto start = std::chrono::high_resolution_clock::now();
+        int token_count = 0;
+
+        auto status = runner->generate_streaming(prompt, gen_config, [&](const std::string& token) {
+            std::cout << token << std::flush;
+            token_count++;
+            return true;
+        }, spec_config);
+
+        auto end = std::chrono::high_resolution_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+        std::cout << "\n" << std::endl;
+
+        if (!status.ok()) {
+            GRANITE_LOG_ERROR("Generation failed: {}", status.error().message());
+            return 1;
+        }
+
+        auto& stats = runner->stats();
+        float tok_per_sec = token_count > 0 && ms > 0 ? (token_count * 1000.0f / ms) : 0;
+        GRANITE_LOG_INFO("Generated {} tokens in {} ms ({:.1f} tok/s)",
+                         token_count, ms, tok_per_sec);
+        GRANITE_LOG_INFO("Speculative stats: {} drafted, {} accepted ({:.1f}%), {} target forwards",
+                         stats.total_draft_tokens, stats.total_accepted_tokens,
+                         stats.acceptance_rate() * 100.0f, stats.total_target_forwards);
+
+        return 0;
+    }
 
     GRANITE_LOG_INFO("Loading model: {}", model_path);
 

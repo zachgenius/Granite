@@ -118,6 +118,14 @@ void KVCache::clear() {
     current_len_ = 0;
 }
 
+void KVCache::truncate(int new_len) {
+    // Truncate cache to new length (for speculative decoding rollback)
+    // Data stays in place but is effectively ignored for positions >= new_len
+    if (new_len >= 0 && new_len < current_len_) {
+        current_len_ = new_len;
+    }
+}
+
 size_t KVCache::memory_bytes() const {
     size_t total = 0;
     for (const auto& lc : layers_) {

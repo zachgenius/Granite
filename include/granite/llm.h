@@ -78,6 +78,11 @@ struct GPUKVCache {
     int seq_len() const { return current_len; }
     void clear() { current_len = 0; }
     void increment_len(int delta = 1) { current_len += delta; }
+    void truncate(int new_len) {
+        if (new_len >= 0 && new_len < current_len) {
+            current_len = new_len;
+        }
+    }
 };
 #endif
 
@@ -113,6 +118,9 @@ public:
     /// Increment sequence length (for GPU path that writes directly to cache)
     void increment_seq_len(int delta = 1) { current_len_ += delta; }
     void set_seq_len(int len) { current_len_ = len; }
+
+    /// Truncate cache to a specific length (for speculative decoding rollback)
+    void truncate(int new_len);
 
     /// Memory usage in bytes
     [[nodiscard]] size_t memory_bytes() const;
@@ -231,6 +239,18 @@ struct GenerationConfig {
 };
 
 // =============================================================================
+// Speculative Decoding Config
+// =============================================================================
+
+struct SpeculativeConfig {
+    int initial_k = 4;              // Starting speculation depth
+    int min_k = 1;                  // Minimum tokens to speculate
+    int max_k = 8;                  // Maximum tokens to speculate
+    float target_acceptance = 0.8f; // Target acceptance rate for adaptive K
+    bool enabled = true;            // Enable/disable speculative decoding
+};
+
+// =============================================================================
 // Transformer Model
 // =============================================================================
 
@@ -267,6 +287,13 @@ public:
     [[nodiscard]] Result<Tensor> forward_single(
         int32_t token_id,
         KVCache& kv_cache);
+
+    /// Forward pass for batch of tokens (speculative decoding verification)
+    /// Returns logits for ALL positions [1, num_tokens, vocab_size]
+    [[nodiscard]] Result<Tensor> forward_batch(
+        const std::vector<int32_t>& tokens,
+        KVCache* kv_cache,
+        int start_pos);
 
     /// Get embedding for token IDs
     [[nodiscard]] Result<Tensor> embed(const Tensor& token_ids);
@@ -423,6 +450,84 @@ private:
         std::vector<float>& logits,
         const std::vector<int32_t>& past_tokens,
         float penalty);
+};
+
+// =============================================================================
+// Speculative Runner (Draft Model + Target Model)
+// =============================================================================
+
+class SpeculativeRunner {
+public:
+    SpeculativeRunner() = default;
+    ~SpeculativeRunner() = default;
+
+    /// Load target and draft models from GGUF files
+    [[nodiscard]] static Result<std::unique_ptr<SpeculativeRunner>> load(
+        const std::string& target_path,
+        const std::string& draft_path);
+
+    /// Generate text (blocking)
+    [[nodiscard]] Result<std::string> generate(
+        const std::string& prompt,
+        const GenerationConfig& config = {},
+        const SpeculativeConfig& spec_config = {});
+
+    /// Generate text with streaming callback
+    /// Callback returns false to stop generation
+    [[nodiscard]] Result<void> generate_streaming(
+        const std::string& prompt,
+        const GenerationConfig& config,
+        TokenCallback callback,
+        const SpeculativeConfig& spec_config = {});
+
+    /// Cancel ongoing generation
+    void cancel();
+
+    /// Get target model config
+    [[nodiscard]] const ModelConfig& config() const { return target_model_.config(); }
+
+    /// Get tokenizer
+    [[nodiscard]] const Tokenizer& tokenizer() const { return tokenizer_; }
+
+    /// Reset KV caches (for new conversation)
+    void reset();
+
+    /// Get speculative decoding stats
+    struct Stats {
+        int total_draft_tokens = 0;      // Total tokens drafted
+        int total_accepted_tokens = 0;   // Tokens accepted by target
+        int total_target_forwards = 0;   // Number of target model batch forwards
+        float acceptance_rate() const {
+            return total_draft_tokens > 0
+                ? static_cast<float>(total_accepted_tokens) / total_draft_tokens
+                : 0.0f;
+        }
+    };
+    [[nodiscard]] const Stats& stats() const { return stats_; }
+
+private:
+    std::unique_ptr<IComputeBackend> target_backend_;
+    std::unique_ptr<IComputeBackend> draft_backend_;
+    TransformerModel target_model_;
+    TransformerModel draft_model_;
+    Tokenizer tokenizer_;  // Shared tokenizer (same vocab assumed)
+    KVCache target_kv_cache_;
+    KVCache draft_kv_cache_;
+
+    std::atomic<bool> cancelled_{false};
+    Stats stats_;
+
+    // Core speculative decoding methods
+    std::vector<int32_t> draft_tokens(int k, int32_t last_token);
+    std::vector<int32_t> verify_tokens(
+        const std::vector<int32_t>& candidates,
+        int32_t last_accepted_token);
+    void sync_kv_caches(int accepted_count, int drafted_count);
+    int adapt_k(int current_k, float acceptance_rate, const SpeculativeConfig& config);
+
+    // Sampling
+    int32_t sample(const Tensor& logits, const GenerationConfig& config);
+    int32_t argmax(const Tensor& logits);
 };
 
 // =============================================================================

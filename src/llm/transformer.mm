@@ -442,6 +442,39 @@ Result<Tensor> TransformerModel::forward_single(int32_t token_id, KVCache& kv_ca
     return forward(ids, &kv_cache, start_pos);
 }
 
+Result<Tensor> TransformerModel::forward_batch(
+    const std::vector<int32_t>& tokens,
+    KVCache* kv_cache,
+    int start_pos)
+{
+    if (tokens.empty()) {
+        GRANITE_FAIL(ErrorCode::InvalidArgument, "Empty token batch");
+    }
+
+    int num_tokens = static_cast<int>(tokens.size());
+
+    // Create tensor from tokens [1, num_tokens]
+    std::vector<int64_t> ids_shape = {1, static_cast<int64_t>(num_tokens)};
+    auto ids_result = Tensor::allocate(ids_shape, DataType::INT32, backend_);
+    if (!ids_result.ok()) {
+        return ids_result.error();
+    }
+    auto ids = std::move(ids_result).take();
+
+    // Copy tokens to tensor
+    auto map_ids = backend_->map_buffer(ids.buffer());
+    if (!map_ids.ok()) {
+        return Error(ErrorCode::InternalError, "Failed to map token buffer");
+    }
+    auto* ptr = static_cast<int32_t*>(map_ids.value());
+    std::memcpy(ptr, tokens.data(), tokens.size() * sizeof(int32_t));
+    backend_->unmap_buffer(ids.buffer());
+
+    // Forward pass - returns logits [1, num_tokens, vocab_size]
+    // The forward() method already handles proper causal attention for multiple tokens
+    return forward(ids, kv_cache, start_pos);
+}
+
 // =============================================================================
 // SECTION 4: Helper Functions
 // =============================================================================

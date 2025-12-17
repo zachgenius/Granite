@@ -71,6 +71,7 @@ set(GRANITE_LLM_SOURCES
     src/llm/tokenizer.cpp
     src/llm/model_config.cpp
     src/llm/runner.cpp
+    src/llm/speculative_runner.cpp
 )
 
 # TransformerModel uses Metal - compile as .mm on Apple
