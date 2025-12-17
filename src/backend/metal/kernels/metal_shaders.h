@@ -3967,6 +3967,271 @@ kernel void matvec_residual_q2k(
 }
 
 // =============================================================================
+// Fused RMSNorm + Dual Q3_K MatVec (Gate + Up projections in one kernel)
+// =============================================================================
+// Eliminates redundant RMSNorm: compute once, use for both gate and up
+kernel void rms_norm_dual_matvec_q3k(
+    device const float* x          [[buffer(0)]],
+    device const half* norm_weight [[buffer(1)]],
+    device const void* W_gate      [[buffer(2)]],
+    device const void* W_up        [[buffer(3)]],
+    device float* y_gate           [[buffer(4)]],
+    device float* y_up             [[buffer(5)]],
+    constant uint& K               [[buffer(6)]],
+    constant uint& N               [[buffer(7)]],
+    constant float& eps            [[buffer(8)]],
+    uint tgid                      [[threadgroup_position_in_grid]],
+    uint tid                       [[thread_position_in_threadgroup]],
+    uint simd_lane                 [[thread_index_in_simdgroup]],
+    uint simd_id                   [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup float x_norm[4096];
+    threadgroup float reduction_scratch[8];
+
+    // Step 1: RMSNorm (computed ONCE for both projections)
+    float local_sum_sq = 0.0f;
+    for (uint i = tid; i < K; i += 256) {
+        float val = x[i];
+        local_sum_sq += val * val;
+    }
+
+    float simd_sum_sq = simd_sum(local_sum_sq);
+    if (simd_lane == 0) {
+        reduction_scratch[simd_id] = simd_sum_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float rms_inv;
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint i = 0; i < 8; i++) {
+            total += reduction_scratch[i];
+        }
+        rms_inv = rsqrt(total / float(K) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < K; i += 256) {
+        x_norm[i] = x[i] * rms_inv * float(norm_weight[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 2: Dual Q3_K MatVec
+    uint row = tgid * 8 + simd_id;
+    if (row >= N) return;
+
+    const uint num_blocks_k = K / QK_K;
+    const device block_q3_K* weights_gate = (const device block_q3_K*)W_gate;
+    const device block_q3_K* weights_up = (const device block_q3_K*)W_up;
+
+    float sum_gate = 0.0f;
+    float sum_up = 0.0f;
+
+    for (uint kb = simd_lane; kb < num_blocks_k; kb += 32) {
+        uint base_idx = kb * QK_K;
+
+        // Gate projection
+        {
+            const device block_q3_K* block = &weights_gate[row * num_blocks_k + kb];
+            float d = float(block->d);
+            float acc = 0.0f;
+
+            for (uint i = 0; i < 256; i++) {
+                uint qs_byte = i / 4;
+                uint qs_shift = (i % 4) * 2;
+                uint low2 = (block->qs[qs_byte] >> qs_shift) & 0x3;
+
+                uint hm_byte = i / 8;
+                uint hm_bit = i % 8;
+                uint high1 = (block->hmask[hm_byte] >> hm_bit) & 0x1;
+
+                int q3 = int(low2 | (high1 << 2)) - 4;
+
+                uint sub_block = i / 32;
+                int8_t scale;
+                if (sub_block < 4) {
+                    uint8_t sc_low = block->scales[sub_block] & 0x0F;
+                    uint8_t sc_high = (block->scales[8 + sub_block / 2] >> (4 * (sub_block % 2))) & 0x03;
+                    scale = int8_t((sc_low | (sc_high << 4))) - 32;
+                } else {
+                    uint8_t sc_low = (block->scales[sub_block - 4] >> 4) & 0x0F;
+                    uint8_t sc_high = (block->scales[10 + (sub_block - 4) / 2] >> (4 * ((sub_block - 4) % 2))) & 0x03;
+                    scale = int8_t((sc_low | (sc_high << 4))) - 32;
+                }
+
+                acc += x_norm[base_idx + i] * (d * float(scale) * float(q3));
+            }
+            sum_gate += acc;
+        }
+
+        // Up projection (same normalized input)
+        {
+            const device block_q3_K* block = &weights_up[row * num_blocks_k + kb];
+            float d = float(block->d);
+            float acc = 0.0f;
+
+            for (uint i = 0; i < 256; i++) {
+                uint qs_byte = i / 4;
+                uint qs_shift = (i % 4) * 2;
+                uint low2 = (block->qs[qs_byte] >> qs_shift) & 0x3;
+
+                uint hm_byte = i / 8;
+                uint hm_bit = i % 8;
+                uint high1 = (block->hmask[hm_byte] >> hm_bit) & 0x1;
+
+                int q3 = int(low2 | (high1 << 2)) - 4;
+
+                uint sub_block = i / 32;
+                int8_t scale;
+                if (sub_block < 4) {
+                    uint8_t sc_low = block->scales[sub_block] & 0x0F;
+                    uint8_t sc_high = (block->scales[8 + sub_block / 2] >> (4 * (sub_block % 2))) & 0x03;
+                    scale = int8_t((sc_low | (sc_high << 4))) - 32;
+                } else {
+                    uint8_t sc_low = (block->scales[sub_block - 4] >> 4) & 0x0F;
+                    uint8_t sc_high = (block->scales[10 + (sub_block - 4) / 2] >> (4 * ((sub_block - 4) % 2))) & 0x03;
+                    scale = int8_t((sc_low | (sc_high << 4))) - 32;
+                }
+
+                acc += x_norm[base_idx + i] * (d * float(scale) * float(q3));
+            }
+            sum_up += acc;
+        }
+    }
+
+    float gate_result = simd_sum(sum_gate);
+    float up_result = simd_sum(sum_up);
+
+    if (simd_lane == 0) {
+        y_gate[row] = gate_result;
+        y_up[row] = up_result;
+    }
+}
+
+// =============================================================================
+// Fused RMSNorm + Dual Q2_K MatVec (Gate + Up projections in one kernel)
+// =============================================================================
+// Eliminates redundant RMSNorm: compute once, use for both gate and up
+kernel void rms_norm_dual_matvec_q2k(
+    device const float* x          [[buffer(0)]],
+    device const half* norm_weight [[buffer(1)]],
+    device const void* W_gate      [[buffer(2)]],
+    device const void* W_up        [[buffer(3)]],
+    device float* y_gate           [[buffer(4)]],
+    device float* y_up             [[buffer(5)]],
+    constant uint& K               [[buffer(6)]],
+    constant uint& N               [[buffer(7)]],
+    constant float& eps            [[buffer(8)]],
+    uint tgid                      [[threadgroup_position_in_grid]],
+    uint tid                       [[thread_position_in_threadgroup]],
+    uint simd_lane                 [[thread_index_in_simdgroup]],
+    uint simd_id                   [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup float x_norm[4096];
+    threadgroup float reduction_scratch[8];
+
+    // Step 1: RMSNorm (computed ONCE for both projections)
+    float local_ss = 0.0f;
+    for (uint i = tid; i < K; i += 256) {
+        float val = x[i];
+        local_ss += val * val;
+    }
+
+    float simd_ss = simd_sum(local_ss);
+    if (simd_lane == 0) {
+        reduction_scratch[simd_id] = simd_ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float total_ss = 0.0f;
+        for (uint i = 0; i < 8; i++) {
+            total_ss += reduction_scratch[i];
+        }
+        reduction_scratch[0] = rsqrt(total_ss / float(K) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float scale = reduction_scratch[0];
+
+    for (uint i = tid; i < K; i += 256) {
+        x_norm[i] = x[i] * scale * float(norm_weight[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 2: Dual Q2_K MatVec
+    uint row = tgid * 8 + simd_id;
+    if (row >= N) return;
+
+    const uint nb = K / QK_K;
+    const device block_q2_K* weights_gate = (const device block_q2_K*)W_gate;
+    const device block_q2_K* weights_up = (const device block_q2_K*)W_up;
+
+    float sum_gate = 0.0f;
+    float sum_up = 0.0f;
+
+    for (uint kb = simd_lane; kb < nb; kb += 32) {
+        uint base_idx = kb * QK_K;
+
+        // Gate projection
+        {
+            const device block_q2_K* block = &weights_gate[row * nb + kb];
+            float d = float(block->d);
+            float dmin = float(block->dmin);
+            float acc = 0.0f;
+
+            for (uint j = 0; j < 16; j++) {
+                uint8_t sc_byte = block->scales[j];
+                float scale_val = d * float(sc_byte & 0xF);
+                float min_val = dmin * float(sc_byte >> 4);
+
+                for (uint i = 0; i < 16; i++) {
+                    uint elem = j * 16 + i;
+                    uint qs_idx = elem / 4;
+                    uint qs_shift = (elem % 4) * 2;
+                    int q2 = int((block->qs[qs_idx] >> qs_shift) & 0x3);
+
+                    acc += x_norm[base_idx + elem] * (scale_val * float(q2) - min_val);
+                }
+            }
+            sum_gate += acc;
+        }
+
+        // Up projection (same normalized input)
+        {
+            const device block_q2_K* block = &weights_up[row * nb + kb];
+            float d = float(block->d);
+            float dmin = float(block->dmin);
+            float acc = 0.0f;
+
+            for (uint j = 0; j < 16; j++) {
+                uint8_t sc_byte = block->scales[j];
+                float scale_val = d * float(sc_byte & 0xF);
+                float min_val = dmin * float(sc_byte >> 4);
+
+                for (uint i = 0; i < 16; i++) {
+                    uint elem = j * 16 + i;
+                    uint qs_idx = elem / 4;
+                    uint qs_shift = (elem % 4) * 2;
+                    int q2 = int((block->qs[qs_idx] >> qs_shift) & 0x3);
+
+                    acc += x_norm[base_idx + elem] * (scale_val * float(q2) - min_val);
+                }
+            }
+            sum_up += acc;
+        }
+    }
+
+    float gate_result = simd_sum(sum_gate);
+    float up_result = simd_sum(sum_up);
+
+    if (simd_lane == 0) {
+        y_gate[row] = gate_result;
+        y_up[row] = up_result;
+    }
+}
+
+// =============================================================================
 // Flash Attention style decode kernel using online softmax
 // =============================================================================
 // Benefits:

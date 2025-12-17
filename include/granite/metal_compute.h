@@ -471,6 +471,32 @@ public:
         float eps                 // RMSNorm epsilon
     );
 
+    // Fused RMSNorm + Dual Q3_K MatVec for gate and up projections
+    Result<void> rms_norm_dual_matvec_q3k(
+        MTL::Buffer* x,           // Input [K] float
+        MTL::Buffer* norm_weight, // RMSNorm weight [K] half
+        MTL::Buffer* W_gate,      // Gate Q3_K weights [N, K/256] blocks
+        MTL::Buffer* W_up,        // Up Q3_K weights [N, K/256] blocks
+        MTL::Buffer* y_gate,      // Gate output [N] float
+        MTL::Buffer* y_up,        // Up output [N] float
+        uint32_t K,               // Input dimension (hidden_dim)
+        uint32_t N,               // Output dimension (intermediate_dim)
+        float eps                 // RMSNorm epsilon
+    );
+
+    // Fused RMSNorm + Dual Q2_K MatVec for gate and up projections
+    Result<void> rms_norm_dual_matvec_q2k(
+        MTL::Buffer* x,           // Input [K] float
+        MTL::Buffer* norm_weight, // RMSNorm weight [K] half
+        MTL::Buffer* W_gate,      // Gate Q2_K weights [N, K/256] blocks
+        MTL::Buffer* W_up,        // Up Q2_K weights [N, K/256] blocks
+        MTL::Buffer* y_gate,      // Gate output [N] float
+        MTL::Buffer* y_up,        // Up output [N] float
+        uint32_t K,               // Input dimension (hidden_dim)
+        uint32_t N,               // Output dimension (intermediate_dim)
+        float eps                 // RMSNorm epsilon
+    );
+
     // Fused MatVec + Residual Add for down projection
     // Combines down projection with residual connection in one kernel
     Result<void> matvec_residual_q4k(

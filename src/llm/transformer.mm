@@ -756,15 +756,15 @@ Result<Tensor> TransformerModel::transformer_block(
                         gpu->rms_norm_matvec_q5_k(post_attn_buf, ffn_norm_buf, wu_buf, up_buf,
                                                 hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
                     } else if (fused_qtype == GGMLType::Q3_K) {
-                        gpu->rms_norm_matvec_q3_k(post_attn_buf, ffn_norm_buf, wg_buf, gate_buf,
-                                                hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
-                        gpu->rms_norm_matvec_q3_k(post_attn_buf, ffn_norm_buf, wu_buf, up_buf,
-                                                hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                        // Q3_K - Use Phase 2 fused kernel (RMSNorm computed once!)
+                        gpu->rms_norm_dual_matvec_q3k(post_attn_buf, ffn_norm_buf, wg_buf, wu_buf,
+                                                     gate_buf, up_buf,
+                                                     hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
                     } else if (fused_qtype == GGMLType::Q2_K) {
-                        gpu->rms_norm_matvec_q2_k(post_attn_buf, ffn_norm_buf, wg_buf, gate_buf,
-                                                hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
-                        gpu->rms_norm_matvec_q2_k(post_attn_buf, ffn_norm_buf, wu_buf, up_buf,
-                                                hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                        // Q2_K - Use Phase 2 fused kernel (RMSNorm computed once!)
+                        gpu->rms_norm_dual_matvec_q2k(post_attn_buf, ffn_norm_buf, wg_buf, wu_buf,
+                                                     gate_buf, up_buf,
+                                                     hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
                     } else {
                         // Q4_K (default) - Use Phase 2 fused kernel (RMSNorm computed once!)
                         gpu->rms_norm_dual_matvec_q4k(post_attn_buf, ffn_norm_buf, wg_buf, wu_buf,
