@@ -12,6 +12,8 @@
 #include <functional>
 #include <atomic>
 #include <unordered_map>
+#include <chrono>
+#include <deque>
 
 namespace granite {
 
@@ -248,6 +250,80 @@ struct SpeculativeConfig {
     int max_k = 8;                  // Maximum tokens to speculate
     float target_acceptance = 0.8f; // Target acceptance rate for adaptive K
     bool enabled = true;            // Enable/disable speculative decoding
+
+    // Tree speculation settings
+    bool use_tree = false;          // Enable tree-based speculation
+    int tree_width = 2;             // Branching factor (top-k at each level)
+    int tree_depth = 4;             // Maximum tree depth
+};
+
+// =============================================================================
+// Speculation Tree (for tree-based speculative decoding)
+// =============================================================================
+
+class SpeculationTree {
+public:
+    struct Node {
+        int32_t token;
+        int parent_idx;             // -1 for root
+        int depth;                  // Distance from root
+        float log_prob;             // Log probability from draft model
+        std::vector<int> children;
+    };
+
+    SpeculationTree() = default;
+
+    // Build tree from draft model starting from last token
+    void build(int width, int depth);
+
+    // Add a node to the tree
+    int add_node(int32_t token, int parent_idx, float log_prob = 0.0f);
+
+    // Get all leaf node indices
+    std::vector<int> get_leaves() const;
+
+    // Get path from root to node (inclusive)
+    std::vector<int> get_path(int node_idx) const;
+
+    // Get parent indices for all nodes (for attention mask)
+    std::vector<int> get_parent_indices() const;
+
+    // Flatten tree tokens in BFS order for batch processing
+    std::vector<int32_t> flatten_tokens() const;
+
+    // Get number of nodes
+    size_t size() const { return nodes_.size(); }
+
+    // Access nodes
+    const Node& node(int idx) const { return nodes_[idx]; }
+    Node& node(int idx) { return nodes_[idx]; }
+
+    // Get node pointer (for speculative_runner compatibility)
+    const Node* get_node(int idx) const {
+        if (idx < 0 || idx >= static_cast<int>(nodes_.size())) return nullptr;
+        return &nodes_[idx];
+    }
+
+    // Get maximum depth in tree
+    int max_depth() const {
+        int max_d = 0;
+        for (const auto& n : nodes_) {
+            max_d = std::max(max_d, n.depth);
+        }
+        return max_d;
+    }
+
+    // Clear tree
+    void clear() { nodes_.clear(); }
+
+    // Find longest accepted path given target verification results
+    // Returns token indices along the accepted path
+    std::vector<int32_t> find_accepted_path(
+        const std::vector<int32_t>& target_choices  // argmax at each position
+    ) const;
+
+private:
+    std::vector<Node> nodes_;
 };
 
 // =============================================================================
@@ -292,6 +368,15 @@ public:
     /// Returns logits for ALL positions [1, num_tokens, vocab_size]
     [[nodiscard]] Result<Tensor> forward_batch(
         const std::vector<int32_t>& tokens,
+        KVCache* kv_cache,
+        int start_pos);
+
+    /// Forward pass for tree-structured tokens (tree speculative decoding)
+    /// Uses tree attention mask where each node attends only to ancestors
+    /// Returns logits for ALL nodes [1, num_nodes, vocab_size]
+    [[nodiscard]] Result<Tensor> forward_tree(
+        const std::vector<int32_t>& tokens,
+        const std::vector<int>& parent_indices,  // -1 for root
         KVCache* kv_cache,
         int start_pos);
 
@@ -391,6 +476,22 @@ private:
         const Tensor& hidden,
         int layer,
         int start_pos);
+
+    // Tree attention for speculative decoding
+    // tree_mask[i][j] = true if node i can attend to node j
+    Result<Tensor> transformer_block_tree(
+        const Tensor& hidden,
+        int layer,
+        KVCache* kv_cache,
+        int start_pos,
+        const std::vector<std::vector<bool>>& tree_mask);
+
+    Result<Tensor> attention_tree(
+        const Tensor& hidden,
+        int layer,
+        KVCache* kv_cache,
+        int start_pos,
+        const std::vector<std::vector<bool>>& tree_mask);
 
     // Helper functions
     Tensor apply_rms_norm(const Tensor& input, const Tensor* weight);
@@ -525,9 +626,159 @@ private:
     void sync_kv_caches(int accepted_count, int drafted_count);
     int adapt_k(int current_k, float acceptance_rate, const SpeculativeConfig& config);
 
+    // Tree-based speculative decoding methods
+    void build_tree(SpeculationTree& tree, int32_t root_token, int width, int depth);
+    std::vector<int32_t> verify_tree(SpeculationTree& tree, int32_t last_accepted_token);
+    std::vector<std::pair<int32_t, float>> get_top_k(const Tensor& logits, int k);
+    Result<void> generate_streaming_tree(
+        const std::string& prompt,
+        const GenerationConfig& config,
+        TokenCallback callback,
+        const SpeculativeConfig& spec_config);
+
     // Sampling
     int32_t sample(const Tensor& logits, const GenerationConfig& config);
     int32_t argmax(const Tensor& logits);
+};
+
+// =============================================================================
+// Continuous Batching - KV Cache Pool
+// =============================================================================
+
+class KVCachePool {
+public:
+    KVCachePool() = default;
+    ~KVCachePool() = default;
+
+    /// Allocate pool with N cache slots
+    [[nodiscard]] Result<void> allocate(
+        int num_slots,
+        const ModelConfig& config,
+        int max_seq_len,
+        IComputeBackend* backend);
+
+    /// Acquire a free cache slot (-1 if none available)
+    int acquire_slot();
+
+    /// Release a cache slot back to the pool
+    void release_slot(int slot);
+
+    /// Get KV cache for a specific slot
+    KVCache& get_cache(int slot) { return caches_[slot]; }
+    const KVCache& get_cache(int slot) const { return caches_[slot]; }
+
+    /// Check if slot is in use
+    bool is_slot_in_use(int slot) const { return slot_in_use_[slot]; }
+
+    /// Get number of slots
+    int num_slots() const { return static_cast<int>(caches_.size()); }
+
+    /// Get number of free slots
+    int num_free_slots() const;
+
+private:
+    std::vector<KVCache> caches_;
+    std::vector<bool> slot_in_use_;
+    IComputeBackend* backend_ = nullptr;
+};
+
+// =============================================================================
+// Continuous Batching - Generation Request
+// =============================================================================
+
+struct GenerationRequest {
+    int request_id = -1;
+    std::string prompt;
+    GenerationConfig config;
+    TokenCallback callback;
+
+    // Request state
+    enum class State { PENDING, PREFILLING, DECODING, COMPLETED, FAILED };
+    State state = State::PENDING;
+
+    // Token state
+    std::vector<int32_t> prompt_tokens;
+    std::vector<int32_t> generated_tokens;
+    int prefill_pos = 0;            // Progress through prefill
+
+    // KV cache assignment
+    int kv_cache_slot = -1;
+
+    // Timing
+    std::chrono::steady_clock::time_point start_time;
+    std::chrono::steady_clock::time_point first_token_time;
+};
+
+// =============================================================================
+// Continuous Batching - Batch Scheduler
+// =============================================================================
+
+class BatchScheduler {
+public:
+    BatchScheduler() = default;
+    ~BatchScheduler() = default;
+
+    /// Initialize scheduler with model and cache pool
+    [[nodiscard]] Result<void> initialize(
+        TransformerModel* model,
+        Tokenizer* tokenizer,
+        int num_cache_slots,
+        int max_batch_tokens = 256);
+
+    /// Submit a new generation request
+    /// Returns request ID
+    int submit(const std::string& prompt,
+               const GenerationConfig& config,
+               TokenCallback callback = nullptr);
+
+    /// Process one batch iteration
+    /// Returns number of completed requests
+    int step();
+
+    /// Get and clear completed requests
+    std::vector<GenerationRequest> take_completed();
+
+    /// Cancel a request
+    void cancel(int request_id);
+
+    /// Cancel all requests
+    void cancel_all();
+
+    /// Check if any requests are pending/active
+    bool has_pending() const;
+
+    /// Get queue sizes
+    int prefill_queue_size() const { return static_cast<int>(prefill_queue_.size()); }
+    int decode_queue_size() const { return static_cast<int>(decode_queue_.size()); }
+
+private:
+    // Batch assembly
+    struct Batch {
+        std::vector<int32_t> tokens;
+        std::vector<int> positions;      // Position in sequence per token
+        std::vector<int> kv_slots;       // KV cache slot per token
+        std::vector<int> request_ids;    // Request ID per token
+        bool is_prefill = false;
+    };
+
+    Batch assemble_prefill_batch();
+    Batch assemble_decode_batch();
+    void process_batch(const Batch& batch);
+
+    // Model and resources
+    TransformerModel* model_ = nullptr;
+    Tokenizer* tokenizer_ = nullptr;
+    std::unique_ptr<KVCachePool> kv_pool_;
+    std::unique_ptr<IComputeBackend> backend_;
+
+    // Request management
+    std::deque<std::unique_ptr<GenerationRequest>> prefill_queue_;
+    std::deque<std::unique_ptr<GenerationRequest>> decode_queue_;
+    std::vector<GenerationRequest> completed_;
+    int next_request_id_ = 0;
+
+    // Configuration
+    int max_batch_tokens_ = 256;
 };
 
 // =============================================================================

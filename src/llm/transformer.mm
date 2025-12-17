@@ -475,6 +475,126 @@ Result<Tensor> TransformerModel::forward_batch(
     return forward(ids, kv_cache, start_pos);
 }
 
+Result<Tensor> TransformerModel::forward_tree(
+    const std::vector<int32_t>& tokens,
+    const std::vector<int>& parent_indices,
+    KVCache* kv_cache,
+    int start_pos)
+{
+    if (tokens.empty()) {
+        GRANITE_FAIL(ErrorCode::InvalidArgument, "Empty token batch");
+    }
+
+    if (tokens.size() != parent_indices.size()) {
+        GRANITE_FAIL(ErrorCode::InvalidArgument,
+                     "Tokens and parent_indices must have same size");
+    }
+
+    int num_nodes = static_cast<int>(tokens.size());
+
+    // Build ancestor mask: ancestors[i] = set of node indices that node i can attend to
+    // Node i can attend to itself and all ancestors up to root
+    std::vector<std::vector<bool>> tree_mask(num_nodes, std::vector<bool>(num_nodes, false));
+
+    for (int i = 0; i < num_nodes; i++) {
+        // Each node attends to itself
+        tree_mask[i][i] = true;
+
+        // Walk up the parent chain to find all ancestors
+        int current = parent_indices[i];
+        while (current >= 0 && current < num_nodes) {
+            tree_mask[i][current] = true;
+            current = parent_indices[current];
+        }
+    }
+
+    // Create tensor from tokens [1, num_nodes]
+    std::vector<int64_t> ids_shape = {1, static_cast<int64_t>(num_nodes)};
+    auto ids_result = Tensor::allocate(ids_shape, DataType::INT32, backend_);
+    if (!ids_result.ok()) {
+        return ids_result.error();
+    }
+    auto ids = std::move(ids_result).take();
+
+    // Copy tokens to tensor
+    auto map_ids = backend_->map_buffer(ids.buffer());
+    if (!map_ids.ok()) {
+        return Error(ErrorCode::InternalError, "Failed to map token buffer");
+    }
+    auto* ptr = static_cast<int32_t*>(map_ids.value());
+    std::memcpy(ptr, tokens.data(), tokens.size() * sizeof(int32_t));
+    backend_->unmap_buffer(ids.buffer());
+
+    // Embed tokens
+    auto hidden_result = embed(ids);
+    if (!hidden_result.ok()) {
+        return hidden_result.error();
+    }
+    auto hidden = std::move(hidden_result).take();
+
+    // Process through transformer layers with tree attention
+    for (int layer = 0; layer < config_.num_layers; layer++) {
+        auto block_result = transformer_block_tree(hidden, layer, kv_cache, start_pos, tree_mask);
+        if (!block_result.ok()) {
+            return block_result.error();
+        }
+        hidden = std::move(block_result).take();
+    }
+
+    // Final RMSNorm and output projection (same as regular forward)
+    const Tensor* norm_weight = get_weight("output_norm.weight");
+    const Tensor* output_weight = get_weight("output.weight");
+    if (!output_weight) {
+        output_weight = get_weight("token_embd.weight");
+    }
+    if (!output_weight) {
+        GRANITE_FAIL(ErrorCode::InvalidState, "Output weight not found");
+    }
+
+    // CPU path for tree forward (multi-token)
+    if (norm_weight) {
+        hidden = apply_rms_norm(hidden, norm_weight);
+    }
+
+    // Output projection: logits = hidden @ output.T
+    int batch = 1;
+    int seq_len = num_nodes;
+    int hidden_dim = config_.hidden_dim;
+    int vocab_size = config_.vocab_size;
+
+    std::vector<int64_t> logits_shape = {
+        static_cast<int64_t>(batch),
+        static_cast<int64_t>(seq_len),
+        static_cast<int64_t>(vocab_size)
+    };
+    auto logits_result = Tensor::allocate(logits_shape, DataType::FP32, backend_);
+    if (!logits_result.ok()) {
+        return logits_result.error();
+    }
+    auto logits = std::move(logits_result).take();
+
+    auto map_h = backend_->map_buffer(hidden.buffer());
+    auto map_l = backend_->map_buffer(logits.buffer());
+    auto map_w = backend_->map_buffer(output_weight->buffer());
+
+    if (!map_h.ok() || !map_l.ok() || !map_w.ok()) {
+        GRANITE_FAIL(ErrorCode::InternalError, "Failed to map logits buffers");
+    }
+
+    const float* h_data = static_cast<const float*>(map_h.value());
+    float* l_data = static_cast<float*>(map_l.value());
+    const uint16_t* w_data = static_cast<const uint16_t*>(map_w.value());
+
+    // Batch matmul: [num_nodes, hidden_dim] @ [vocab_size, hidden_dim].T
+    matmul_transb_fp16(h_data, w_data, l_data, num_nodes, vocab_size, hidden_dim);
+
+    backend_->unmap_buffer(hidden.buffer());
+    backend_->unmap_buffer(logits.buffer());
+    backend_->unmap_buffer(output_weight->buffer());
+
+    return logits;
+}
+
 // =============================================================================
 // SECTION 4: Helper Functions
 // =============================================================================
@@ -935,6 +1055,52 @@ cpu_path:
     return output;
 }
 
+// Tree-aware transformer block for speculative decoding
+Result<Tensor> TransformerModel::transformer_block_tree(
+    const Tensor& hidden,
+    int layer,
+    KVCache* kv_cache,
+    int start_pos,
+    const std::vector<std::vector<bool>>& tree_mask)
+{
+    std::string prefix = "blk." + std::to_string(layer) + ".";
+
+    // Get weights
+    const Tensor* attn_norm_weight = get_weight(prefix + "attn_norm.weight");
+    const Tensor* ffn_norm_weight = get_weight(prefix + "ffn_norm.weight");
+
+    // CPU path for tree attention (multi-token, tree-structured)
+    // Save residual for later
+    Tensor residual = hidden;
+
+    // 1. RMSNorm for attention
+    auto attn_input = apply_rms_norm(hidden, attn_norm_weight);
+
+    // 2. Tree attention (no GPU path for tree attention yet)
+    auto attn_result = attention_tree(attn_input, layer, kv_cache, start_pos, tree_mask);
+    if (!attn_result.ok()) {
+        return attn_result.error();
+    }
+    auto attn_output = std::move(attn_result).take();
+
+    // 3. Residual add: hidden = residual + attn_output
+    auto post_attn = add_tensors(residual, attn_output);
+
+    // 4. RMSNorm for FFN
+    auto ffn_input = apply_rms_norm(post_attn, ffn_norm_weight);
+
+    // 5. Feed forward (SwiGLU) - CPU path
+    auto ffn_result = feed_forward(ffn_input, layer);
+    if (!ffn_result.ok()) {
+        return ffn_result.error();
+    }
+    auto ffn_output = std::move(ffn_result).take();
+
+    // 6. Residual add: output = post_attn + ffn_output
+    auto output = add_tensors(post_attn, ffn_output);
+    return output;
+}
+
 // =============================================================================
 // SECTION 6: CPU Attention
 // =============================================================================
@@ -1254,6 +1420,282 @@ Result<Tensor> TransformerModel::attention(
     // output = context @ wo.T
     matmul_transb_fp16(context.data(), wo_data, out_data,
                        total_tokens2, hidden_dim, attn_out_dim);
+
+    backend_->unmap_buffer(output.buffer());
+    backend_->unmap_buffer(wo->buffer());
+
+    return output;
+}
+
+// Tree attention: uses tree_mask instead of causal mask
+// tree_mask[q_idx][k_idx] = true if query at tree position q_idx can attend to k_idx
+// Note: tree positions are relative to the tree (0 to num_nodes-1)
+// For KV cache positions (< start_pos), we allow all tree nodes to attend
+Result<Tensor> TransformerModel::attention_tree(
+    const Tensor& hidden,
+    int layer,
+    KVCache* kv_cache,
+    int start_pos,
+    const std::vector<std::vector<bool>>& tree_mask)
+{
+    std::string prefix = "blk." + std::to_string(layer) + ".";
+
+    // Get attention weights
+    const Tensor* wq = get_weight(prefix + "attn_q.weight");
+    const Tensor* wk = get_weight(prefix + "attn_k.weight");
+    const Tensor* wv = get_weight(prefix + "attn_v.weight");
+    const Tensor* wo = get_weight(prefix + "attn_output.weight");
+
+    if (!wq || !wk || !wv || !wo) {
+        GRANITE_FAIL(ErrorCode::InvalidState,
+                     "Missing attention weights for layer " + std::to_string(layer));
+    }
+
+    int batch = static_cast<int>(hidden.size(0));
+    int num_nodes = static_cast<int>(hidden.size(1));  // Tree nodes
+    int hidden_dim = config_.hidden_dim;
+    int num_heads = config_.num_heads;
+    int num_kv_heads = config_.num_kv_heads;
+    int head_dim = config_.head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+
+    // Allocate Q, K, V tensors for tree nodes
+    std::vector<int64_t> q_shape = {
+        static_cast<int64_t>(batch),
+        static_cast<int64_t>(num_nodes),
+        static_cast<int64_t>(num_heads),
+        static_cast<int64_t>(head_dim)
+    };
+    std::vector<int64_t> kv_shape = {
+        static_cast<int64_t>(batch),
+        static_cast<int64_t>(num_nodes),
+        static_cast<int64_t>(num_kv_heads),
+        static_cast<int64_t>(head_dim)
+    };
+
+    auto q_result = Tensor::allocate(q_shape, DataType::FP32, backend_);
+    auto k_result = Tensor::allocate(kv_shape, DataType::FP32, backend_);
+    auto v_result = Tensor::allocate(kv_shape, DataType::FP32, backend_);
+
+    if (!q_result.ok() || !k_result.ok() || !v_result.ok()) {
+        GRANITE_FAIL(ErrorCode::AllocationFailed, "Failed to allocate Q/K/V tensors");
+    }
+
+    auto q = std::move(q_result).take();
+    auto k = std::move(k_result).take();
+    auto v = std::move(v_result).take();
+
+    // Project Q, K, V
+    auto map_h = backend_->map_buffer(hidden.buffer());
+    auto map_q = backend_->map_buffer(q.buffer());
+    auto map_k = backend_->map_buffer(k.buffer());
+    auto map_v = backend_->map_buffer(v.buffer());
+    auto map_wq = backend_->map_buffer(wq->buffer());
+    auto map_wk = backend_->map_buffer(wk->buffer());
+    auto map_wv = backend_->map_buffer(wv->buffer());
+
+    if (!map_h.ok() || !map_q.ok() || !map_k.ok() || !map_v.ok() ||
+        !map_wq.ok() || !map_wk.ok() || !map_wv.ok()) {
+        GRANITE_FAIL(ErrorCode::InternalError, "Failed to map attention buffers");
+    }
+
+    const float* h_data = static_cast<const float*>(map_h.value());
+    float* q_data = static_cast<float*>(map_q.value());
+    float* k_data = static_cast<float*>(map_k.value());
+    float* v_data = static_cast<float*>(map_v.value());
+    const uint16_t* wq_data = static_cast<const uint16_t*>(map_wq.value());
+    const uint16_t* wk_data = static_cast<const uint16_t*>(map_wk.value());
+    const uint16_t* wv_data = static_cast<const uint16_t*>(map_wv.value());
+
+    // Q, K, V projections
+    int q_out_dim = num_heads * head_dim;
+    matmul_transb_fp16(h_data, wq_data, q_data, num_nodes, q_out_dim, hidden_dim);
+    matmul_transb_fp16(h_data, wk_data, k_data, num_nodes, kv_dim, hidden_dim);
+    matmul_transb_fp16(h_data, wv_data, v_data, num_nodes, kv_dim, hidden_dim);
+
+    backend_->unmap_buffer(hidden.buffer());
+    backend_->unmap_buffer(wq->buffer());
+    backend_->unmap_buffer(wk->buffer());
+    backend_->unmap_buffer(wv->buffer());
+
+    // Unmap before RoPE
+    backend_->unmap_buffer(q.buffer());
+    backend_->unmap_buffer(k.buffer());
+    backend_->unmap_buffer(v.buffer());
+
+    // Apply RoPE - all tree nodes get positions starting at start_pos
+    // Since tree nodes are speculative, they all share the same "position" conceptually
+    // But for correct attention, each node gets its own position
+    auto rope_result = rope_cache_.apply(q, k, start_pos, backend_);
+    if (!rope_result.ok()) {
+        GRANITE_LOG_WARN("RoPE failed: {}", rope_result.error().message());
+    }
+
+    // Remap after RoPE
+    map_q = backend_->map_buffer(q.buffer());
+    map_k = backend_->map_buffer(k.buffer());
+    map_v = backend_->map_buffer(v.buffer());
+    q_data = static_cast<float*>(map_q.value());
+    k_data = static_cast<float*>(map_k.value());
+    v_data = static_cast<float*>(map_v.value());
+
+    // Compute attention with tree mask
+    float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    // Total KV sequence = cached + tree nodes
+    int cached_len = kv_cache ? kv_cache->seq_len() : 0;
+    int total_kv = cached_len + num_nodes;
+
+    // Allocate attention output
+    std::vector<int64_t> output_shape = {
+        static_cast<int64_t>(batch),
+        static_cast<int64_t>(num_nodes),
+        static_cast<int64_t>(hidden_dim)
+    };
+    auto output_result = Tensor::allocate(output_shape, DataType::FP32, backend_);
+    if (!output_result.ok()) {
+        return output_result.error();
+    }
+    auto output = std::move(output_result).take();
+
+    auto map_out = backend_->map_buffer(output.buffer());
+    auto map_wo = backend_->map_buffer(wo->buffer());
+
+    if (!map_out.ok() || !map_wo.ok()) {
+        GRANITE_FAIL(ErrorCode::InternalError, "Failed to map output buffers");
+    }
+
+    float* out_data = static_cast<float*>(map_out.value());
+    const uint16_t* wo_data = static_cast<const uint16_t*>(map_wo.value());
+
+    // Get cached K, V if available
+    const float* k_cached = nullptr;
+    const float* v_cached = nullptr;
+    std::vector<float> k_cache_buf, v_cache_buf;
+
+    if (kv_cache && cached_len > 0) {
+        auto [cached_k, cached_v] = kv_cache->get(layer);
+        auto map_ck = backend_->map_buffer(cached_k.buffer());
+        auto map_cv = backend_->map_buffer(cached_v.buffer());
+
+        if (map_ck.ok() && map_cv.ok()) {
+            const uint16_t* ck = static_cast<const uint16_t*>(map_ck.value());
+            const uint16_t* cv = static_cast<const uint16_t*>(map_cv.value());
+
+            k_cache_buf.resize(cached_len * num_kv_heads * head_dim);
+            v_cache_buf.resize(cached_len * num_kv_heads * head_dim);
+
+            // [1, num_kv_heads, cached_len, head_dim] -> [cached_len, num_kv_heads, head_dim]
+            for (int h = 0; h < num_kv_heads; h++) {
+                for (int s = 0; s < cached_len; s++) {
+                    for (int d = 0; d < head_dim; d++) {
+                        int src_idx = h * kv_cache->max_seq_len() * head_dim + s * head_dim + d;
+                        int dst_idx = s * num_kv_heads * head_dim + h * head_dim + d;
+                        k_cache_buf[dst_idx] = fp16_to_fp32(ck[src_idx]);
+                        v_cache_buf[dst_idx] = fp16_to_fp32(cv[src_idx]);
+                    }
+                }
+            }
+
+            backend_->unmap_buffer(cached_k.buffer());
+            backend_->unmap_buffer(cached_v.buffer());
+
+            k_cached = k_cache_buf.data();
+            v_cached = v_cache_buf.data();
+        }
+    }
+
+    // Compute attention for each head
+    int heads_per_kv = num_heads / num_kv_heads;
+    std::vector<float> context(batch * num_nodes * num_heads * head_dim);
+
+    int total_work = batch * num_heads * num_nodes;
+    size_t num_threads = get_num_threads();
+
+    parallel_for(static_cast<size_t>(total_work), num_threads, [&](size_t work_idx_u) {
+        int work_idx = static_cast<int>(work_idx_u);
+        int b = work_idx / (num_heads * num_nodes);
+        int rem = work_idx % (num_heads * num_nodes);
+        int h = rem / num_nodes;
+        int q_node = rem % num_nodes;  // Query's tree node index
+
+        int kv_h = h / heads_per_kv;
+
+        // Thread-local scores buffer
+        std::vector<float> scores(total_kv);
+        const float* q_vec = q_data + (b * num_nodes + q_node) * num_heads * head_dim + h * head_dim;
+
+        // Compute attention scores
+        // 1. Attend to cached positions (all tree nodes can attend to full cache)
+        for (int k_pos = 0; k_pos < cached_len; k_pos++) {
+            const float* k_vec = k_cached + k_pos * num_kv_heads * head_dim + kv_h * head_dim;
+            float dot = 0;
+            for (int d = 0; d < head_dim; d++) {
+                dot += q_vec[d] * k_vec[d];
+            }
+            scores[k_pos] = dot * scale;
+        }
+
+        // 2. Attend to tree nodes (use tree_mask)
+        for (int k_node = 0; k_node < num_nodes; k_node++) {
+            int k_pos_in_total = cached_len + k_node;
+
+            // Check tree_mask: can q_node attend to k_node?
+            if (tree_mask[q_node][k_node]) {
+                const float* k_vec = k_data + (b * num_nodes + k_node) * num_kv_heads * head_dim + kv_h * head_dim;
+                float dot = 0;
+                for (int d = 0; d < head_dim; d++) {
+                    dot += q_vec[d] * k_vec[d];
+                }
+                scores[k_pos_in_total] = dot * scale;
+            } else {
+                scores[k_pos_in_total] = -std::numeric_limits<float>::infinity();
+            }
+        }
+
+        // Softmax
+        float max_score = *std::max_element(scores.begin(), scores.begin() + total_kv);
+        float sum = 0;
+        for (int i = 0; i < total_kv; i++) {
+            scores[i] = std::exp(scores[i] - max_score);
+            sum += scores[i];
+        }
+        float inv_sum = 1.0f / sum;
+        for (int i = 0; i < total_kv; i++) {
+            scores[i] *= inv_sum;
+        }
+
+        // Weighted sum of values
+        float* ctx = context.data() + (b * num_nodes + q_node) * num_heads * head_dim + h * head_dim;
+        std::fill(ctx, ctx + head_dim, 0.0f);
+
+        // From cached values
+        for (int v_pos = 0; v_pos < cached_len; v_pos++) {
+            const float* v_vec = v_cached + v_pos * num_kv_heads * head_dim + kv_h * head_dim;
+            float w = scores[v_pos];
+            for (int d = 0; d < head_dim; d++) {
+                ctx[d] += w * v_vec[d];
+            }
+        }
+
+        // From tree values
+        for (int v_node = 0; v_node < num_nodes; v_node++) {
+            int v_pos_in_total = cached_len + v_node;
+            const float* v_vec = v_data + (b * num_nodes + v_node) * num_kv_heads * head_dim + kv_h * head_dim;
+            float w = scores[v_pos_in_total];
+            for (int d = 0; d < head_dim; d++) {
+                ctx[d] += w * v_vec[d];
+            }
+        }
+    });  // End parallel_for
+
+    backend_->unmap_buffer(q.buffer());
+    backend_->unmap_buffer(k.buffer());
+    backend_->unmap_buffer(v.buffer());
+
+    // Output projection
+    int attn_out_dim = num_heads * head_dim;
+    matmul_transb_fp16(context.data(), wo_data, out_data, num_nodes, hidden_dim, attn_out_dim);
 
     backend_->unmap_buffer(output.buffer());
     backend_->unmap_buffer(wo->buffer());

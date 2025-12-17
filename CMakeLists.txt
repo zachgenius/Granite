@@ -67,11 +67,14 @@ set(GRANITE_MODEL_SOURCES
 set(GRANITE_LLM_SOURCES
     src/llm/math_ops.cpp
     src/llm/kv_cache.cpp
+    src/llm/kv_cache_pool.cpp
     src/llm/rope.cpp
     src/llm/tokenizer.cpp
     src/llm/model_config.cpp
     src/llm/runner.cpp
     src/llm/speculative_runner.cpp
+    src/llm/speculation_tree.cpp
+    src/llm/batch_scheduler.cpp
 )
 
 # TransformerModel uses Metal - compile as .mm on Apple

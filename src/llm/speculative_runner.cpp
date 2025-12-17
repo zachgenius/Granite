@@ -466,4 +466,335 @@ int32_t SpeculativeRunner::argmax(const Tensor& logits) {
     return best_idx;
 }
 
+// =============================================================================
+// Tree-based Speculative Decoding
+// =============================================================================
+
+void SpeculativeRunner::build_tree(
+    SpeculationTree& tree,
+    int32_t root_token,
+    int width,
+    int depth)
+{
+    tree.clear();
+
+    // Add root node
+    int root_idx = tree.add_node(root_token, -1);
+
+    // BFS to build tree layer by layer
+    std::vector<int> current_level = {root_idx};
+    int current_depth = 0;
+    int draft_start_pos = draft_kv_cache_.seq_len();
+
+    while (current_depth < depth && !current_level.empty()) {
+        std::vector<int> next_level;
+
+        for (int parent_idx : current_level) {
+            int32_t parent_token = tree.get_node(parent_idx)->token;
+
+            // Get logits from draft model for this token
+            auto logits_result = draft_model_.forward_single(parent_token, draft_kv_cache_);
+            if (!logits_result.ok()) {
+                continue;
+            }
+
+            // Get top-k tokens from draft logits
+            auto top_k = get_top_k(logits_result.value(), width);
+
+            // Add children to tree
+            for (const auto& [token, log_prob] : top_k) {
+                int child_idx = tree.add_node(token, parent_idx, log_prob);
+                next_level.push_back(child_idx);
+            }
+        }
+
+        current_level = std::move(next_level);
+        current_depth++;
+
+        // Limit tree size to avoid explosion
+        if (tree.size() > 64) {
+            break;
+        }
+    }
+
+    GRANITE_LOG_DEBUG("Built speculation tree: {} nodes, max depth {}", tree.size(), depth);
+}
+
+std::vector<int32_t> SpeculativeRunner::verify_tree(
+    SpeculationTree& tree,
+    int32_t last_accepted_token)
+{
+    if (tree.size() == 0) {
+        return {};
+    }
+
+    // First, add the last accepted token to target KV cache
+    auto first_logits_result = target_model_.forward_single(last_accepted_token, target_kv_cache_);
+    if (!first_logits_result.ok()) {
+        return {};
+    }
+
+    // Get target's prediction for first tree position
+    int32_t first_target_choice = argmax(first_logits_result.value());
+
+    // Get flattened tree tokens and parent indices for tree attention
+    auto tree_tokens = tree.flatten_tokens();
+    auto parent_indices = tree.get_parent_indices();
+
+    // Verify root token first
+    if (tree.get_node(0)->token != first_target_choice) {
+        // Root doesn't match - return target's choice
+        return {first_target_choice};
+    }
+
+    // Forward all tree nodes through target with tree attention
+    int target_start_pos = target_kv_cache_.seq_len();
+    auto tree_logits_result = target_model_.forward_tree(
+        tree_tokens, parent_indices, &target_kv_cache_, target_start_pos);
+
+    if (!tree_logits_result.ok()) {
+        // Fallback to just the first token
+        return {first_target_choice};
+    }
+
+    auto tree_logits = std::move(tree_logits_result).take();
+
+    // Get target's choices for each tree position
+    auto map_result = target_backend_->map_buffer(tree_logits.buffer());
+    if (!map_result.ok()) {
+        return {first_target_choice};
+    }
+
+    const float* logits_data = static_cast<const float*>(map_result.value());
+    int vocab_size = static_cast<int>(tree_logits.size(2));
+    int num_nodes = static_cast<int>(tree_tokens.size());
+
+    // Get argmax for each position
+    std::vector<int32_t> target_choices(num_nodes);
+    for (int i = 0; i < num_nodes; i++) {
+        const float* pos_logits = logits_data + i * vocab_size;
+        int32_t best_idx = 0;
+        float best_val = pos_logits[0];
+        for (int v = 1; v < vocab_size; v++) {
+            if (pos_logits[v] > best_val) {
+                best_val = pos_logits[v];
+                best_idx = v;
+            }
+        }
+        target_choices[i] = best_idx;
+    }
+
+    target_backend_->unmap_buffer(tree_logits.buffer());
+
+    // Find longest accepted path
+    auto accepted_path = tree.find_accepted_path(target_choices);
+
+    // The first token was already verified, include the root
+    std::vector<int32_t> result;
+    result.push_back(first_target_choice);  // Root token
+
+    // Add tokens from the accepted path (skipping root if it matches)
+    for (size_t i = 0; i < accepted_path.size(); i++) {
+        if (i == 0 && accepted_path[i] == first_target_choice) {
+            continue;  // Skip duplicate root
+        }
+        result.push_back(accepted_path[i]);
+    }
+
+    // If we accepted everything, add a bonus token
+    if (result.size() > static_cast<size_t>(tree.max_depth())) {
+        // Find the last accepted position and get target's next choice
+        // This is already included via find_accepted_path's mismatch handling
+    }
+
+    return result;
+}
+
+std::vector<std::pair<int32_t, float>> SpeculativeRunner::get_top_k(
+    const Tensor& logits,
+    int k)
+{
+    auto map_result = draft_backend_->map_buffer(logits.buffer());
+    if (!map_result.ok()) {
+        return {};
+    }
+
+    const float* data = static_cast<const float*>(map_result.value());
+    int seq_len = static_cast<int>(logits.size(1));
+    int vocab_size = static_cast<int>(logits.size(2));
+
+    // Get logits for last position
+    const float* last_logits = data + (seq_len - 1) * vocab_size;
+
+    // Find top-k tokens
+    std::vector<std::pair<float, int32_t>> scores;
+    scores.reserve(vocab_size);
+    for (int i = 0; i < vocab_size; i++) {
+        scores.emplace_back(last_logits[i], i);
+    }
+
+    // Partial sort to get top-k
+    std::partial_sort(scores.begin(), scores.begin() + k, scores.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    draft_backend_->unmap_buffer(logits.buffer());
+
+    // Return top-k as (token, log_prob) pairs
+    std::vector<std::pair<int32_t, float>> result;
+    result.reserve(k);
+    for (int i = 0; i < k && i < static_cast<int>(scores.size()); i++) {
+        result.emplace_back(scores[i].second, scores[i].first);
+    }
+
+    return result;
+}
+
+Result<void> SpeculativeRunner::generate_streaming_tree(
+    const std::string& prompt,
+    const GenerationConfig& config,
+    TokenCallback callback,
+    const SpeculativeConfig& spec_config)
+{
+    cancelled_ = false;
+    stats_ = Stats{};
+
+    if (!tokenizer_.is_loaded()) {
+        GRANITE_FAIL(ErrorCode::InvalidState, "Tokenizer not loaded");
+    }
+
+    // Tokenize prompt
+    auto prompt_tokens = tokenizer_.encode(prompt, true);
+    GRANITE_LOG_DEBUG("Prompt tokens: {}", prompt_tokens.size());
+
+    // Clear KV caches
+    target_kv_cache_.clear();
+    draft_kv_cache_.clear();
+
+    // Create token tensor for prefill
+    std::vector<int64_t> prompt_shape = {1, static_cast<int64_t>(prompt_tokens.size())};
+
+    auto target_ids_result = Tensor::allocate(prompt_shape, DataType::INT32, target_backend_.get());
+    auto draft_ids_result = Tensor::allocate(prompt_shape, DataType::INT32, draft_backend_.get());
+
+    if (!target_ids_result.ok() || !draft_ids_result.ok()) {
+        GRANITE_FAIL(ErrorCode::InternalError, "Failed to allocate prompt tensors");
+    }
+
+    auto target_ids = std::move(target_ids_result).take();
+    auto draft_ids = std::move(draft_ids_result).take();
+
+    // Copy tokens
+    auto map_target = target_backend_->map_buffer(target_ids.buffer());
+    auto map_draft = draft_backend_->map_buffer(draft_ids.buffer());
+
+    if (map_target.ok() && map_draft.ok()) {
+        auto* target_ptr = static_cast<int32_t*>(map_target.value());
+        auto* draft_ptr = static_cast<int32_t*>(map_draft.value());
+        std::copy(prompt_tokens.begin(), prompt_tokens.end(), target_ptr);
+        std::copy(prompt_tokens.begin(), prompt_tokens.end(), draft_ptr);
+        target_backend_->unmap_buffer(target_ids.buffer());
+        draft_backend_->unmap_buffer(draft_ids.buffer());
+    }
+
+    // Prefill both models
+    auto target_logits_result = target_model_.forward(target_ids, &target_kv_cache_, 0);
+    if (!target_logits_result.ok()) {
+        return target_logits_result.error();
+    }
+    auto target_logits = std::move(target_logits_result).take();
+
+    auto draft_logits_result = draft_model_.forward(draft_ids, &draft_kv_cache_, 0);
+    if (!draft_logits_result.ok()) {
+        return draft_logits_result.error();
+    }
+
+    // Sample first token
+    int32_t last_token = argmax(target_logits);
+
+    if (last_token == tokenizer_.eos_token()) {
+        return {};
+    }
+
+    std::string token_str = tokenizer_.decode_token(last_token);
+    if (!callback(token_str)) {
+        return {};
+    }
+
+    // Tree speculative decoding loop
+    int width = spec_config.tree_width;
+    int depth = spec_config.tree_depth;
+    int generated = 1;
+
+    SpeculationTree tree;
+
+    while (generated < config.max_tokens && !cancelled_) {
+        // 1. Build speculation tree from draft model
+        build_tree(tree, last_token, width, depth);
+        stats_.total_draft_tokens += tree.size();
+
+        // 2. Verify tree with target model
+        auto accepted = verify_tree(tree, last_token);
+        stats_.total_target_forwards++;
+        stats_.total_accepted_tokens += static_cast<int>(accepted.size());
+
+        // 3. Output accepted tokens
+        bool should_stop = false;
+        for (size_t i = 0; i < accepted.size(); i++) {
+            int32_t token = accepted[i];
+
+            if (token == tokenizer_.eos_token()) {
+                should_stop = true;
+                break;
+            }
+
+            if (std::find(config.stop_tokens.begin(), config.stop_tokens.end(),
+                          token) != config.stop_tokens.end()) {
+                should_stop = true;
+                break;
+            }
+
+            token_str = tokenizer_.decode_token(token);
+            if (!callback(token_str)) {
+                should_stop = true;
+                break;
+            }
+
+            generated++;
+            if (generated >= config.max_tokens) {
+                should_stop = true;
+                break;
+            }
+        }
+
+        if (should_stop || accepted.empty()) {
+            break;
+        }
+
+        // Update last token
+        last_token = accepted.back();
+
+        // 4. Sync KV caches
+        // For tree verification, we need to truncate to accepted path length
+        int tree_size = tree.size();
+        int accepted_depth = static_cast<int>(accepted.size());
+
+        // Target: added 1 + tree_size tokens, keep accepted_depth
+        int target_original = target_kv_cache_.seq_len() - 1 - tree_size;
+        target_kv_cache_.truncate(target_original + accepted_depth);
+
+        // Draft: need to rebuild from accepted position
+        // For simplicity, truncate to match target
+        int draft_original = draft_kv_cache_.seq_len() - tree_size;
+        draft_kv_cache_.truncate(draft_original + accepted_depth - 1);
+
+        tree.clear();
+    }
+
+    GRANITE_LOG_INFO("Tree speculative decoding stats: {} drafted, {} accepted ({:.1f}%), {} target forwards",
+                     stats_.total_draft_tokens, stats_.total_accepted_tokens,
+                     stats_.acceptance_rate() * 100.0f, stats_.total_target_forwards);
+
+    return {};
+}
+
 }  // namespace granite
