@@ -67,7 +67,7 @@ Result<TransformerModel> TransformerModel::load(
         if (info.type != GGMLType::Q4_K && info.type != GGMLType::Q6_K &&
             info.type != GGMLType::Q5_K && info.type != GGMLType::Q8_0 &&
             info.type != GGMLType::Q4_0 && info.type != GGMLType::IQ4_NL &&
-            info.type != GGMLType::IQ4_XS) {
+            info.type != GGMLType::IQ4_XS && info.type != GGMLType::IQ3_S) {
             continue;
         }
 
@@ -667,7 +667,7 @@ Result<Tensor> TransformerModel::transformer_block(
                 const RawWeight* w_up = get_raw_weight(prefix + "ffn_up.weight");
                 const RawWeight* w_down = get_raw_weight(prefix + "ffn_down.weight");
 
-                // Check if we can use fused kernels (need Q4_K/Q6_K/Q5_K/Q8_0/Q4_0/IQ4_NL/IQ4_XS weights and FP16 norm)
+                // Check if we can use fused kernels (need Q4_K/Q6_K/Q5_K/Q8_0/Q4_0/IQ4_NL/IQ4_XS/IQ3_S weights and FP16 norm)
                 bool can_fuse = w_gate && w_up && w_down &&
                                (w_gate->quant_type == GGMLType::Q4_K ||
                                 w_gate->quant_type == GGMLType::Q6_K ||
@@ -675,7 +675,8 @@ Result<Tensor> TransformerModel::transformer_block(
                                 w_gate->quant_type == GGMLType::Q8_0 ||
                                 w_gate->quant_type == GGMLType::Q4_0 ||
                                 w_gate->quant_type == GGMLType::IQ4_NL ||
-                                w_gate->quant_type == GGMLType::IQ4_XS) &&
+                                w_gate->quant_type == GGMLType::IQ4_XS ||
+                                w_gate->quant_type == GGMLType::IQ3_S) &&
                                ffn_norm_weight->dtype() == DataType::FP16;
                 GGMLType fused_qtype = can_fuse ? w_gate->quant_type : GGMLType::F32;
 
@@ -734,6 +735,11 @@ Result<Tensor> TransformerModel::transformer_block(
                                                 hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
                         gpu->rms_norm_matvec_iq4_xs(post_attn_buf, ffn_norm_buf, wu_buf, up_buf,
                                                 hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                    } else if (fused_qtype == GGMLType::IQ3_S) {
+                        gpu->rms_norm_matvec_iq3_s(post_attn_buf, ffn_norm_buf, wg_buf, gate_buf,
+                                                hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                        gpu->rms_norm_matvec_iq3_s(post_attn_buf, ffn_norm_buf, wu_buf, up_buf,
+                                                hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
                     } else if (fused_qtype == GGMLType::Q6_K) {
                         gpu->rms_norm_matvec_q6_k(post_attn_buf, ffn_norm_buf, wg_buf, gate_buf,
                                                 hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
@@ -764,6 +770,8 @@ Result<Tensor> TransformerModel::transformer_block(
                         gpu->matvec_iq4_nl(gate_buf, wd_buf, ffn_out_buf, config_.intermediate_dim, hidden_dim);
                     } else if (fused_qtype == GGMLType::IQ4_XS) {
                         gpu->matvec_iq4_xs(gate_buf, wd_buf, ffn_out_buf, config_.intermediate_dim, hidden_dim);
+                    } else if (fused_qtype == GGMLType::IQ3_S) {
+                        gpu->matvec_iq3_s(gate_buf, wd_buf, ffn_out_buf, config_.intermediate_dim, hidden_dim);
                     } else if (fused_qtype == GGMLType::Q6_K) {
                         gpu->matvec_q6_k(gate_buf, wd_buf, ffn_out_buf, config_.intermediate_dim, hidden_dim);
                     } else if (fused_qtype == GGMLType::Q5_K) {
@@ -1299,11 +1307,11 @@ Result<Tensor> TransformerModel::feed_forward_gpu(const Tensor& hidden, int laye
         return feed_forward(hidden, layer);
     }
 
-    // Support Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, IQ4_NL, and IQ4_XS
+    // Support Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, IQ4_NL, IQ4_XS, and IQ3_S
     GGMLType qtype = w_gate->quant_type;
     if (qtype != GGMLType::Q4_K && qtype != GGMLType::Q5_K && qtype != GGMLType::Q6_K &&
         qtype != GGMLType::Q8_0 && qtype != GGMLType::Q4_0 && qtype != GGMLType::IQ4_NL &&
-        qtype != GGMLType::IQ4_XS) {
+        qtype != GGMLType::IQ4_XS && qtype != GGMLType::IQ3_S) {
         return feed_forward(hidden, layer);
     }
 
@@ -1394,6 +1402,11 @@ Result<Tensor> TransformerModel::feed_forward_gpu(const Tensor& hidden, int laye
             gpu->matvec_iq4_xs(h_buf, wu_buf, up_buf, hidden_dim, intermediate_dim);
             gpu->silu_mul(gate_buf, up_buf, gate_buf, intermediate_dim);
             gpu->matvec_iq4_xs(gate_buf, wd_buf, o_buf, intermediate_dim, hidden_dim);
+        } else if (qtype == GGMLType::IQ3_S) {
+            gpu->matvec_iq3_s(h_buf, wg_buf, gate_buf, hidden_dim, intermediate_dim);
+            gpu->matvec_iq3_s(h_buf, wu_buf, up_buf, hidden_dim, intermediate_dim);
+            gpu->silu_mul(gate_buf, up_buf, gate_buf, intermediate_dim);
+            gpu->matvec_iq3_s(gate_buf, wd_buf, o_buf, intermediate_dim, hidden_dim);
         } else if (qtype == GGMLType::Q6_K) {
             gpu->matvec_q6_k(h_buf, wg_buf, gate_buf, hidden_dim, intermediate_dim);
             gpu->matvec_q6_k(h_buf, wu_buf, up_buf, hidden_dim, intermediate_dim);
@@ -1433,6 +1446,11 @@ Result<Tensor> TransformerModel::feed_forward_gpu(const Tensor& hidden, int laye
             gpu->matmul_iq4_xs(h_buf, wu_buf, up_buf, total_tokens, hidden_dim, intermediate_dim);
             gpu->silu_mul(gate_buf, up_buf, gate_buf, total_tokens * intermediate_dim);
             gpu->matmul_iq4_xs(gate_buf, wd_buf, o_buf, total_tokens, intermediate_dim, hidden_dim);
+        } else if (qtype == GGMLType::IQ3_S) {
+            gpu->matmul_iq3_s(h_buf, wg_buf, gate_buf, total_tokens, hidden_dim, intermediate_dim);
+            gpu->matmul_iq3_s(h_buf, wu_buf, up_buf, total_tokens, hidden_dim, intermediate_dim);
+            gpu->silu_mul(gate_buf, up_buf, gate_buf, total_tokens * intermediate_dim);
+            gpu->matmul_iq3_s(gate_buf, wd_buf, o_buf, total_tokens, intermediate_dim, hidden_dim);
         } else if (qtype == GGMLType::Q6_K) {
             gpu->matmul_q6_k(h_buf, wg_buf, gate_buf, total_tokens, hidden_dim, intermediate_dim);
             gpu->matmul_q6_k(h_buf, wu_buf, up_buf, total_tokens, hidden_dim, intermediate_dim);
@@ -1754,6 +1772,10 @@ Result<Tensor> TransformerModel::attention_full_gpu(
         gpu->matvec_iq4_xs(h_buf, wq_buf, q_buf, hidden_dim, q_dim);
         gpu->matvec_iq4_xs(h_buf, wk_buf, k_buf, hidden_dim, kv_dim);
         gpu->matvec_iq4_xs(h_buf, wv_buf, v_buf, hidden_dim, kv_dim);
+    } else if (attn_qtype == GGMLType::IQ3_S) {
+        gpu->matvec_iq3_s(h_buf, wq_buf, q_buf, hidden_dim, q_dim);
+        gpu->matvec_iq3_s(h_buf, wk_buf, k_buf, hidden_dim, kv_dim);
+        gpu->matvec_iq3_s(h_buf, wv_buf, v_buf, hidden_dim, kv_dim);
     } else if (attn_qtype == GGMLType::Q6_K) {
         gpu->matvec_q6_k(h_buf, wq_buf, q_buf, hidden_dim, q_dim);
         gpu->matvec_q6_k(h_buf, wk_buf, k_buf, hidden_dim, kv_dim);
@@ -1805,6 +1827,8 @@ Result<Tensor> TransformerModel::attention_full_gpu(
         gpu->matvec_iq4_nl(attn_out_buf, wo_buf, o_buf, q_dim, hidden_dim);
     } else if (attn_qtype == GGMLType::IQ4_XS) {
         gpu->matvec_iq4_xs(attn_out_buf, wo_buf, o_buf, q_dim, hidden_dim);
+    } else if (attn_qtype == GGMLType::IQ3_S) {
+        gpu->matvec_iq3_s(attn_out_buf, wo_buf, o_buf, q_dim, hidden_dim);
     } else if (attn_qtype == GGMLType::Q6_K) {
         gpu->matvec_q6_k(attn_out_buf, wo_buf, o_buf, q_dim, hidden_dim);
     } else if (attn_qtype == GGMLType::Q5_K) {
@@ -1904,7 +1928,7 @@ Result<Tensor> TransformerModel::attention_gpu(
                 (raw_wq->quant_type == GGMLType::Q4_K || raw_wq->quant_type == GGMLType::Q5_K ||
                  raw_wq->quant_type == GGMLType::Q6_K || raw_wq->quant_type == GGMLType::Q8_0 ||
                  raw_wq->quant_type == GGMLType::Q4_0 || raw_wq->quant_type == GGMLType::IQ4_NL ||
-                 raw_wq->quant_type == GGMLType::IQ4_XS)) {
+                 raw_wq->quant_type == GGMLType::IQ4_XS || raw_wq->quant_type == GGMLType::IQ3_S)) {
 
                 GGMLType prefill_qtype = raw_wq->quant_type;
                 int hidden_dim = config_.hidden_dim;
@@ -1951,6 +1975,10 @@ Result<Tensor> TransformerModel::attention_gpu(
                         gpu->matmul_iq4_xs(h_buf, wq_buf, q_buf, total_tokens, hidden_dim, q_dim);
                         gpu->matmul_iq4_xs(h_buf, wk_buf, k_buf, total_tokens, hidden_dim, kv_dim);
                         gpu->matmul_iq4_xs(h_buf, wv_buf, v_buf, total_tokens, hidden_dim, kv_dim);
+                    } else if (prefill_qtype == GGMLType::IQ3_S) {
+                        gpu->matmul_iq3_s(h_buf, wq_buf, q_buf, total_tokens, hidden_dim, q_dim);
+                        gpu->matmul_iq3_s(h_buf, wk_buf, k_buf, total_tokens, hidden_dim, kv_dim);
+                        gpu->matmul_iq3_s(h_buf, wv_buf, v_buf, total_tokens, hidden_dim, kv_dim);
                     } else if (prefill_qtype == GGMLType::Q6_K) {
                         gpu->matmul_q6_k(h_buf, wq_buf, q_buf, total_tokens, hidden_dim, q_dim);
                         gpu->matmul_q6_k(h_buf, wk_buf, k_buf, total_tokens, hidden_dim, kv_dim);
@@ -2009,6 +2037,8 @@ Result<Tensor> TransformerModel::attention_gpu(
                             gpu->matmul_iq4_nl(attn_out_buf, wo_buf, o_buf, total_tokens, q_dim, hidden_dim);
                         } else if (prefill_qtype == GGMLType::IQ4_XS) {
                             gpu->matmul_iq4_xs(attn_out_buf, wo_buf, o_buf, total_tokens, q_dim, hidden_dim);
+                        } else if (prefill_qtype == GGMLType::IQ3_S) {
+                            gpu->matmul_iq3_s(attn_out_buf, wo_buf, o_buf, total_tokens, q_dim, hidden_dim);
                         } else if (prefill_qtype == GGMLType::Q6_K) {
                             gpu->matmul_q6_k(attn_out_buf, wo_buf, o_buf, total_tokens, q_dim, hidden_dim);
                         } else if (prefill_qtype == GGMLType::Q5_K) {
