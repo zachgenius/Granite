@@ -98,13 +98,22 @@ int main(int argc, char* argv[]) {
     auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(load_end - load_start).count();
     GRANITE_LOG_INFO("Model loaded in {} ms", load_ms);
 
-    // Allocate KV cache
+    // Allocate KV cache (CPU)
     auto cache_result = granite::KVCache::allocate(config, 512, backend.get());
     if (!cache_result.ok()) {
         GRANITE_LOG_ERROR("Failed to allocate KV cache: {}", cache_result.error().message());
         return 1;
     }
     auto kv_cache = std::move(cache_result).take();
+
+#ifdef GRANITE_HAS_METAL
+    // Allocate GPU KV cache for faster decode
+    auto gpu_cache_result = model.allocate_gpu_kv_cache(512);
+    if (!gpu_cache_result.ok()) {
+        GRANITE_LOG_WARN("Failed to allocate GPU KV cache: {}", gpu_cache_result.error().message());
+        // Continue without GPU KV cache - will use CPU path
+    }
+#endif
 
     // Debug: Check actual weight shapes and sample values
     GRANITE_LOG_INFO("Checking loaded weights:");

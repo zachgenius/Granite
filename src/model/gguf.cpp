@@ -33,6 +33,7 @@ const char* ggml_type_name(GGMLType type) {
         case GGMLType::Q5_K:    return "Q5_K";
         case GGMLType::Q6_K:    return "Q6_K";
         case GGMLType::Q8_K:    return "Q8_K";
+        case GGMLType::IQ4_NL:  return "IQ4_NL";
         case GGMLType::BF16:    return "BF16";
         case GGMLType::I8:      return "I8";
         case GGMLType::I16:     return "I16";
@@ -75,6 +76,7 @@ size_t ggml_type_block_size(GGMLType type) {
         case GGMLType::Q5_1:
         case GGMLType::Q8_0:
         case GGMLType::Q8_1:
+        case GGMLType::IQ4_NL:
             return 32;
 
         case GGMLType::Q2_K:
@@ -126,6 +128,9 @@ size_t ggml_type_bytes_per_block(GGMLType type) {
         case GGMLType::Q5_K: return 176;
         case GGMLType::Q6_K: return 210;
         case GGMLType::Q8_K: return 292;
+
+        // IQ4_NL: 32 elements, 2 bytes scale + 16 bytes data = 18 bytes
+        case GGMLType::IQ4_NL: return 18;
 
         default:
             return 0;
@@ -1112,6 +1117,41 @@ Result<Tensor> ModelLoader::dequantize_tensor(
                 }
 
                 src += 210;
+            }
+            break;
+        }
+
+        case GGMLType::IQ4_NL: {
+            // IQ4_NL: 32 elements per block, 18 bytes per block
+            // Structure: half d (2 bytes) + uint8_t qs[16] (16 bytes)
+            // Uses non-linear lookup table for dequantization
+            static const int8_t kvalues_iq4nl[16] = {
+                -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+            };
+
+            const uint8_t* src = static_cast<const uint8_t*>(data);
+            size_t num_blocks = (numel + 31) / 32;
+
+            for (size_t blk = 0; blk < num_blocks; blk++) {
+                uint16_t d_bits;
+                memcpy(&d_bits, src, 2);
+                float d = fp16_to_fp32(d_bits);
+                const uint8_t* qs = src + 2;
+
+                for (int i = 0; i < 16; i++) {
+                    int q0 = qs[i] & 0xF;       // Low 4 bits
+                    int q1 = qs[i] >> 4;        // High 4 bits
+
+                    size_t idx0 = blk * 32 + 2 * i;
+                    size_t idx1 = blk * 32 + 2 * i + 1;
+
+                    if (idx0 < numel)
+                        output[idx0] = fp32_to_fp16(d * static_cast<float>(kvalues_iq4nl[q0]));
+                    if (idx1 < numel)
+                        output[idx1] = fp32_to_fp16(d * static_cast<float>(kvalues_iq4nl[q1]));
+                }
+
+                src += 18;  // Move to next block
             }
             break;
         }
