@@ -1348,6 +1348,79 @@ Result<Tensor> ModelLoader::dequantize_tensor(
             break;
         }
 
+        case GGMLType::Q3_K: {
+            // Q3_K: 256 elements per super-block, 110 bytes per block
+            // Structure (matching GGML's block_q3_K):
+            //   - hmask: 32 bytes (high bit of 3-bit quants)
+            //   - qs: 64 bytes (low 2 bits of 3-bit quants)
+            //   - scales: 12 bytes (6-bit scales, packed)
+            //   - d: fp16 scale (2 bytes)
+            const uint8_t* src = static_cast<const uint8_t*>(data);
+            size_t num_blocks = (numel + 255) / 256;
+
+            const uint32_t kmask1 = 0x03030303;
+            const uint32_t kmask2 = 0x0f0f0f0f;
+
+            for (size_t b = 0; b < num_blocks; b++) {
+                const uint8_t* hmask = src;           // 32 bytes
+                const uint8_t* qs = src + 32;         // 64 bytes
+                const uint8_t* scales_raw = src + 96; // 12 bytes
+                uint16_t d_bits;
+                memcpy(&d_bits, src + 108, 2);
+                float d_all = fp16_to_fp32(d_bits);
+
+                // Unpack 16 6-bit scales from 12 bytes (matches llama.cpp)
+                uint32_t aux[4];
+                memcpy(aux, scales_raw, 12);
+                uint32_t tmp = aux[2];
+                aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+                aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+                aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+                aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+                const int8_t* scales = reinterpret_cast<const int8_t*>(aux);
+
+                const uint8_t* q = qs;
+                const uint8_t* hm = hmask;
+                uint8_t m = 1;
+                int is = 0;
+
+                // Process 256 elements in two passes of 128
+                for (int n = 0; n < 256; n += 128) {
+                    int shift = 0;
+                    for (int j = 0; j < 4; ++j) {
+                        float dl = d_all * (scales[is++] - 32);
+
+                        // First 16 elements
+                        for (int l = 0; l < 16; ++l) {
+                            size_t idx = b * 256 + n + j * 32 + l;
+                            if (idx < numel) {
+                                int8_t q3 = ((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4);
+                                output[idx] = fp32_to_fp16(dl * static_cast<float>(q3));
+                            }
+                        }
+
+                        dl = d_all * (scales[is++] - 32);
+
+                        // Next 16 elements
+                        for (int l = 0; l < 16; ++l) {
+                            size_t idx = b * 256 + n + j * 32 + 16 + l;
+                            if (idx < numel) {
+                                int8_t q3 = ((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4);
+                                output[idx] = fp32_to_fp16(dl * static_cast<float>(q3));
+                            }
+                        }
+
+                        shift += 2;
+                        m <<= 1;
+                    }
+                    q += 32;
+                }
+
+                src += 110;  // Move to next block
+            }
+            break;
+        }
+
         default:
             backend_->unmap_buffer(tensor.buffer());
             GRANITE_FAIL(ErrorCode::NotImplemented,
