@@ -34,6 +34,10 @@
 #include "granite/metal_compute.h"
 #endif
 
+#ifdef GRANITE_HAS_COREML
+#include "granite/coreml_attention.h"
+#endif
+
 namespace granite {
 
 // Thread-local RNG for sampling (defined in runner.cpp)

@@ -154,6 +154,32 @@ if(APPLE AND GRANITE_BUILD_METAL)
 endif()
 
 # =============================================================================
+# CoreML/MPSGraph Backend (Apple only, for ANE acceleration)
+# =============================================================================
+
+option(GRANITE_BUILD_COREML "Build CoreML backend for ANE (Apple only)" ON)
+
+if(APPLE AND GRANITE_BUILD_COREML AND GRANITE_BUILD_METAL)
+    set(GRANITE_COREML_SOURCES
+        src/backend/coreml/coreml_attention.mm
+    )
+
+    target_sources(granite PRIVATE ${GRANITE_COREML_SOURCES})
+
+    target_link_libraries(granite
+        PRIVATE
+            "-framework MetalPerformanceShadersGraph"
+    )
+
+    target_compile_definitions(granite PUBLIC GRANITE_HAS_COREML=1)
+
+    # Enable ARC for CoreML Objective-C++ files
+    set_source_files_properties(${GRANITE_COREML_SOURCES} PROPERTIES
+        COMPILE_FLAGS "-fobjc-arc"
+    )
+endif()
+
+# =============================================================================
 # CPU Backend
 # =============================================================================
 

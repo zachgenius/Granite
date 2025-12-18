@@ -404,6 +404,10 @@ public:
     void set_use_gpu(bool use_gpu) { use_gpu_ = use_gpu; }
     [[nodiscard]] bool use_gpu() const { return use_gpu_; }
 
+    /// Enable/disable CoreML/ANE acceleration for attention
+    void set_use_coreml(bool use_coreml) { use_coreml_ = use_coreml; }
+    [[nodiscard]] bool use_coreml() const { return use_coreml_; }
+
     /// Get raw weight by name (for GPU path)
     [[nodiscard]] const RawWeight* get_raw_weight(const std::string& name) const;
 
@@ -431,6 +435,7 @@ private:
     IComputeBackend* backend_ = nullptr;
     std::unique_ptr<GGUFFile> gguf_;
     bool use_gpu_ = false;
+    bool use_coreml_ = false;  // Use CoreML/ANE for attention
 
 #ifdef GRANITE_HAS_METAL
     std::unique_ptr<GPUKVCache> gpu_kv_cache_;
