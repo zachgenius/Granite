@@ -4,6 +4,7 @@
 #include "granite/error.h"
 #include "granite/tensor.h"
 #include "granite/backend.h"
+#include "granite/config.h"
 #include "granite/gguf.h"
 
 #include <string>
@@ -348,8 +349,18 @@ public:
         const std::string& path,
         IComputeBackend* backend);
 
+    /// Load model from GGUF file with runtime configuration
+    /// Config controls attention backend selection, memory limits, etc.
+    [[nodiscard]] static Result<TransformerModel> load(
+        const std::string& path,
+        IComputeBackend* backend,
+        const Config& config);
+
     /// Get model config
-    [[nodiscard]] const ModelConfig& config() const { return config_; }
+    [[nodiscard]] const ModelConfig& config() const { return model_config_; }
+
+    /// Get runtime config
+    [[nodiscard]] const Config& runtime_config() const { return runtime_config_; }
 
     /// Forward pass for prefill (multiple tokens)
     /// Input: token_ids [batch, seq_len]
@@ -412,7 +423,8 @@ public:
 #endif
 
 private:
-    ModelConfig config_;
+    ModelConfig model_config_;
+    Config runtime_config_;  // Runtime configuration (attention backend, memory, etc.)
     std::unordered_map<std::string, Tensor> weights_;
     std::unordered_map<std::string, RawWeight> raw_weights_;  // Raw quantized for GPU
     RoPECache rope_cache_;

@@ -20,6 +20,7 @@
 
 #include "granite/types.h"
 #include "granite/error.h"
+#include "granite/config.h"
 #include "granite/backend.h"
 #include "granite/tensor.h"
 #include "granite/operators.h"

@@ -52,6 +52,7 @@ set(GRANITE_CORE_SOURCES
     src/core/operator_registry.cpp
     src/core/error.cpp
     src/core/backend_factory.cpp
+    src/core/config.cpp
 )
 
 set(GRANITE_GRAPH_SOURCES
@@ -228,6 +229,7 @@ if(GRANITE_BUILD_TESTS)
         tests/test_optimization.cpp
         tests/test_gguf.cpp
         tests/test_llm.cpp
+        tests/test_config.cpp
     )
 
     target_link_libraries(granite_tests

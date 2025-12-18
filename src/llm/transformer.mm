@@ -29,8 +29,18 @@ Result<TransformerModel> TransformerModel::load(
     const std::string& path,
     IComputeBackend* backend)
 {
+    // Load with default balanced config
+    return load(path, backend, Config::Balanced());
+}
+
+Result<TransformerModel> TransformerModel::load(
+    const std::string& path,
+    IComputeBackend* backend,
+    const Config& config)
+{
     TransformerModel model;
     model.backend_ = backend;
+    model.runtime_config_ = config;
 
     // Open GGUF file
     auto gguf_result = GGUFFile::open(path);
@@ -44,13 +54,13 @@ Result<TransformerModel> TransformerModel::load(
     if (!config_result.ok()) {
         return config_result.error();
     }
-    model.config_ = std::move(config_result).take();
+    model.model_config_ = std::move(config_result).take();
 
     // Initialize RoPE cache
     model.rope_cache_.initialize(
-        model.config_.max_seq_len,
-        model.config_.head_dim,
-        model.config_.rope_theta);
+        model.model_config_.max_seq_len,
+        model.model_config_.head_dim,
+        model.model_config_.rope_theta);
 
     // Load weights (dequantized for CPU path)
     ModelLoader loader(backend);
@@ -115,12 +125,28 @@ Result<TransformerModel> TransformerModel::load(
     GRANITE_LOG_INFO("Loaded model: {} weights ({} raw for GPU)",
                      model.weights_.size(), model.raw_weights_.size());
 
-    // Enable GPU if Metal backend and raw weights available
+    // Determine attention backend based on runtime config and device
+    auto device_info = platform::get_device_info();
+    auto selected_backend = platform::select_attention_backend(config, device_info);
+
+    GRANITE_LOG_INFO("Attention backend: {} (requested: {})",
+                     to_string(selected_backend),
+                     to_string(config.attention_backend));
+
+    // Enable GPU based on selected backend
 #ifdef GRANITE_HAS_METAL
-    if (backend->get_type() == BackendType::Metal && !model.raw_weights_.empty()) {
+    if ((selected_backend == AttentionBackend::MetalFlash ||
+         selected_backend == AttentionBackend::MetalLegacy) &&
+        backend->get_type() == BackendType::Metal &&
+        !model.raw_weights_.empty()) {
         model.use_gpu_ = true;
-        GRANITE_LOG_INFO("GPU acceleration enabled");
+        GRANITE_LOG_INFO("GPU acceleration enabled (Metal)");
+    } else if (selected_backend == AttentionBackend::CPU) {
+        model.use_gpu_ = false;
+        GRANITE_LOG_INFO("Using CPU attention backend");
     }
+#else
+    model.use_gpu_ = false;
 #endif
 
     return model;
@@ -158,7 +184,7 @@ Result<Tensor> TransformerModel::embed(const Tensor& token_ids) {
 
     int batch = static_cast<int>(token_ids.size(0));
     int seq_len = static_cast<int>(token_ids.size(1));
-    int hidden_dim = config_.hidden_dim;
+    int hidden_dim = model_config_.hidden_dim;
     int total_tokens = batch * seq_len;
 
     std::vector<int64_t> output_shape = {
@@ -183,7 +209,7 @@ Result<Tensor> TransformerModel::embed(const Tensor& token_ids) {
 
             if (ids_buf && emb_buf && out_buf) {
                 gpu->embedding_lookup(ids_buf, emb_buf, out_buf,
-                                     total_tokens, hidden_dim, config_.vocab_size);
+                                     total_tokens, hidden_dim, model_config_.vocab_size);
                 // No sync needed - will be synced by subsequent operations
                 return output;
             }
@@ -207,7 +233,7 @@ Result<Tensor> TransformerModel::embed(const Tensor& token_ids) {
     // Embedding lookup
     // GGUF stores embedding with ne0=hidden_dim (innermost), ne1=vocab_size
     // This means token embeddings are contiguous: token t's embedding at t * hidden_dim
-    int vocab_size = config_.vocab_size;
+    int vocab_size = model_config_.vocab_size;
     for (int b = 0; b < batch; b++) {
         for (int s = 0; s < seq_len; s++) {
             int token_id = ids[b * seq_len + s];
@@ -271,7 +297,7 @@ Result<Tensor> TransformerModel::forward(
     auto hidden = std::move(hidden_result).take();
 
     // Process through transformer layers
-    for (int layer = 0; layer < config_.num_layers; layer++) {
+    for (int layer = 0; layer < model_config_.num_layers; layer++) {
         auto block_result = transformer_block(hidden, layer, kv_cache, start_pos);
         if (!block_result.ok()) {
             return block_result.error();
@@ -306,11 +332,11 @@ Result<Tensor> TransformerModel::forward(
 
             if (h_buf && norm_buf && out_w_buf) {
                 // Allocate output tensor for normalized hidden
-                std::vector<int64_t> norm_shape = {1, 1, static_cast<int64_t>(config_.hidden_dim)};
+                std::vector<int64_t> norm_shape = {1, 1, static_cast<int64_t>(model_config_.hidden_dim)};
                 auto norm_out_result = Tensor::allocate(norm_shape, DataType::FP32, backend_);
 
                 // Allocate logits tensor
-                std::vector<int64_t> logits_shape = {1, 1, static_cast<int64_t>(config_.vocab_size)};
+                std::vector<int64_t> logits_shape = {1, 1, static_cast<int64_t>(model_config_.vocab_size)};
                 auto logits_result = Tensor::allocate(logits_shape, DataType::FP32, backend_);
 
                 if (norm_out_result.ok() && logits_result.ok()) {
@@ -324,15 +350,15 @@ Result<Tensor> TransformerModel::forward(
                     bool is_f16 = (norm_weight->dtype() == DataType::FP16);
                     if (is_f16) {
                         gpu->rms_norm_f16(h_buf, norm_buf, norm_out_buf,
-                                         config_.hidden_dim, config_.rms_norm_eps);
+                                         model_config_.hidden_dim, model_config_.rms_norm_eps);
                     } else {
                         gpu->rms_norm(h_buf, norm_buf, norm_out_buf,
-                                     config_.hidden_dim, config_.rms_norm_eps);
+                                     model_config_.hidden_dim, model_config_.rms_norm_eps);
                     }
 
                     // GPU Output projection (FP16 weights -> matvec_f16)
                     gpu->matvec_f16(norm_out_buf, out_w_buf, logits_buf,
-                                   config_.hidden_dim, config_.vocab_size);
+                                   model_config_.hidden_dim, model_config_.vocab_size);
 
                     // Sync before returning results
                     gpu->sync();
@@ -355,7 +381,7 @@ Result<Tensor> TransformerModel::forward(
             const void* w = map_w.value();
             DataType w_dtype = norm_weight->dtype();
 
-            int dim = config_.hidden_dim;
+            int dim = model_config_.hidden_dim;
 
             for (int b = 0; b < batch; b++) {
                 for (int s = 0; s < seq_len; s++) {
@@ -366,7 +392,7 @@ Result<Tensor> TransformerModel::forward(
                     for (int d = 0; d < dim; d++) {
                         sum_sq += row[d] * row[d];
                     }
-                    float rms = std::sqrt(sum_sq / dim + config_.rms_norm_eps);
+                    float rms = std::sqrt(sum_sq / dim + model_config_.rms_norm_eps);
                     float inv_rms = 1.0f / rms;
 
                     // Normalize and scale (handle FP32 or FP16 weights)
@@ -387,7 +413,7 @@ Result<Tensor> TransformerModel::forward(
     std::vector<int64_t> logits_shape = {
         static_cast<int64_t>(batch),
         static_cast<int64_t>(seq_len),
-        static_cast<int64_t>(config_.vocab_size)
+        static_cast<int64_t>(model_config_.vocab_size)
     };
     auto logits_result = Tensor::allocate(logits_shape, DataType::FP32, backend_);
     if (!logits_result.ok()) {
@@ -408,8 +434,8 @@ Result<Tensor> TransformerModel::forward(
     const auto* w = static_cast<const uint16_t*>(map_w.value());  // [vocab, hidden]
     auto* l = static_cast<float*>(map_l.value());
 
-    int hidden_dim = config_.hidden_dim;
-    int vocab_size = config_.vocab_size;
+    int hidden_dim = model_config_.hidden_dim;
+    int vocab_size = model_config_.vocab_size;
 
     // Use optimized BLAS matmul: logits = hidden @ output_weight.T
     // Output weight shape: [vocab_size, hidden_dim]
@@ -544,7 +570,7 @@ Result<Tensor> TransformerModel::forward_tree(
     auto hidden = std::move(hidden_result).take();
 
     // Process through transformer layers with tree attention
-    for (int layer = 0; layer < config_.num_layers; layer++) {
+    for (int layer = 0; layer < model_config_.num_layers; layer++) {
         if (use_gpu) {
             // GPU path: use parent_indices directly
             auto block_result = transformer_block_tree_gpu(hidden, layer, kv_cache, start_pos, parent_indices);
@@ -580,8 +606,8 @@ Result<Tensor> TransformerModel::forward_tree(
     // Output projection: logits = hidden @ output.T
     int batch = 1;
     int seq_len = num_nodes;
-    int hidden_dim = config_.hidden_dim;
-    int vocab_size = config_.vocab_size;
+    int hidden_dim = model_config_.hidden_dim;
+    int vocab_size = model_config_.vocab_size;
 
     std::vector<int64_t> logits_shape = {
         static_cast<int64_t>(batch),
@@ -668,7 +694,7 @@ Tensor TransformerModel::apply_rms_norm(const Tensor& input, const Tensor* weigh
             for (int d = 0; d < dim; d++) {
                 sum_sq += row[d] * row[d];
             }
-            float rms = std::sqrt(sum_sq / dim + config_.rms_norm_eps);
+            float rms = std::sqrt(sum_sq / dim + model_config_.rms_norm_eps);
             float inv_rms = 1.0f / rms;
 
             // Normalize and scale
@@ -751,7 +777,7 @@ Result<Tensor> TransformerModel::transformer_block(
 
     int batch = static_cast<int>(hidden.size(0));
     int seq_len = static_cast<int>(hidden.size(1));
-    int hidden_dim = config_.hidden_dim;
+    int hidden_dim = model_config_.hidden_dim;
     int total_tokens = batch * seq_len;
     bool is_decode = (total_tokens == 1);
 
@@ -819,10 +845,10 @@ Result<Tensor> TransformerModel::transformer_block(
                 bool is_f16_weight = (attn_norm_weight->dtype() == DataType::FP16);
                 if (is_f16_weight) {
                     gpu->rms_norm_f16(h_buf, attn_norm_buf, attn_in_buf,
-                                     hidden_dim, config_.rms_norm_eps);
+                                     hidden_dim, model_config_.rms_norm_eps);
                 } else {
                     gpu->rms_norm(h_buf, attn_norm_buf, attn_in_buf,
-                                 hidden_dim, config_.rms_norm_eps);
+                                 hidden_dim, model_config_.rms_norm_eps);
                 }
 
                 // 2. GPU Attention
@@ -876,8 +902,8 @@ Result<Tensor> TransformerModel::transformer_block(
                         gate_buf = static_cast<MTL::Buffer*>(decode_pool_->ffn_gate_buf);
                         up_buf = static_cast<MTL::Buffer*>(decode_pool_->ffn_up_buf);
                     } else {
-                        gate_buf = gpu->create_buffer(config_.intermediate_dim * sizeof(float));
-                        up_buf = gpu->create_buffer(config_.intermediate_dim * sizeof(float));
+                        gate_buf = gpu->create_buffer(model_config_.intermediate_dim * sizeof(float));
+                        up_buf = gpu->create_buffer(model_config_.intermediate_dim * sizeof(float));
                     }
 
                     // Check if residual will be fused (Q4_K/Q3_K/Q2_K use fused down+residual)
@@ -904,88 +930,88 @@ Result<Tensor> TransformerModel::transformer_block(
                     // Fused RMSNorm + gate projection: eliminates intermediate norm buffer
                     if (fused_qtype == GGMLType::Q8_0) {
                         gpu->rms_norm_matvec_q8_0(post_attn_buf, ffn_norm_buf, wg_buf, gate_buf,
-                                                hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                                                hidden_dim, model_config_.intermediate_dim, model_config_.rms_norm_eps);
                         gpu->rms_norm_matvec_q8_0(post_attn_buf, ffn_norm_buf, wu_buf, up_buf,
-                                                hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                                                hidden_dim, model_config_.intermediate_dim, model_config_.rms_norm_eps);
                     } else if (fused_qtype == GGMLType::Q4_0) {
                         gpu->rms_norm_matvec_q4_0(post_attn_buf, ffn_norm_buf, wg_buf, gate_buf,
-                                                hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                                                hidden_dim, model_config_.intermediate_dim, model_config_.rms_norm_eps);
                         gpu->rms_norm_matvec_q4_0(post_attn_buf, ffn_norm_buf, wu_buf, up_buf,
-                                                hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                                                hidden_dim, model_config_.intermediate_dim, model_config_.rms_norm_eps);
                     } else if (fused_qtype == GGMLType::IQ4_NL) {
                         gpu->rms_norm_matvec_iq4_nl(post_attn_buf, ffn_norm_buf, wg_buf, gate_buf,
-                                                hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                                                hidden_dim, model_config_.intermediate_dim, model_config_.rms_norm_eps);
                         gpu->rms_norm_matvec_iq4_nl(post_attn_buf, ffn_norm_buf, wu_buf, up_buf,
-                                                hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                                                hidden_dim, model_config_.intermediate_dim, model_config_.rms_norm_eps);
                     } else if (fused_qtype == GGMLType::IQ4_XS) {
                         gpu->rms_norm_matvec_iq4_xs(post_attn_buf, ffn_norm_buf, wg_buf, gate_buf,
-                                                hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                                                hidden_dim, model_config_.intermediate_dim, model_config_.rms_norm_eps);
                         gpu->rms_norm_matvec_iq4_xs(post_attn_buf, ffn_norm_buf, wu_buf, up_buf,
-                                                hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                                                hidden_dim, model_config_.intermediate_dim, model_config_.rms_norm_eps);
                     } else if (fused_qtype == GGMLType::IQ3_S) {
                         gpu->rms_norm_matvec_iq3_s(post_attn_buf, ffn_norm_buf, wg_buf, gate_buf,
-                                                hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                                                hidden_dim, model_config_.intermediate_dim, model_config_.rms_norm_eps);
                         gpu->rms_norm_matvec_iq3_s(post_attn_buf, ffn_norm_buf, wu_buf, up_buf,
-                                                hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                                                hidden_dim, model_config_.intermediate_dim, model_config_.rms_norm_eps);
                     } else if (fused_qtype == GGMLType::Q6_K) {
                         gpu->rms_norm_matvec_q6_k(post_attn_buf, ffn_norm_buf, wg_buf, gate_buf,
-                                                hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                                                hidden_dim, model_config_.intermediate_dim, model_config_.rms_norm_eps);
                         gpu->rms_norm_matvec_q6_k(post_attn_buf, ffn_norm_buf, wu_buf, up_buf,
-                                                hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                                                hidden_dim, model_config_.intermediate_dim, model_config_.rms_norm_eps);
                     } else if (fused_qtype == GGMLType::Q5_K) {
                         gpu->rms_norm_matvec_q5_k(post_attn_buf, ffn_norm_buf, wg_buf, gate_buf,
-                                                hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                                                hidden_dim, model_config_.intermediate_dim, model_config_.rms_norm_eps);
                         gpu->rms_norm_matvec_q5_k(post_attn_buf, ffn_norm_buf, wu_buf, up_buf,
-                                                hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                                                hidden_dim, model_config_.intermediate_dim, model_config_.rms_norm_eps);
                     } else if (fused_qtype == GGMLType::Q3_K) {
                         // Q3_K - Use Phase 2 fused kernel (RMSNorm computed once!)
                         gpu->rms_norm_dual_matvec_q3k(post_attn_buf, ffn_norm_buf, wg_buf, wu_buf,
                                                      gate_buf, up_buf,
-                                                     hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                                                     hidden_dim, model_config_.intermediate_dim, model_config_.rms_norm_eps);
                     } else if (fused_qtype == GGMLType::Q2_K) {
                         // Q2_K - Use Phase 2 fused kernel (RMSNorm computed once!)
                         gpu->rms_norm_dual_matvec_q2k(post_attn_buf, ffn_norm_buf, wg_buf, wu_buf,
                                                      gate_buf, up_buf,
-                                                     hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                                                     hidden_dim, model_config_.intermediate_dim, model_config_.rms_norm_eps);
                     } else {
                         // Q4_K (default) - Use Phase 2 fused kernel (RMSNorm computed once!)
                         gpu->rms_norm_dual_matvec_q4k(post_attn_buf, ffn_norm_buf, wg_buf, wu_buf,
                                                      gate_buf, up_buf,
-                                                     hidden_dim, config_.intermediate_dim, config_.rms_norm_eps);
+                                                     hidden_dim, model_config_.intermediate_dim, model_config_.rms_norm_eps);
                     }
 
                     // Fused silu + mul
-                    gpu->silu_mul(gate_buf, up_buf, gate_buf, config_.intermediate_dim);
+                    gpu->silu_mul(gate_buf, up_buf, gate_buf, model_config_.intermediate_dim);
 
                     // Down projection (+ fused residual for Q4_K)
                     if (fused_qtype == GGMLType::Q8_0) {
-                        gpu->matvec_q8_0(gate_buf, wd_buf, ffn_out_buf, config_.intermediate_dim, hidden_dim);
+                        gpu->matvec_q8_0(gate_buf, wd_buf, ffn_out_buf, model_config_.intermediate_dim, hidden_dim);
                     } else if (fused_qtype == GGMLType::Q4_0) {
-                        gpu->matvec_q4_0(gate_buf, wd_buf, ffn_out_buf, config_.intermediate_dim, hidden_dim);
+                        gpu->matvec_q4_0(gate_buf, wd_buf, ffn_out_buf, model_config_.intermediate_dim, hidden_dim);
                     } else if (fused_qtype == GGMLType::IQ4_NL) {
-                        gpu->matvec_iq4_nl(gate_buf, wd_buf, ffn_out_buf, config_.intermediate_dim, hidden_dim);
+                        gpu->matvec_iq4_nl(gate_buf, wd_buf, ffn_out_buf, model_config_.intermediate_dim, hidden_dim);
                     } else if (fused_qtype == GGMLType::IQ4_XS) {
-                        gpu->matvec_iq4_xs(gate_buf, wd_buf, ffn_out_buf, config_.intermediate_dim, hidden_dim);
+                        gpu->matvec_iq4_xs(gate_buf, wd_buf, ffn_out_buf, model_config_.intermediate_dim, hidden_dim);
                     } else if (fused_qtype == GGMLType::IQ3_S) {
-                        gpu->matvec_iq3_s(gate_buf, wd_buf, ffn_out_buf, config_.intermediate_dim, hidden_dim);
+                        gpu->matvec_iq3_s(gate_buf, wd_buf, ffn_out_buf, model_config_.intermediate_dim, hidden_dim);
                     } else if (fused_qtype == GGMLType::Q6_K) {
-                        gpu->matvec_q6_k(gate_buf, wd_buf, ffn_out_buf, config_.intermediate_dim, hidden_dim);
+                        gpu->matvec_q6_k(gate_buf, wd_buf, ffn_out_buf, model_config_.intermediate_dim, hidden_dim);
                     } else if (fused_qtype == GGMLType::Q5_K) {
-                        gpu->matvec_q5_k(gate_buf, wd_buf, ffn_out_buf, config_.intermediate_dim, hidden_dim);
+                        gpu->matvec_q5_k(gate_buf, wd_buf, ffn_out_buf, model_config_.intermediate_dim, hidden_dim);
                     } else if (fused_qtype == GGMLType::Q3_K) {
                         // Q3_K - Use Phase 2 fused kernel (down proj + residual in one!)
                         gpu->matvec_residual_q3k(gate_buf, wd_buf, post_attn_buf, out_buf,
-                                                config_.intermediate_dim, hidden_dim);
+                                                model_config_.intermediate_dim, hidden_dim);
                         residual_fused = true;
                     } else if (fused_qtype == GGMLType::Q2_K) {
                         // Q2_K - Use Phase 2 fused kernel (down proj + residual in one!)
                         gpu->matvec_residual_q2k(gate_buf, wd_buf, post_attn_buf, out_buf,
-                                                config_.intermediate_dim, hidden_dim);
+                                                model_config_.intermediate_dim, hidden_dim);
                         residual_fused = true;
                     } else {
                         // Q4_K (default) - Use Phase 2 fused kernel (down proj + residual in one!)
                         gpu->matvec_residual_q4k(gate_buf, wd_buf, post_attn_buf, out_buf,
-                                                config_.intermediate_dim, hidden_dim);
+                                                model_config_.intermediate_dim, hidden_dim);
                         residual_fused = true;
                     }
 
@@ -998,10 +1024,10 @@ Result<Tensor> TransformerModel::transformer_block(
                     is_f16_weight = (ffn_norm_weight->dtype() == DataType::FP16);
                     if (is_f16_weight) {
                         gpu->rms_norm_f16(post_attn_buf, ffn_norm_buf, ffn_in_buf,
-                                         hidden_dim, config_.rms_norm_eps);
+                                         hidden_dim, model_config_.rms_norm_eps);
                     } else {
                         gpu->rms_norm(post_attn_buf, ffn_norm_buf, ffn_in_buf,
-                                     hidden_dim, config_.rms_norm_eps);
+                                     hidden_dim, model_config_.rms_norm_eps);
                     }
 
                     auto ffn_result = feed_forward_gpu(ffn_input, layer);
@@ -1155,10 +1181,10 @@ Result<Tensor> TransformerModel::attention(
 
     int batch = static_cast<int>(hidden.size(0));
     int seq_len = static_cast<int>(hidden.size(1));
-    int hidden_dim = config_.hidden_dim;
-    int num_heads = config_.num_heads;
-    int num_kv_heads = config_.num_kv_heads;
-    int head_dim = config_.head_dim;
+    int hidden_dim = model_config_.hidden_dim;
+    int num_heads = model_config_.num_heads;
+    int num_kv_heads = model_config_.num_kv_heads;
+    int head_dim = model_config_.head_dim;
     int kv_dim = num_kv_heads * head_dim;
 
     // Allocate Q, K, V tensors
@@ -1482,10 +1508,10 @@ Result<Tensor> TransformerModel::attention_tree(
 
     int batch = static_cast<int>(hidden.size(0));
     int num_nodes = static_cast<int>(hidden.size(1));  // Tree nodes
-    int hidden_dim = config_.hidden_dim;
-    int num_heads = config_.num_heads;
-    int num_kv_heads = config_.num_kv_heads;
-    int head_dim = config_.head_dim;
+    int hidden_dim = model_config_.hidden_dim;
+    int num_heads = model_config_.num_heads;
+    int num_kv_heads = model_config_.num_kv_heads;
+    int head_dim = model_config_.head_dim;
     int kv_dim = num_kv_heads * head_dim;
 
     // Allocate Q, K, V tensors for tree nodes
@@ -1775,10 +1801,10 @@ Result<Tensor> TransformerModel::attention_tree_gpu(
 
     int batch = static_cast<int>(hidden.size(0));
     int num_nodes = static_cast<int>(hidden.size(1));
-    int hidden_dim = config_.hidden_dim;
-    int num_heads = config_.num_heads;
-    int num_kv_heads = config_.num_kv_heads;
-    int head_dim = config_.head_dim;
+    int hidden_dim = model_config_.hidden_dim;
+    int num_heads = model_config_.num_heads;
+    int num_kv_heads = model_config_.num_kv_heads;
+    int head_dim = model_config_.head_dim;
     int kv_dim = num_kv_heads * head_dim;
 
     // Allocate Q, K, V tensors
@@ -2058,8 +2084,8 @@ Result<Tensor> TransformerModel::feed_forward(const Tensor& hidden, int layer) {
 
     int batch = static_cast<int>(hidden.size(0));
     int seq_len = static_cast<int>(hidden.size(1));
-    int hidden_dim = config_.hidden_dim;
-    int intermediate_dim = config_.intermediate_dim;
+    int hidden_dim = model_config_.hidden_dim;
+    int intermediate_dim = model_config_.intermediate_dim;
 
     // Allocate output
     std::vector<int64_t> output_shape = {
@@ -2163,8 +2189,8 @@ Result<Tensor> TransformerModel::feed_forward_gpu(const Tensor& hidden, int laye
 
     int batch = static_cast<int>(hidden.size(0));
     int seq_len = static_cast<int>(hidden.size(1));
-    int hidden_dim = config_.hidden_dim;
-    int intermediate_dim = config_.intermediate_dim;
+    int hidden_dim = model_config_.hidden_dim;
+    int intermediate_dim = model_config_.intermediate_dim;
     int total_tokens = batch * seq_len;
 
     // Allocate output tensor
@@ -2352,16 +2378,16 @@ Result<void> TransformerModel::allocate_gpu_kv_cache(int max_seq_len) {
 
     gpu_kv_cache_ = std::make_unique<GPUKVCache>();
     gpu_kv_cache_->max_seq_len = max_seq_len;
-    gpu_kv_cache_->num_kv_heads = config_.num_kv_heads;
-    gpu_kv_cache_->head_dim = config_.head_dim;
+    gpu_kv_cache_->num_kv_heads = model_config_.num_kv_heads;
+    gpu_kv_cache_->head_dim = model_config_.head_dim;
     gpu_kv_cache_->current_len = 0;
-    gpu_kv_cache_->layers.resize(config_.num_layers);
+    gpu_kv_cache_->layers.resize(model_config_.num_layers);
 
-    for (int layer = 0; layer < config_.num_layers; layer++) {
+    for (int layer = 0; layer < model_config_.num_layers; layer++) {
         auto [k_cache, v_cache] = gpu->create_kv_cache(
-            config_.num_kv_heads,
+            model_config_.num_kv_heads,
             max_seq_len,
-            config_.head_dim
+            model_config_.head_dim
         );
         if (!k_cache || !v_cache) {
             GRANITE_FAIL(ErrorCode::OutOfMemory, "Failed to allocate GPU KV cache");
@@ -2387,8 +2413,8 @@ Result<void> TransformerModel::init_decode_pool() {
 
     decode_pool_ = std::make_unique<DecodeBufferPool>();
 
-    std::vector<int64_t> hidden_shape = {1, 1, static_cast<int64_t>(config_.hidden_dim)};
-    std::vector<int64_t> logits_shape = {1, 1, static_cast<int64_t>(config_.vocab_size)};
+    std::vector<int64_t> hidden_shape = {1, 1, static_cast<int64_t>(model_config_.hidden_dim)};
+    std::vector<int64_t> logits_shape = {1, 1, static_cast<int64_t>(model_config_.vocab_size)};
 
     // Allocate buffers
     auto attn_in = Tensor::allocate(hidden_shape, DataType::FP32, backend_);
@@ -2415,9 +2441,9 @@ Result<void> TransformerModel::init_decode_pool() {
     // Allocate GPU-specific buffers for attention and FFN
     auto* gpu = get_metal_compute();
     if (gpu && gpu->is_initialized()) {
-        int q_dim = config_.num_heads * config_.head_dim;
-        int kv_dim = config_.num_kv_heads * config_.head_dim;
-        int intermediate_dim = config_.intermediate_dim;
+        int q_dim = model_config_.num_heads * model_config_.head_dim;
+        int kv_dim = model_config_.num_kv_heads * model_config_.head_dim;
+        int intermediate_dim = model_config_.intermediate_dim;
 
         decode_pool_->q_buf = gpu->create_buffer(q_dim * sizeof(float));
         decode_pool_->k_buf = gpu->create_buffer(kv_dim * sizeof(float));
@@ -2465,11 +2491,11 @@ Result<void> TransformerModel::sync_cpu_to_gpu_kv_cache(KVCache* kv_cache) {
         GRANITE_FAIL(ErrorCode::InvalidArgument, "CPU cache too large for GPU cache");
     }
 
-    int num_kv_heads = config_.num_kv_heads;
-    int head_dim = config_.head_dim;
+    int num_kv_heads = model_config_.num_kv_heads;
+    int head_dim = model_config_.head_dim;
 
     // Copy each layer's cache
-    for (int layer = 0; layer < config_.num_layers; layer++) {
+    for (int layer = 0; layer < model_config_.num_layers; layer++) {
         auto [k_cpu, v_cpu] = kv_cache->get(layer);
 
         auto* k_gpu = static_cast<MTL::Buffer*>(gpu_kv_cache_->layers[layer].k_cache);
@@ -2552,10 +2578,10 @@ Result<Tensor> TransformerModel::attention_full_gpu(
         GRANITE_FAIL(ErrorCode::InternalError, "GPU or KV cache not initialized");
     }
 
-    int hidden_dim = config_.hidden_dim;
-    int num_heads = config_.num_heads;
-    int num_kv_heads = config_.num_kv_heads;
-    int head_dim = config_.head_dim;
+    int hidden_dim = model_config_.hidden_dim;
+    int num_heads = model_config_.num_heads;
+    int num_kv_heads = model_config_.num_kv_heads;
+    int head_dim = model_config_.head_dim;
     int q_dim = num_heads * head_dim;
     int kv_dim = num_kv_heads * head_dim;
     int max_seq = gpu_kv_cache_->max_seq_len;
@@ -2678,7 +2704,7 @@ Result<Tensor> TransformerModel::attention_full_gpu(
 
     // 2. Apply RoPE to Q and K
     gpu->rope_multihead(q_buf, k_buf, num_heads, num_kv_heads, 1, head_dim,
-                        start_pos, config_.rope_theta);
+                        start_pos, model_config_.rope_theta);
 
     // 3. Append new K/V to cache
     gpu->kv_cache_append(
@@ -2730,7 +2756,7 @@ Result<Tensor> TransformerModel::attention_full_gpu(
     // gpu->sync();  // Removed - caller will sync
 
     // Update cache length only on last layer
-    if (layer == config_.num_layers - 1) {
+    if (layer == model_config_.num_layers - 1) {
         // Need to commit current work before updating length
         gpu->sync();
         gpu_kv_cache_->increment_len(1);
@@ -2770,7 +2796,7 @@ Result<Tensor> TransformerModel::attention_gpu(
             auto result = attention_full_gpu(hidden, layer, start_pos);
             // After last layer, sync CPU cache length to match GPU cache
             // This keeps forward_single's start_pos calculation correct
-            if (result.ok() && layer == config_.num_layers - 1 && kv_cache) {
+            if (result.ok() && layer == model_config_.num_layers - 1 && kv_cache) {
                 kv_cache->increment_seq_len(1);
             }
             return result;
@@ -2790,7 +2816,7 @@ Result<Tensor> TransformerModel::attention_gpu(
             if (gpu_kv_cache_->seq_len() == start_pos) {
                 auto result = attention_full_gpu(hidden, layer, start_pos);
                 // After last layer, sync CPU cache length
-                if (result.ok() && layer == config_.num_layers - 1 && kv_cache) {
+                if (result.ok() && layer == model_config_.num_layers - 1 && kv_cache) {
                     kv_cache->increment_seq_len(1);
                 }
                 return result;
@@ -2822,10 +2848,10 @@ Result<Tensor> TransformerModel::attention_gpu(
                  raw_wq->quant_type == GGMLType::IQ3_S)) {
 
                 GGMLType prefill_qtype = raw_wq->quant_type;
-                int hidden_dim = config_.hidden_dim;
-                int num_heads = config_.num_heads;
-                int num_kv_heads = config_.num_kv_heads;
-                int head_dim = config_.head_dim;
+                int hidden_dim = model_config_.hidden_dim;
+                int num_heads = model_config_.num_heads;
+                int num_kv_heads = model_config_.num_kv_heads;
+                int head_dim = model_config_.head_dim;
                 int q_dim = num_heads * head_dim;
                 int kv_dim = num_kv_heads * head_dim;
                 int max_seq = gpu_kv_cache_->max_seq_len;
@@ -2895,7 +2921,7 @@ Result<Tensor> TransformerModel::attention_gpu(
 
                     // 2. Apply RoPE to Q and K (batched)
                     gpu->rope_multihead(q_buf, k_buf, num_heads, num_kv_heads, total_tokens, head_dim,
-                                        start_pos, config_.rope_theta);
+                                        start_pos, model_config_.rope_theta);
 
                     // 3. Append K/V to FP16 cache (kv_cache_append uses FP16 by default)
                     gpu->kv_cache_append(
@@ -2951,7 +2977,7 @@ Result<Tensor> TransformerModel::attention_gpu(
                         }
 
                         // Update GPU cache length on last layer
-                        if (layer == config_.num_layers - 1) {
+                        if (layer == model_config_.num_layers - 1) {
                             gpu_kv_cache_->current_len = total_tokens;
                             if (kv_cache) {
                                 kv_cache->set_seq_len(total_tokens);
