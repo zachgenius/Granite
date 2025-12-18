@@ -5905,13 +5905,13 @@ inline float simd_broadcast(float val, ushort lane_group) {
 }
 
 // =============================================================================
-// Flash Attention Decode - head_dim=64, llama.cpp style (simplified)
+// Flash Attention Decode - head_dim=64 with NE/NL parallelism (llama.cpp style)
 // =============================================================================
 //
-// This kernel uses a simpler approach than llama.cpp:
-// - Each simdgroup processes tiles of C positions with stride NSG
-// - All 32 threads cooperate on each K dot product (no NE/NL split)
-// - Sequential cross-simdgroup reduction for correctness
+// Key optimization: NE/NL parallelism
+// - NL = 16 threads cooperate on each K dot product
+// - NE = 2 K positions processed in parallel per simdgroup
+// - This doubles throughput compared to sequential K processing
 //
 kernel void flash_attention_decode_d64(
     device const float* Q          [[buffer(0)]],   // [num_heads, 64] FP32
@@ -5937,6 +5937,15 @@ kernel void flash_attention_decode_d64(
     constexpr uint NW = 32;          // Threads per simdgroup
     constexpr uint NSG = 4;          // Simdgroups per threadgroup
 
+    // NE/NL parallelism: process NE K positions in parallel
+    // For d64: 16 threads (NL) per K, 2 K positions (NE) in parallel
+    constexpr uint NL = DK4;         // 16 threads per K dot product
+    constexpr uint NE = NW / NL;     // 2 K positions in parallel
+
+    // Thread role within simdgroup
+    const ushort tx = tiisg % NL;    // 0-15: which float4 element
+    const ushort ty = tiisg / NL;    // 0-1: which K position (of NE)
+
     // GQA: map query head to KV head
     const uint heads_per_kv = num_heads / num_kv_heads;
     const uint kv_head = head_idx / heads_per_kv;
@@ -5948,15 +5957,15 @@ kernel void flash_attention_decode_d64(
     device float4* out4 = (device float4*)(output + head_idx * DK);
 
     // Shared memory
-    threadgroup float4 sq4[DK4];         // Query vector
-    threadgroup float ss[C];             // Attention scores
+    threadgroup float4 sq4[DK4];         // Query vector (16 float4s)
+    threadgroup float ss[C];             // Attention scores (32 floats)
     threadgroup float4 so4[NSG * DK4];   // Output accumulators per simdgroup
     threadgroup float sm_s[NSG];         // Running sum per simdgroup
     threadgroup float sm_m[NSG];         // Running max per simdgroup
 
     const uint tid = tiisg + sgitg * NW;
 
-    // Load Q into shared memory (only need first DK4 threads)
+    // Load Q into shared memory
     if (tid < DK4) {
         sq4[tid] = q4[tid];
     }
@@ -5974,33 +5983,41 @@ kernel void flash_attention_decode_d64(
     float M = -FLT_MAX / 2;
 
     // Process KV cache in tiles
-    // Each simdgroup handles tiles with stride NSG
     for (uint ic0 = sgitg; ic0 * C < seq_kv; ic0 += NSG) {
         const uint ic = ic0 * C;
         const uint tile_len = min(C, seq_kv - ic);
 
         // =====================================================================
-        // Q * K^T: Compute attention scores
+        // Q * K^T with NE/NL parallelism
         // =====================================================================
         device const half4* pk4 = k4_base + ic * DK4;
 
-        // Each simdgroup computes scores for its tile
-        // 32 threads compute one K dot product at a time
-        for (uint k_idx = 0; k_idx < tile_len; ++k_idx) {
-            device const half4* k_row = pk4 + k_idx * DK4;
+        // Process C K positions, NE at a time
+        for (uint kk = 0; kk < tile_len; kk += NE) {
+            // Each thread handles one K position (ty) and one float4 element (tx)
+            const uint k_idx = kk + ty;
+            float score = 0.0f;
 
-            // Each thread handles DK4/NW float4s (16/32 = 0.5, so use pairs)
-            float partial = 0.0f;
-            if (tiisg < DK4) {
-                float4 q_vec = sq4[tiisg];
-                float4 k_vec = float4(k_row[tiisg]);
-                partial = dot(q_vec, k_vec);
+            if (k_idx < tile_len) {
+                device const half4* k_row = pk4 + k_idx * DK4;
+
+                // Each thread computes dot(Q[tx], K[k_idx][tx])
+                float4 q_vec = sq4[tx];
+                float4 k_vec = float4(k_row[tx]);
+                float partial = dot(q_vec, k_vec);
+
+                // Reduce across NL threads using simd_shuffle_down
+                // This sums the 16 partial dot products
+                partial += simd_shuffle_down(partial, 8);
+                partial += simd_shuffle_down(partial, 4);
+                partial += simd_shuffle_down(partial, 2);
+                partial += simd_shuffle_down(partial, 1);
+
+                score = partial * scale;
             }
 
-            // Sum across simdgroup
-            float score = simd_sum(partial) * scale;
-
-            if (tiisg == 0) {
+            // Thread 0 and 16 (tx=0 for each ty) write their scores
+            if (tx == 0 && k_idx < tile_len) {
                 ss[k_idx] = score;
             }
         }
@@ -6020,10 +6037,9 @@ kernel void flash_attention_decode_d64(
         float tile_max = simd_max(local_max);
         M = max(M, tile_max);
 
-        // Correction factor for old values
         const float ms = exp(old_M - M);
 
-        // Compute exp(score - M) and sum
+        // Compute exp and sum
         float local_sum = 0.0f;
         for (uint k = tiisg; k < tile_len; k += NW) {
             float vs = exp(ss[k] - M);
@@ -6033,7 +6049,7 @@ kernel void flash_attention_decode_d64(
         float tile_sum = simd_sum(local_sum);
         S = S * ms + tile_sum;
 
-        // Scale previous output by correction factor
+        // Scale previous output
         if (tiisg < DK4) {
             my_so4[tiisg] *= ms;
         }
@@ -6041,20 +6057,30 @@ kernel void flash_attention_decode_d64(
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
         // =====================================================================
-        // Accumulate: O += softmax(Q*K^T) * V
+        // O += P * V with NE/NL parallelism
         // =====================================================================
         device const half4* pv4 = v4_base + ic * DK4;
 
-        // Accumulate V weighted by attention probabilities
-        // Each thread handles one output float4 element
-        if (tiisg < DK4) {
-            float4 accum = float4(0.0f);
-            for (uint k_idx = 0; k_idx < tile_len; ++k_idx) {
+        // Each thread accumulates for its assigned output element (tx)
+        float4 accum = float4(0.0f);
+
+        // Process C K positions, NE at a time
+        for (uint kk = 0; kk < tile_len; kk += NE) {
+            const uint k_idx = kk + ty;
+            if (k_idx < tile_len) {
                 float weight = ss[k_idx];
-                float4 v_vec = float4(pv4[k_idx * DK4 + tiisg]);
+                float4 v_vec = float4(pv4[k_idx * DK4 + tx]);
                 accum += v_vec * weight;
             }
-            my_so4[tiisg] += accum;
+        }
+
+        // Reduce across ty (NE dimension) - threads 0-15 and 16-31 need to combine
+        // simd_shuffle_down by NL brings thread 16's value to thread 0, etc.
+        accum += simd_shuffle_down(accum, NL);
+
+        // Only ty=0 threads (0-15) have the complete sum
+        if (ty == 0) {
+            my_so4[tx] += accum;
         }
 
         simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -6063,7 +6089,6 @@ kernel void flash_attention_decode_d64(
     // =====================================================================
     // Cross-simdgroup reduction
     // =====================================================================
-    // Store per-simdgroup S and M
     if (tiisg == 0) {
         sm_s[sgitg] = S;
         sm_m[sgitg] = M;
@@ -6071,24 +6096,20 @@ kernel void flash_attention_decode_d64(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // All threads in simdgroup 0 do the final reduction and output
     if (sgitg == 0) {
-        // Each thread reads the 4 simdgroup results and computes independently
-        // This is correct because we're not modifying shared memory until the end
-
-        // Find global max across all simdgroups
+        // Find global max
         float final_M = sm_m[0];
         for (uint sg = 1; sg < NSG; ++sg) {
             final_M = max(final_M, sm_m[sg]);
         }
 
-        // Compute combined sum with proper scaling
+        // Compute combined sum
         float final_S = 0.0f;
         for (uint sg = 0; sg < NSG; ++sg) {
             final_S += sm_s[sg] * exp(sm_m[sg] - final_M);
         }
 
-        // Combine output vectors with proper scaling
+        // Combine output vectors
         if (tiisg < DK4) {
             float4 final_o = float4(0.0f);
             for (uint sg = 0; sg < NSG; ++sg) {
@@ -6096,7 +6117,6 @@ kernel void flash_attention_decode_d64(
                 final_o += so4[sg * DK4 + tiisg] * scale_sg;
             }
 
-            // Normalize and write output
             float inv_S = (final_S > 0.0f) ? 1.0f / final_S : 0.0f;
             out4[tiisg] = final_o * inv_S;
         }

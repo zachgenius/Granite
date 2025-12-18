@@ -2825,9 +2825,10 @@ Result<Tensor> TransformerModel::attention_full_gpu(
     // gpu->sync();  // Removed - caller will sync
 
     // Update cache length only on last layer
+    // No sync needed here - GPU ops are queued and will execute in order.
+    // The final sync in get_logits() ensures everything completes before we
+    // return from forward(). increment_len just updates a CPU counter.
     if (layer == model_config_.num_layers - 1) {
-        // Need to commit current work before updating length
-        gpu->sync();
         gpu_kv_cache_->increment_len(1);
     }
 
