@@ -5509,10 +5509,11 @@ kernel void batched_paged_attention_decode(
     constant uint& max_blocks_per_seq  [[buffer(11)]],
     constant float& scale              [[buffer(12)]],
     uint2 tgid                         [[threadgroup_position_in_grid]],
-    uint tid                           [[thread_position_in_threadgroup]],
+    uint2 tid_2d                       [[thread_position_in_threadgroup]],
     uint simd_lane                     [[thread_index_in_simdgroup]],
     uint simd_id                       [[simdgroup_index_in_threadgroup]]
 ) {
+    uint tid = tid_2d.x;  // Use x component for 1D indexing
     uint batch_idx = tgid.y;
     uint head_idx = tgid.x;
 

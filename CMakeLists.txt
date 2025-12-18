@@ -258,6 +258,9 @@ target_link_libraries(granite_benchmark PRIVATE granite)
 add_executable(granite_tree_bench tools/benchmark_tree_batching.cpp)
 target_link_libraries(granite_tree_bench PRIVATE granite)
 
+add_executable(granite_bench_vs_llamacpp tools/benchmark_vs_llamacpp.cpp)
+target_link_libraries(granite_bench_vs_llamacpp PRIVATE granite)
+
 # =============================================================================
 # Installation
 # =============================================================================
