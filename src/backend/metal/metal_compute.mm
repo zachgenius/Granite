@@ -1193,33 +1193,69 @@ Result<void> MetalCompute::multihead_attention(
 {
     auto* encoder = impl_->get_encoder();
 
-    // Select appropriate kernel based on configuration
-    const char* kernel_name = "multihead_attention_decode_f16kv";
-    auto* pipeline = impl_->get_pipeline(kernel_name);
-    if (!pipeline) {
-        kernel_name = "multihead_attention_decode";
-        pipeline = impl_->get_pipeline(kernel_name);
+    // Select kernel based on seq_q:
+    // - seq_q == 1: decode kernel (single query, FP16 KV cache)
+    // - seq_q > 1: prefill kernel (batched queries)
+    if (seq_q == 1) {
+        // Decode path: multihead_attention_decode_f16kv
+        // Kernel signature: Q, K, V, output, num_heads, num_kv_heads, seq_kv, head_dim, scale
+        const char* kernel_name = "multihead_attention_decode_f16kv";
+        auto* pipeline = impl_->get_pipeline(kernel_name);
         if (!pipeline) {
-            return Error(ErrorCode::InternalError, "multihead_attention kernel not found");
+            kernel_name = "multihead_attention_decode";
+            pipeline = impl_->get_pipeline(kernel_name);
+            if (!pipeline) {
+                return Error(ErrorCode::InternalError, "multihead_attention_decode kernel not found");
+            }
         }
+
+        encoder->setComputePipelineState(pipeline);
+        encoder->setBuffer(Q, 0, 0);
+        encoder->setBuffer(K, 0, 1);
+        encoder->setBuffer(V, 0, 2);
+        encoder->setBuffer(output, 0, 3);
+        encoder->setBytes(&num_heads, sizeof(num_heads), 4);
+        encoder->setBytes(&num_kv_heads, sizeof(num_kv_heads), 5);
+        encoder->setBytes(&seq_kv, sizeof(seq_kv), 6);        // seq_kv at buffer 6
+        encoder->setBytes(&head_dim, sizeof(head_dim), 7);    // head_dim at buffer 7
+        encoder->setBytes(&scale, sizeof(scale), 8);          // scale at buffer 8
+
+        // One threadgroup per head
+        MTL::Size grid_size = MTL::Size::Make(num_heads, 1, 1);
+        MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
+        encoder->dispatchThreadgroups(grid_size, threadgroup_size);
+    } else {
+        // Prefill path: attention_prefill_f16kv
+        // Kernel signature includes seq_q, seq_kv, start_pos
+        const char* kernel_name = "attention_prefill_f16kv";
+        auto* pipeline = impl_->get_pipeline(kernel_name);
+        if (!pipeline) {
+            kernel_name = "attention_prefill";
+            pipeline = impl_->get_pipeline(kernel_name);
+            if (!pipeline) {
+                return Error(ErrorCode::InternalError, "attention_prefill kernel not found");
+            }
+        }
+
+        encoder->setComputePipelineState(pipeline);
+        encoder->setBuffer(Q, 0, 0);
+        encoder->setBuffer(K, 0, 1);
+        encoder->setBuffer(V, 0, 2);
+        encoder->setBuffer(output, 0, 3);
+        encoder->setBytes(&num_heads, sizeof(num_heads), 4);
+        encoder->setBytes(&num_kv_heads, sizeof(num_kv_heads), 5);
+        encoder->setBytes(&seq_q, sizeof(seq_q), 6);
+        encoder->setBytes(&seq_kv, sizeof(seq_kv), 7);
+        encoder->setBytes(&head_dim, sizeof(head_dim), 8);
+        encoder->setBytes(&scale, sizeof(scale), 9);
+        uint32_t start_pos = 0;  // For prefill, start_pos is 0
+        encoder->setBytes(&start_pos, sizeof(start_pos), 10);
+
+        // One threadgroup per (head, query_position) pair
+        MTL::Size grid_size = MTL::Size::Make(num_heads, seq_q, 1);
+        MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
+        encoder->dispatchThreadgroups(grid_size, threadgroup_size);
     }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(Q, 0, 0);
-    encoder->setBuffer(K, 0, 1);
-    encoder->setBuffer(V, 0, 2);
-    encoder->setBuffer(output, 0, 3);
-    encoder->setBytes(&num_heads, sizeof(num_heads), 4);
-    encoder->setBytes(&num_kv_heads, sizeof(num_kv_heads), 5);
-    encoder->setBytes(&seq_q, sizeof(seq_q), 6);
-    encoder->setBytes(&seq_kv, sizeof(seq_kv), 7);
-    encoder->setBytes(&head_dim, sizeof(head_dim), 8);
-    encoder->setBytes(&scale, sizeof(scale), 9);
-
-    // One threadgroup per head
-    MTL::Size grid_size = MTL::Size::Make(num_heads, seq_q, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
 
     return {};
 }
