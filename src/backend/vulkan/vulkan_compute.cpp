@@ -339,6 +339,40 @@ public:
     }
 
     // =========================================================================
+    // Softmax (for attention)
+    // =========================================================================
+
+    Result<void> softmax(VkBuffer x, VkBuffer out, uint32_t size, float scale = 1.0f) {
+        auto* pipeline = get_pipeline("softmax");
+        if (!pipeline) {
+            return Error(ErrorCode::NotImplemented, "Softmax pipeline not available");
+        }
+
+        PushConstantsSimple pc{};
+        pc.KX = size;
+        pc.param1 = scale;
+
+        // One workgroup for the softmax
+        return dispatch_simple(*pipeline, {x, out}, pc, 1);
+    }
+
+    Result<void> softmax_rows(VkBuffer x, VkBuffer out, uint32_t rows, uint32_t cols,
+                              float scale = 1.0f) {
+        auto* pipeline = get_pipeline("softmax");
+        if (!pipeline) {
+            return Error(ErrorCode::NotImplemented, "Softmax pipeline not available");
+        }
+
+        PushConstantsSimple pc{};
+        pc.KX = cols;  // Each row has 'cols' elements
+        pc.KY = rows;
+        pc.param1 = scale;
+
+        // One workgroup per row
+        return dispatch_simple(*pipeline, {x, out}, pc, rows);
+    }
+
+    // =========================================================================
     // Profiling
     // =========================================================================
 
@@ -885,6 +919,97 @@ void main() {
         auto matvec_result = compile_shader("matvec_q4k_simple", matvec_q4k_shader, 3);
         if (!matvec_result.ok()) {
             GRANITE_LOG_WARN("Failed to compile matvec_q4k shader: {}", matvec_result.error().message());
+        }
+
+        // Softmax shader with numerically stable implementation
+        const char* softmax_shader = R"(
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint KX;        // Row size (number of elements per row)
+    uint KY;        // Number of rows (for batched softmax)
+    float scale;    // Pre-softmax scale (e.g., 1/sqrt(d_k) for attention)
+    float padding;
+} p;
+
+layout(binding = 0) readonly buffer X { float data_x[]; };
+layout(binding = 1) writeonly buffer D { float data_d[]; };
+
+shared float shared_max;
+shared float shared_sum;
+shared float partial_max[256];
+shared float partial_sum[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
+    uint n = p.KX;
+    uint offset = row * n;
+
+    // Step 1: Find max for numerical stability (parallel reduction)
+    float local_max = -1e38;
+    for (uint i = tid; i < n; i += 256) {
+        float val = data_x[offset + i] * p.scale;
+        local_max = max(local_max, val);
+    }
+
+    partial_max[tid] = local_max;
+    barrier();
+
+    // Reduce to find global max
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial_max[tid] = max(partial_max[tid], partial_max[tid + s]);
+        }
+        barrier();
+    }
+
+    if (tid == 0) {
+        shared_max = partial_max[0];
+    }
+    barrier();
+
+    float max_val = shared_max;
+
+    // Step 2: Compute exp(x - max) and sum
+    float local_sum = 0.0;
+    for (uint i = tid; i < n; i += 256) {
+        float val = data_x[offset + i] * p.scale;
+        local_sum += exp(val - max_val);
+    }
+
+    partial_sum[tid] = local_sum;
+    barrier();
+
+    // Reduce to find global sum
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial_sum[tid] += partial_sum[tid + s];
+        }
+        barrier();
+    }
+
+    if (tid == 0) {
+        shared_sum = partial_sum[0];
+    }
+    barrier();
+
+    float sum_exp = shared_sum;
+    float inv_sum = 1.0 / sum_exp;
+
+    // Step 3: Write normalized values
+    for (uint i = tid; i < n; i += 256) {
+        float val = data_x[offset + i] * p.scale;
+        data_d[offset + i] = exp(val - max_val) * inv_sum;
+    }
+}
+)";
+
+        auto softmax_result = compile_shader("softmax", softmax_shader, 2);
+        if (!softmax_result.ok()) {
+            GRANITE_LOG_WARN("Failed to compile softmax shader: {}", softmax_result.error().message());
         }
 
         GRANITE_LOG_INFO("Compiled {} builtin shaders", pipelines_.size());

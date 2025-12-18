@@ -210,6 +210,8 @@ endif()
 # Vulkan Backend (Linux/Android/Windows)
 # =============================================================================
 
+option(GRANITE_WITH_SHADERC "Enable runtime shader compilation with shaderc" OFF)
+
 if(GRANITE_BUILD_VULKAN)
     find_package(Vulkan REQUIRED)
 
@@ -229,10 +231,26 @@ if(GRANITE_BUILD_VULKAN)
     target_compile_definitions(granite PUBLIC GRANITE_HAS_VULKAN=1)
 
     # Optional: Link shaderc for runtime shader compilation
-    find_package(unofficial-shaderc CONFIG QUIET)
-    if(unofficial-shaderc_FOUND)
-        target_link_libraries(granite PRIVATE unofficial::shaderc::shaderc)
-        target_compile_definitions(granite PRIVATE GRANITE_HAS_SHADERC=1)
+    if(GRANITE_WITH_SHADERC)
+        # Try vcpkg-style first
+        find_package(unofficial-shaderc CONFIG QUIET)
+        if(unofficial-shaderc_FOUND)
+            target_link_libraries(granite PRIVATE unofficial::shaderc::shaderc)
+            target_compile_definitions(granite PRIVATE GRANITE_HAS_SHADERC=1)
+            message(STATUS "Found shaderc via vcpkg")
+        else()
+            # Try system shaderc
+            find_library(SHADERC_LIB shaderc_combined HINTS /usr/lib /usr/local/lib)
+            find_path(SHADERC_INCLUDE shaderc/shaderc.hpp HINTS /usr/include /usr/local/include)
+            if(SHADERC_LIB AND SHADERC_INCLUDE)
+                target_link_libraries(granite PRIVATE ${SHADERC_LIB})
+                target_include_directories(granite PRIVATE ${SHADERC_INCLUDE})
+                target_compile_definitions(granite PRIVATE GRANITE_HAS_SHADERC=1)
+                message(STATUS "Found system shaderc: ${SHADERC_LIB}")
+            else()
+                message(WARNING "GRANITE_WITH_SHADERC enabled but shaderc not found")
+            endif()
+        endif()
     endif()
 endif()
 
@@ -285,6 +303,7 @@ if(GRANITE_BUILD_TESTS)
         tests/test_gguf.cpp
         tests/test_llm.cpp
         tests/test_config.cpp
+        tests/test_vulkan.cpp
     )
 
     target_link_libraries(granite_tests
