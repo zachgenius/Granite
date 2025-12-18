@@ -261,6 +261,37 @@ public:
         return {};
     }
 
+    // SIMD K-parallel matmul dispatch for prefill
+    // Each simdgroup (32 threads) handles 4 rows x 1 col with 8-way K parallelism
+    Result<void> dispatch_matmul_simd(
+        const char* kernel_name,
+        MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
+        uint32_t M, uint32_t K, uint32_t N)
+    {
+        auto* encoder = get_encoder();
+        auto* pipeline = get_pipeline(kernel_name);
+        if (!pipeline) {
+            return Error(ErrorCode::InternalError, std::string(kernel_name) + " pipeline not found");
+        }
+
+        encoder->setComputePipelineState(pipeline);
+        encoder->setBuffer(X, 0, 0);
+        encoder->setBuffer(W, 0, 1);
+        encoder->setBuffer(Y, 0, 2);
+        encoder->setBytes(&M, sizeof(M), 3);
+        encoder->setBytes(&K, sizeof(K), 4);
+        encoder->setBytes(&N, sizeof(N), 5);
+
+        // Grid: (N cols, M/4 row groups)
+        // Each simdgroup handles 4 rows x 1 col
+        uint32_t grid_M = (M + 3) / 4;
+        MTL::Size grid_size = MTL::Size::Make(N, grid_M, 1);
+        MTL::Size threadgroup_size = MTL::Size::Make(32, 1, 1);  // 1 simdgroup
+        encoder->dispatchThreads(grid_size, threadgroup_size);
+
+        return {};
+    }
+
     // Fused RMSNorm + matvec dispatch
     // Uses 8 rows per threadgroup with 256 threads
     Result<void> dispatch_rms_norm_matvec(
@@ -342,7 +373,7 @@ private:
         // All kernel names to compile
         std::vector<std::string> kernels = {
             // Core quantized kernels
-            "matvec_q4k", "matmul_q4k", "matmul_q4k_vec", "matmul_q4k_tiled",
+            "matvec_q4k", "matmul_q4k", "matmul_q4k_vec", "matmul_q4k_tiled", "matmul_q4k_simd",
             "matvec_f16", "matvec_f32",
             "matvec_q8_0", "matmul_q8_0",
             "matvec_q4_0", "matmul_q4_0",
@@ -465,8 +496,10 @@ Result<void> MetalCompute::matmul_q4k(
     MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
     uint32_t M, uint32_t K, uint32_t N)
 {
-    // Use register-tiled kernel for prefill (M > 2), vectorized for small M
-    if (M > 2) {
+    // Use SIMD kernel for larger batches (M >= 32), tiled for medium, scalar/vec for small
+    if (M >= 32) {
+        return impl_->dispatch_matmul_simd("matmul_q4k_simd", X, W, Y, M, K, N);
+    } else if (M > 2) {
         return impl_->dispatch_matmul_tiled("matmul_q4k_tiled", X, W, Y, M, K, N);
     } else if (M > 1) {
         return impl_->dispatch_matmul("matmul_q4k_vec", X, W, Y, M, K, N);

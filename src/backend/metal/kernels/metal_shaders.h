@@ -743,6 +743,98 @@ kernel void matmul_q4k_tiled(
 }
 
 // =============================================================================
+// SIMD Group Matrix Q4_K Matmul (Prefill - K-Parallel)
+// =============================================================================
+// Simple approach: 4 rows per simdgroup with 8-way K parallelism
+// Each simdgroup handles 4 rows x 1 column
+
+kernel void matmul_q4k_simd(
+    device const float* X          [[buffer(0)]],
+    device const void* W           [[buffer(1)]],
+    device float* Y                [[buffer(2)]],
+    constant uint& M               [[buffer(3)]],
+    constant uint& K               [[buffer(4)]],
+    constant uint& N               [[buffer(5)]],
+    uint2 gid                      [[thread_position_in_grid]],
+    uint simd_lane                 [[thread_index_in_simdgroup]]
+) {
+    // Each simdgroup handles 4 rows x 1 column
+    uint row_base = gid.y * 4;
+    uint col = gid.x;
+
+    if (col >= N) return;
+
+    const uint num_blocks_k = K / QK_K;
+    const device block_q4_K* weights = (const device block_q4_K*)W;
+
+    // Each thread accumulates for one row (lanes 0-7 -> row 0, etc.)
+    uint local_row = simd_lane / 8;
+    uint k_lane = simd_lane % 8;  // 8-way K parallelism
+
+    uint row = row_base + local_row;
+    float sum = 0.0f;
+
+    if (row < M) {
+        for (uint kb = 0; kb < num_blocks_k; kb++) {
+            const device block_q4_K* block = &weights[col * num_blocks_k + kb];
+            float d = float(block->d);
+            float dmin = float(block->dmin);
+            const device uint8_t* scales = block->scales;
+            const device uint8_t* qs = block->qs;
+
+            // Each lane processes 32 elements of the 256-element block
+            // k_lane 0: elements 0-31, k_lane 1: 32-63, etc.
+            uint elem_start = k_lane * 32;
+
+            // Determine scale index based on which 64-element group we're in
+            int is = (elem_start / 64) * 2;
+            if (elem_start % 64 >= 32) is++;
+
+            uint8_t sc1, m1;
+            get_scale_min_k4(is, scales, sc1, m1);
+            float d1 = d * float(sc1);
+            float dm1 = dmin * float(m1);
+
+            // qs base: each 64-element group uses 32 bytes
+            uint qs_base = (elem_start / 64) * 32;
+            bool high = (elem_start % 64) >= 32;
+
+            for (uint l = 0; l < 32; l += 4) {
+                uint k_idx = kb * QK_K + elem_start + l;
+                if (k_idx + 3 < K) {
+                    float4 xv = float4(X[row * K + k_idx], X[row * K + k_idx + 1],
+                                       X[row * K + k_idx + 2], X[row * K + k_idx + 3]);
+                    uint8_t q0 = qs[qs_base + l];
+                    uint8_t q1 = qs[qs_base + l + 1];
+                    uint8_t q2 = qs[qs_base + l + 2];
+                    uint8_t q3 = qs[qs_base + l + 3];
+
+                    float4 wv;
+                    if (high) {
+                        wv = float4(d1 * float(q0 >> 4) - dm1, d1 * float(q1 >> 4) - dm1,
+                                    d1 * float(q2 >> 4) - dm1, d1 * float(q3 >> 4) - dm1);
+                    } else {
+                        wv = float4(d1 * float(q0 & 0xF) - dm1, d1 * float(q1 & 0xF) - dm1,
+                                    d1 * float(q2 & 0xF) - dm1, d1 * float(q3 & 0xF) - dm1);
+                    }
+                    sum += dot(xv, wv);
+                }
+            }
+        }
+    }
+
+    // Reduce across the 8 K-parallel lanes for each row
+    for (uint offset = 4; offset > 0; offset /= 2) {
+        sum += simd_shuffle_xor(sum, offset);
+    }
+
+    // Lane 0, 8, 16, 24 write the result for their respective rows
+    if (k_lane == 0 && row < M) {
+        Y[row * N + col] = sum;
+    }
+}
+
+// =============================================================================
 // Q8_0 Matrix-Vector Multiplication (Single Token Decode)
 // =============================================================================
 // Optimized using same techniques as Q4_K:
