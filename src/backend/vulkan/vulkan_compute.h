@@ -13,11 +13,13 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <memory>
 
 namespace granite {
 
-// Forward declaration - implementation in vulkan_compute.cpp
+// Forward declarations
 class VulkanComputeImpl;
+class VulkanCompute;
 
 class VulkanCompute {
 public:
@@ -73,15 +75,36 @@ public:
     // Quantized Matrix-Vector Operations (Decode - Single Token)
     // =========================================================================
 
-    // TODO: Implement using llama.cpp shaders
-    // Result<void> matvec_q4k(VkBuffer x, VkBuffer W, VkBuffer y, uint32_t K, uint32_t N);
-    // Result<void> matvec_q8_0(VkBuffer x, VkBuffer W, VkBuffer y, uint32_t K, uint32_t N);
+    Result<void> matvec_q4k(VkBuffer x, VkBuffer W, VkBuffer y, uint32_t K, uint32_t N);
+    Result<void> matvec_q8_0(VkBuffer x, VkBuffer W, VkBuffer y, uint32_t K, uint32_t N);
+
+    // =========================================================================
+    // RoPE (Rotary Position Embedding)
+    // =========================================================================
+
+    Result<void> rope(VkBuffer x, VkBuffer freq_cos, VkBuffer freq_sin,
+                     uint32_t head_dim, uint32_t num_heads, float position);
+
+    // =========================================================================
+    // Fused Operations
+    // =========================================================================
+
+    // SiLU activation fused with elementwise multiply (for FFN gate * up)
+    Result<void> silu_mul(VkBuffer gate, VkBuffer up, uint32_t size);
+
+    // =========================================================================
+    // Softmax Operations
+    // =========================================================================
+
+    Result<void> softmax(VkBuffer x, VkBuffer out, uint32_t size, float scale = 1.0f);
+    Result<void> softmax_rows(VkBuffer x, VkBuffer out, uint32_t rows, uint32_t cols,
+                              float scale = 1.0f);
 
     // =========================================================================
     // Attention Operations
     // =========================================================================
 
-    // TODO: Implement using llama.cpp shaders
+    // TODO: Implement flash attention decode
     // Result<void> flash_attention_decode(...);
 
     // =========================================================================
@@ -104,10 +127,17 @@ public:
     Result<void> load_spirv(const std::string& name, const std::vector<uint32_t>& spirv,
                            uint32_t num_buffers = 4);
 
+    // Check if compute interface is initialized
+    bool is_initialized() const;
+
 private:
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+// Global accessor for VulkanCompute singleton
+// Returns nullptr if Vulkan is not available or initialization failed
+VulkanCompute* get_vulkan_compute();
 
 } // namespace granite
 

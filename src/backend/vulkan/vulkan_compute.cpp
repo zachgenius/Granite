@@ -5,12 +5,11 @@
 //
 // Shaders are adapted from llama.cpp's MIT-licensed Vulkan backend.
 
-#include "granite/error.h"
+#include "vulkan_compute.h"
 #include "granite/log.h"
 
 #ifdef GRANITE_HAS_VULKAN
 
-#include <vulkan/vulkan.h>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -21,6 +20,10 @@
 #include <cstring>
 #include <regex>
 #include <chrono>
+#include <mutex>
+#include <memory>
+
+#include "granite/backend.h"
 
 #ifdef GRANITE_HAS_SHADERC
 #include <shaderc/shaderc.hpp>
@@ -101,32 +104,32 @@ private:
 };
 
 // =============================================================================
-// VulkanCompute Implementation
+// VulkanCompute::Impl - Implementation Details
 // =============================================================================
 
-class VulkanCompute {
+struct Pipeline {
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout desc_layout = VK_NULL_HANDLE;
+    uint32_t num_buffers = 0;
+};
+
+// Push constant structure for simple operations
+struct PushConstantsSimple {
+    uint32_t KX;        // Input size
+    uint32_t KY;        // Output size (or second dimension)
+    float param1;       // eps for norm, etc.
+    float param2;       // Additional parameter
+};
+
+class VulkanCompute::Impl {
 public:
-    struct ProfilingStats {
-        uint64_t dispatch_count = 0;
-        uint64_t sync_count = 0;
-        double sync_time_ms = 0;
-        uint64_t command_buffer_count = 0;
-    };
-
-    // Push constant structure for simple operations
-    struct PushConstantsSimple {
-        uint32_t KX;        // Input size
-        uint32_t KY;        // Output size (or second dimension)
-        float param1;       // eps for norm, etc.
-        float param2;       // Additional parameter
-    };
-
-    VulkanCompute() = default;
-    ~VulkanCompute() { shutdown(); }
+    Impl() = default;
+    ~Impl() { shutdown(); }
 
     bool initialize(VkDevice device, VkPhysicalDevice physical_device,
                    VkQueue compute_queue, uint32_t queue_family,
-                   const std::string& shader_dir = "") {
+                   const std::string& shader_dir) {
         device_ = device;
         physical_device_ = physical_device;
         compute_queue_ = compute_queue;
@@ -171,10 +174,8 @@ public:
             return false;
         }
 
-        // Load and compile shaders
-        if (!shader_dir_.empty()) {
-            compile_builtin_shaders();
-        }
+        // Compile builtin shaders
+        compile_builtin_shaders();
 
         initialized_ = true;
         GRANITE_LOG_INFO("VulkanCompute initialized");
@@ -310,14 +311,6 @@ public:
     // Quantized Matrix-Vector Operations
     // =========================================================================
 
-    // Push constants for matvec operations
-    struct PushConstantsMatvec {
-        uint32_t K;         // Input dimension (hidden size)
-        uint32_t N;         // Output dimension (number of rows)
-        uint32_t num_blocks_per_row;  // K / 256 for Q4_K
-        uint32_t padding;
-    };
-
     Result<void> matvec_q4k(VkBuffer x, VkBuffer W, VkBuffer y,
                            uint32_t K, uint32_t N) {
         auto* pipeline = get_pipeline("matvec_q4k_simple");
@@ -338,11 +331,67 @@ public:
         return dispatch_simple(*pipeline, {x, W, y}, pc, N);
     }
 
+    Result<void> matvec_q8_0(VkBuffer x, VkBuffer W, VkBuffer y,
+                            uint32_t K, uint32_t N) {
+        auto* pipeline = get_pipeline("matvec_q8_0_simple");
+        if (!pipeline) {
+            return Error(ErrorCode::NotImplemented, "Q8_0 matvec pipeline not available");
+        }
+
+        // Q8_0 has 32 elements per block
+        constexpr uint32_t BLOCK_SIZE = 32;
+        uint32_t num_blocks = (K + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+        PushConstantsSimple pc{};
+        pc.KX = K;
+        pc.KY = N;
+        pc.param1 = static_cast<float>(num_blocks);
+
+        return dispatch_simple(*pipeline, {x, W, y}, pc, N);
+    }
+
+    // =========================================================================
+    // RoPE (Rotary Position Embedding)
+    // =========================================================================
+
+    Result<void> rope(VkBuffer x, VkBuffer freq_cos, VkBuffer freq_sin,
+                     uint32_t head_dim, uint32_t num_heads, float position) {
+        auto* pipeline = get_pipeline("rope");
+        if (!pipeline) {
+            return Error(ErrorCode::NotImplemented, "RoPE pipeline not available");
+        }
+
+        PushConstantsSimple pc{};
+        pc.KX = head_dim;
+        pc.KY = num_heads;
+        pc.param1 = 10000.0f;  // theta_base (not used with precomputed freqs)
+        pc.param2 = position;
+
+        uint32_t total_pairs = num_heads * (head_dim / 2);
+        return dispatch_simple(*pipeline, {x, freq_cos, freq_sin}, pc, (total_pairs + 255) / 256);
+    }
+
+    // =========================================================================
+    // Fused Operations
+    // =========================================================================
+
+    Result<void> silu_mul(VkBuffer gate, VkBuffer up, uint32_t size) {
+        auto* pipeline = get_pipeline("silu_mul");
+        if (!pipeline) {
+            return Error(ErrorCode::NotImplemented, "SiLU*Mul pipeline not available");
+        }
+
+        PushConstantsSimple pc{};
+        pc.KX = size;
+
+        return dispatch_simple(*pipeline, {gate, up}, pc, (size + 511) / 512);
+    }
+
     // =========================================================================
     // Softmax (for attention)
     // =========================================================================
 
-    Result<void> softmax(VkBuffer x, VkBuffer out, uint32_t size, float scale = 1.0f) {
+    Result<void> softmax(VkBuffer x, VkBuffer out, uint32_t size, float scale) {
         auto* pipeline = get_pipeline("softmax");
         if (!pipeline) {
             return Error(ErrorCode::NotImplemented, "Softmax pipeline not available");
@@ -357,7 +406,7 @@ public:
     }
 
     Result<void> softmax_rows(VkBuffer x, VkBuffer out, uint32_t rows, uint32_t cols,
-                              float scale = 1.0f) {
+                              float scale) {
         auto* pipeline = get_pipeline("softmax");
         if (!pipeline) {
             return Error(ErrorCode::NotImplemented, "Softmax pipeline not available");
@@ -377,15 +426,17 @@ public:
     // =========================================================================
 
     void enable_profiling(bool enable) { profiling_enabled_ = enable; }
-    ProfilingStats get_stats() const { return stats_; }
-    void reset_stats() { stats_ = ProfilingStats{}; }
+    VulkanCompute::ProfilingStats get_stats() const { return stats_; }
+    void reset_stats() { stats_ = VulkanCompute::ProfilingStats{}; }
+
+    bool is_initialized() const { return initialized_; }
 
     // =========================================================================
     // Shader Compilation
     // =========================================================================
 
     Result<void> compile_shader(const std::string& name, const std::string& glsl_code,
-                               uint32_t num_buffers = 4) {
+                               uint32_t num_buffers) {
 #ifdef GRANITE_HAS_SHADERC
         shaderc::Compiler compiler;
         shaderc::CompileOptions options;
@@ -409,18 +460,11 @@ public:
     }
 
     Result<void> load_spirv(const std::string& name, const std::vector<uint32_t>& spirv,
-                           uint32_t num_buffers = 4) {
+                           uint32_t num_buffers) {
         return create_pipeline_from_spirv(name, spirv, num_buffers);
     }
 
 private:
-    struct Pipeline {
-        VkPipeline pipeline = VK_NULL_HANDLE;
-        VkPipelineLayout layout = VK_NULL_HANDLE;
-        VkDescriptorSetLayout desc_layout = VK_NULL_HANDLE;
-        uint32_t num_buffers = 0;
-    };
-
     bool create_descriptor_pool() {
         VkDescriptorPoolSize pool_size{};
         pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -807,8 +851,6 @@ void main() {
         }
 
         // Simplified Q4_K matvec shader
-        // Q4_K format: 256 elements per super-block, 4-bit quantization with K-means clustering
-        // Block structure: d (fp16), dmin (fp16), scales[12] (6-bit packed), qs[128] (4-bit weights)
         const char* matvec_q4k_shader = R"(
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
@@ -839,17 +881,6 @@ layout(binding = 2) writeonly buffer Y { float data_y[]; };
 
 shared float shared_sum[256];
 
-// Unpack 6-bit scales from 12 bytes into 8 scale values
-void unpack_scales(uint8_t packed[12], out float scales[8], out float mins[8]) {
-    // Simplified scale unpacking for Q4_K
-    for (int i = 0; i < 4; i++) {
-        scales[i] = float(packed[i] & 0x3F);
-        scales[i + 4] = float(packed[i + 4] & 0x3F);
-        mins[i] = float((packed[i] >> 6) | ((packed[i + 8] & 0x03) << 2));
-        mins[i + 4] = float((packed[i + 4] >> 6) | ((packed[i + 8] >> 2) & 0x0F));
-    }
-}
-
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint row = gl_WorkGroupID.x;
@@ -872,10 +903,7 @@ void main() {
         uint elem_start = lane * 8;
 
         if (elem_start < 256) {
-            // Determine which sub-block we're in (8 sub-blocks of 32 elements each)
             uint sub_block = elem_start / 32;
-
-            // Get scale for this sub-block (simplified)
             float scale = d * float(block.scales[sub_block % 12] & 0x3F);
             float min_val = dmin * float((block.scales[sub_block % 12] >> 6) + 1);
 
@@ -884,15 +912,12 @@ void main() {
                 uint k_idx = blk * 256 + elem;
 
                 if (k_idx < p.K) {
-                    // Get quantized value (4-bit)
                     uint byte_idx = elem / 2;
                     uint nibble = (elem % 2 == 0) ?
                         (block.qs[byte_idx] & 0x0F) :
                         (block.qs[byte_idx] >> 4);
 
-                    // Dequantize: w = scale * q - min
                     float w = scale * float(nibble) - min_val;
-
                     sum += data_x[k_idx] * w;
                 }
             }
@@ -1012,6 +1037,166 @@ void main() {
             GRANITE_LOG_WARN("Failed to compile softmax shader: {}", softmax_result.error().message());
         }
 
+        // Q8_0 matvec shader
+        const char* matvec_q8_0_shader = R"(
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint K;              // Input dimension
+    uint N;              // Output rows
+    float num_blocks;    // Number of blocks per row
+    float padding;
+} p;
+
+// Q8_0 block structure (34 bytes per 32 elements)
+struct block_q8_0 {
+    float16_t d;         // Scale
+    int8_t qs[32];       // Quantized weights
+};
+
+layout(binding = 0) readonly buffer X { float data_x[]; };
+layout(binding = 1) readonly buffer W { block_q8_0 data_w[]; };
+layout(binding = 2) writeonly buffer Y { float data_y[]; };
+
+shared float shared_sum[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
+
+    if (row >= p.N) return;
+
+    uint num_blocks_per_row = uint(p.num_blocks);
+    float sum = 0.0;
+
+    // Each thread processes multiple blocks
+    for (uint blk = tid; blk < num_blocks_per_row; blk += 256) {
+        uint block_idx = row * num_blocks_per_row + blk;
+        block_q8_0 block = data_w[block_idx];
+
+        float d = float(block.d);
+
+        // Process 32 elements in this block
+        for (uint i = 0; i < 32; i++) {
+            uint k_idx = blk * 32 + i;
+            if (k_idx < p.K) {
+                float w = d * float(block.qs[i]);
+                sum += data_x[k_idx] * w;
+            }
+        }
+    }
+
+    // Parallel reduction
+    shared_sum[tid] = sum;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sum[tid] += shared_sum[tid + s];
+        }
+        barrier();
+    }
+
+    if (tid == 0) {
+        data_y[row] = shared_sum[0];
+    }
+}
+)";
+
+        auto q8_0_result = compile_shader("matvec_q8_0_simple", matvec_q8_0_shader, 3);
+        if (!q8_0_result.ok()) {
+            GRANITE_LOG_WARN("Failed to compile matvec_q8_0 shader: {}", q8_0_result.error().message());
+        }
+
+        // RoPE shader
+        const char* rope_shader = R"(
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint head_dim;       // Dimension per head (e.g., 128)
+    uint num_heads;      // Number of attention heads
+    float theta_base;    // RoPE theta base (e.g., 10000.0)
+    float position;      // Current position in sequence
+} p;
+
+layout(binding = 0) buffer X { float data_x[]; };  // In-place update
+layout(binding = 1) readonly buffer FreqCos { float freq_cos[]; };
+layout(binding = 2) readonly buffer FreqSin { float freq_sin[]; };
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint half_dim = p.head_dim / 2;
+    uint total_pairs = p.num_heads * half_dim;
+
+    if (tid >= total_pairs) return;
+
+    uint head = tid / half_dim;
+    uint pair_idx = tid % half_dim;
+
+    // Get the two elements to rotate
+    uint idx0 = head * p.head_dim + pair_idx;
+    uint idx1 = head * p.head_dim + pair_idx + half_dim;
+
+    float x0 = data_x[idx0];
+    float x1 = data_x[idx1];
+
+    // Get precomputed cos/sin for this position and dimension
+    uint freq_idx = uint(p.position) * half_dim + pair_idx;
+    float cos_val = freq_cos[freq_idx];
+    float sin_val = freq_sin[freq_idx];
+
+    // Apply rotation: (x0, x1) -> (x0*cos - x1*sin, x0*sin + x1*cos)
+    data_x[idx0] = x0 * cos_val - x1 * sin_val;
+    data_x[idx1] = x0 * sin_val + x1 * cos_val;
+}
+)";
+
+        auto rope_result = compile_shader("rope", rope_shader, 3);
+        if (!rope_result.ok()) {
+            GRANITE_LOG_WARN("Failed to compile rope shader: {}", rope_result.error().message());
+        }
+
+        // SiLU * elementwise multiply (fused for FFN)
+        const char* silu_mul_shader = R"(
+#version 450
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint KX;
+    uint KY;
+    float param1;
+    float param2;
+} p;
+
+layout(binding = 0) buffer A { float data_a[]; };  // gate (modified in-place)
+layout(binding = 1) readonly buffer B { float data_b[]; };  // up
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.KX) return;
+
+    float gate = data_a[i];
+    float up = data_b[i];
+
+    // SiLU(gate) * up
+    float silu_gate = gate / (1.0 + exp(-gate));
+    data_a[i] = silu_gate * up;
+}
+)";
+
+        auto silu_mul_result = compile_shader("silu_mul", silu_mul_shader, 2);
+        if (!silu_mul_result.ok()) {
+            GRANITE_LOG_WARN("Failed to compile silu_mul shader: {}", silu_mul_result.error().message());
+        }
+
         GRANITE_LOG_INFO("Compiled {} builtin shaders", pipelines_.size());
 #else
         GRANITE_LOG_INFO("Shaderc not available, using pre-compiled SPIR-V only");
@@ -1021,7 +1206,7 @@ void main() {
     // State
     bool initialized_ = false;
     bool profiling_enabled_ = false;
-    ProfilingStats stats_;
+    VulkanCompute::ProfilingStats stats_;
 
     // Vulkan handles
     VkDevice device_ = VK_NULL_HANDLE;
@@ -1044,6 +1229,154 @@ void main() {
     std::unordered_map<std::string, Pipeline> pipelines_;
     std::unordered_map<uint32_t, VkDescriptorSetLayout> descriptor_set_layouts_;
 };
+
+// =============================================================================
+// VulkanCompute Public Interface Implementation
+// =============================================================================
+
+VulkanCompute::VulkanCompute() : impl_(std::make_unique<Impl>()) {}
+
+VulkanCompute::~VulkanCompute() = default;
+
+VulkanCompute::VulkanCompute(VulkanCompute&&) noexcept = default;
+VulkanCompute& VulkanCompute::operator=(VulkanCompute&&) noexcept = default;
+
+bool VulkanCompute::initialize(VkDevice device, VkPhysicalDevice physical_device,
+                               VkQueue compute_queue, uint32_t queue_family,
+                               const std::string& shader_dir) {
+    return impl_->initialize(device, physical_device, compute_queue, queue_family, shader_dir);
+}
+
+void VulkanCompute::shutdown() {
+    impl_->shutdown();
+}
+
+void VulkanCompute::sync() {
+    impl_->sync();
+}
+
+Result<void> VulkanCompute::silu(VkBuffer x, VkBuffer out, uint32_t size) {
+    return impl_->silu(x, out, size);
+}
+
+Result<void> VulkanCompute::gelu(VkBuffer x, VkBuffer out, uint32_t size) {
+    return impl_->gelu(x, out, size);
+}
+
+Result<void> VulkanCompute::add(VkBuffer a, VkBuffer b, VkBuffer out, uint32_t size) {
+    return impl_->add(a, b, out, size);
+}
+
+Result<void> VulkanCompute::mul(VkBuffer a, VkBuffer b, VkBuffer out, uint32_t size) {
+    return impl_->mul(a, b, out, size);
+}
+
+Result<void> VulkanCompute::rms_norm(VkBuffer x, VkBuffer weight, VkBuffer out,
+                                      uint32_t size, float eps) {
+    return impl_->rms_norm(x, weight, out, size, eps);
+}
+
+Result<void> VulkanCompute::matvec_q4k(VkBuffer x, VkBuffer W, VkBuffer y,
+                                        uint32_t K, uint32_t N) {
+    return impl_->matvec_q4k(x, W, y, K, N);
+}
+
+Result<void> VulkanCompute::matvec_q8_0(VkBuffer x, VkBuffer W, VkBuffer y,
+                                         uint32_t K, uint32_t N) {
+    return impl_->matvec_q8_0(x, W, y, K, N);
+}
+
+Result<void> VulkanCompute::rope(VkBuffer x, VkBuffer freq_cos, VkBuffer freq_sin,
+                                  uint32_t head_dim, uint32_t num_heads, float position) {
+    return impl_->rope(x, freq_cos, freq_sin, head_dim, num_heads, position);
+}
+
+Result<void> VulkanCompute::silu_mul(VkBuffer gate, VkBuffer up, uint32_t size) {
+    return impl_->silu_mul(gate, up, size);
+}
+
+Result<void> VulkanCompute::softmax(VkBuffer x, VkBuffer out, uint32_t size, float scale) {
+    return impl_->softmax(x, out, size, scale);
+}
+
+Result<void> VulkanCompute::softmax_rows(VkBuffer x, VkBuffer out, uint32_t rows,
+                                          uint32_t cols, float scale) {
+    return impl_->softmax_rows(x, out, rows, cols, scale);
+}
+
+void VulkanCompute::enable_profiling(bool enable) {
+    impl_->enable_profiling(enable);
+}
+
+VulkanCompute::ProfilingStats VulkanCompute::get_stats() const {
+    return impl_->get_stats();
+}
+
+void VulkanCompute::reset_stats() {
+    impl_->reset_stats();
+}
+
+Result<void> VulkanCompute::compile_shader(const std::string& name, const std::string& glsl_code,
+                                            uint32_t num_buffers) {
+    return impl_->compile_shader(name, glsl_code, num_buffers);
+}
+
+Result<void> VulkanCompute::load_spirv(const std::string& name, const std::vector<uint32_t>& spirv,
+                                        uint32_t num_buffers) {
+    return impl_->load_spirv(name, spirv, num_buffers);
+}
+
+bool VulkanCompute::is_initialized() const {
+    return impl_->is_initialized();
+}
+
+// =============================================================================
+// Global VulkanCompute Accessor
+// =============================================================================
+
+// Forward declaration
+extern std::unique_ptr<IComputeBackend> create_vulkan_backend();
+
+static std::unique_ptr<VulkanCompute> g_vulkan_compute;
+static std::unique_ptr<IComputeBackend> g_vulkan_backend;  // Keep backend alive
+static std::once_flag g_vulkan_compute_init;
+
+VulkanCompute* get_vulkan_compute() {
+    std::call_once(g_vulkan_compute_init, []() {
+        // Create and initialize VulkanBackend
+        g_vulkan_backend = create_vulkan_backend();
+        if (!g_vulkan_backend) {
+            GRANITE_LOG_ERROR("Failed to create Vulkan backend");
+            return;
+        }
+
+        auto init_result = g_vulkan_backend->initialize();
+        if (!init_result.ok()) {
+            GRANITE_LOG_ERROR("Failed to initialize Vulkan backend: {}",
+                             init_result.error().message());
+            g_vulkan_backend.reset();
+            return;
+        }
+
+        // Get Vulkan device from backend
+        VkDevice device = static_cast<VkDevice>(g_vulkan_backend->get_native_device());
+        if (!device) {
+            GRANITE_LOG_ERROR("Failed to get Vulkan device");
+            g_vulkan_backend.reset();
+            return;
+        }
+
+        g_vulkan_compute = std::make_unique<VulkanCompute>();
+
+        // Note: Full initialization requires physical device and queue
+        // These need to be exposed from VulkanBackend
+        // For now, VulkanCompute is created but not fully initialized
+        GRANITE_LOG_INFO("VulkanCompute accessor ready (device: {})",
+                        g_vulkan_backend->get_capabilities().name);
+    });
+
+    return g_vulkan_compute.get();
+}
 
 } // namespace granite
 
