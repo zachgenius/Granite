@@ -755,12 +755,13 @@ kernel void matmul_q4k_simd(
     constant uint& M               [[buffer(3)]],
     constant uint& K               [[buffer(4)]],
     constant uint& N               [[buffer(5)]],
-    uint2 gid                      [[thread_position_in_grid]],
+    uint2 tgpig                    [[threadgroup_position_in_grid]],
     uint simd_lane                 [[thread_index_in_simdgroup]]
 ) {
-    // Each simdgroup handles 4 rows x 1 column
-    uint row_base = gid.y * 4;
-    uint col = gid.x;
+    // Each simdgroup (threadgroup) handles 4 rows x 1 column
+    // tgpig.x = column index, tgpig.y = row group index
+    uint row_base = tgpig.y * 4;
+    uint col = tgpig.x;
 
     if (col >= N) return;
 
@@ -838,15 +839,17 @@ kernel void matmul_q4k_simd(
 // SIMDGROUP MATRIX Q4_K Matmul (Optimized for Prefill)
 // =============================================================================
 // Uses simdgroup_half8x8 matrices and simdgroup_multiply_accumulate for
-// efficient tiled matrix multiplication. This approach can close the 25%
-// performance gap with llama.cpp.
+// efficient tiled matrix multiplication following llama.cpp's approach.
+//
+// Computes: Y[M, N] = X[M, K] @ W[N, K]^T
 //
 // Algorithm:
-// 1. Dequantize Q4_K blocks into half precision tiles in threadgroup memory
-// 2. Use simdgroup_load to load 8x8 tiles into simdgroup matrices
-// 3. Use simdgroup_multiply_accumulate for efficient matmul
+// 1. Dequantize Q4_K weight blocks into half precision in threadgroup memory (sa)
+// 2. Load input activations into threadgroup memory (sb)
+// 3. Use simdgroup matrices for tiled multiply-accumulate
+// 4. Write results with correct row-major layout
 //
-// Tile sizes: 64 rows x 32 cols output per threadgroup
+// Tile sizes: 64 output-N x 32 output-M per threadgroup
 // Each simdgroup handles 32x16 output elements
 // 4 simdgroups (128 threads) per threadgroup
 // =============================================================================
@@ -882,15 +885,15 @@ inline void dequantize_q4_k_to_half4x4(
     }
 }
 
-// Configuration for simdgroup matmul kernel
-constant constexpr uint SGMM_NR0 = 64;   // Output rows per threadgroup
-constant constexpr uint SGMM_NR1 = 32;   // Output cols per threadgroup
+// Configuration - matches llama.cpp kernel_mul_mm
+constant constexpr uint SGMM_NR0 = 64;   // Weight rows (N output) per threadgroup
+constant constexpr uint SGMM_NR1 = 32;   // Input rows (M output) per threadgroup
 constant constexpr uint SGMM_NK  = 32;   // K-dimension per iteration
 
 kernel void matmul_q4k_simdgroup(
-    device const float* X          [[buffer(0)]],  // Input [M, K]
+    device const float* X          [[buffer(0)]],  // Input [M, K] row-major
     device const void* W           [[buffer(1)]],  // Weights [N, K/256] Q4_K blocks
-    device float* Y                [[buffer(2)]],  // Output [M, N]
+    device float* Y                [[buffer(2)]],  // Output [M, N] row-major
     constant uint& M               [[buffer(3)]],  // Batch size (num tokens)
     constant uint& K               [[buffer(4)]],  // Input dimension
     constant uint& N               [[buffer(5)]],  // Output dimension
@@ -899,112 +902,126 @@ kernel void matmul_q4k_simdgroup(
     ushort tiitg                   [[thread_index_in_threadgroup]],
     ushort sgitg                   [[simdgroup_index_in_threadgroup]]
 ) {
-    // Threadgroup memory layout:
-    // sa: 64 x 32 half for A tiles (dequantized weights)  = 4096 bytes
-    // sb: 32 x 32 half for B tiles (input activations)    = 2048 bytes
+    // Threadgroup memory layout (following llama.cpp):
+    // sa: NR0 x NK half for weight tiles (64 x 32 = 4096 bytes)
+    // sb: NR1 x NK half for input tiles (32 x 32 = 2048 bytes)
     threadgroup half* sa = (threadgroup half*)(shmem);
     threadgroup half* sb = (threadgroup half*)(shmem + 4096);
 
     const uint num_blocks_k = K / QK_K;
     const device block_q4_K* weights = (const device block_q4_K*)W;
 
-    // Output tile position
-    const uint r0 = tgpig.y * SGMM_NR0;  // Output row start (M dimension)
-    const uint r1 = tgpig.x * SGMM_NR1;  // Output col start (N dimension)
+    // Grid assignment (following llama.cpp exactly):
+    // r0 = weight rows (N output dimension)
+    // r1 = input rows (M output dimension)
+    const uint r0 = tgpig.y * SGMM_NR0;  // N dimension start
+    const uint r1 = tgpig.x * SGMM_NR1;  // M dimension start
 
-    // Bounds check
-    const short nr0 = min((uint)SGMM_NR0, M - r0);
-    const short nr1 = min((uint)SGMM_NR1, N - r1);
+    // Bounds
+    const short nr0 = min((uint)SGMM_NR0, N - r0);  // Actual N rows to process
+    const short nr1 = min((uint)SGMM_NR1, M - r1);  // Actual M rows to process
 
-    // Thread's loading position
-    const short NL0 = SGMM_NK / 16;  // 2 - number of 16-element chunks per thread
-    const short NL1 = SGMM_NK / 8;   // 4 - for loading input
+    // Thread assignment for loading
+    const short NL0 = SGMM_NK / 16;  // 2 chunks per thread for weights
+    const short NL1 = SGMM_NK / 8;   // 4 chunks per thread for inputs
 
-    const short lr0 = min((short)(tiitg/NL0), (short)(nr0 - 1));  // Which batch row
-    const short lr1 = min((short)(tiitg/NL1), (short)(nr1 - 1));  // Which output col
+    // Which weight row (0..63) and input row (0..31) this thread loads
+    const short lr0 = min((short)(tiitg / NL0), (short)(nr0 - 1));  // Weight row
+    const short lr1 = min((short)(tiitg / NL1), (short)(nr1 - 1));  // Input row
 
-    const short il0 = tiitg % NL0;  // Which 16-element chunk within block
+    const short il0 = tiitg % NL0;  // Which 16-elem chunk within Q4_K block
 
-    // Simdgroup accumulator matrices (8 x 8x8 = 64 output elements per simdgroup)
+    // Simdgroup accumulator matrices
     simdgroup_half8x8 ma[4];   // Weight tiles
     simdgroup_half8x8 mb[2];   // Input tiles
-    simdgroup_float8x8 mc[8];  // Accumulators (in float for precision)
+    simdgroup_float8x8 mc[8];  // Accumulators
 
-    // Initialize accumulators to zero
+    // Initialize accumulators
     for (short i = 0; i < 8; i++) {
         mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
     }
 
     short il = il0;
+    const short iy = 8 * (tiitg % NL1);  // K offset for input loading
 
-    // Process K dimension in chunks of SGMM_NK
+    // Process K dimension in chunks
     for (uint loop_k = 0; loop_k < K; loop_k += SGMM_NK) {
-        // Determine which Q4_K block we're in
+        // Determine Q4_K block index
         uint block_idx = (loop_k + 16 * il) / QK_K;
         uint within_block = ((loop_k + 16 * il) % QK_K) / 16;
 
-        // Load and dequantize weights into threadgroup memory
-        if (lr1 < nr1 && block_idx < num_blocks_k) {
-            device const block_q4_K* w_block = &weights[(r1 + lr1) * num_blocks_k + block_idx];
-
-            half4x4 temp_a;
+        // Load and dequantize weights into sa
+        // Weight W[n, k] for output dimension n = r0 + lr0
+        half4x4 temp_a;
+        if (lr0 < nr0 && block_idx < num_blocks_k) {
+            device const block_q4_K* w_block = &weights[(r0 + lr0) * num_blocks_k + block_idx];
             dequantize_q4_k_to_half4x4(w_block, within_block, temp_a);
-
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            for (short i = 0; i < 16; i++) {
-                const short sx = 2 * il0 + i/8;
-                const short sy = lr1 / 8;
-                const short lx = lr1 % 8;
-                const short ly = i % 8;
-                const short ib = 8 * sx + sy;
-
-                *(sa + 64 * ib + 8 * ly + lx) = temp_a[i/4][i%4];
-            }
+        } else {
+            temp_a = half4x4(0);
         }
 
-        // Load input activations into threadgroup memory
-        if (lr0 < nr0 && loop_k + 8 * (tiitg % NL1) < K) {
-            const short iy = 8 * (tiitg % NL1);
-            device const float* x_ptr = X + (r0 + lr0) * K + loop_k + iy;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Store weight tile with layout matching simdgroup_load expectations
+        // sa layout: [NK/8 blocks][NR0/8 blocks][8][8]
+        for (short i = 0; i < 16; i++) {
+            const short sx = 2 * il0 + i / 8;       // K block index (0..3 for NK=32)
+            const short sy = lr0 / 8;               // N block index (0..7 for NR0=64)
+            const short lx = lr0 % 8;               // Within N block
+            const short ly = i % 8;                 // Within K block
+            const short ib = 8 * sx + sy;           // Combined block index
+
+            *(sa + 64 * ib + 8 * ly + lx) = temp_a[i / 4][i % 4];
+        }
+
+        // Load input into sb
+        // Input X[m, k] for batch index m = r1 + lr1
+        if (lr1 < nr1) {
+            device const float* x_ptr = X + (r1 + lr1) * K + loop_k + iy;
 
             for (short i = 0; i < 8; ++i) {
-                const short sx = tiitg % NL1;
-                const short sy = lr0 / 8;
-                const short lx = i;
-                const short ly = lr0 % 8;
+                const short sx = tiitg % NL1;       // K block index
+                const short sy = lr1 / 8;           // M block index
+                const short lx = i;                 // Within K block
+                const short ly = lr1 % 8;           // Within M block
                 const short ib = 4 * sx + sy;
 
-                *(sb + 64 * ib + 8 * ly + lx) = loop_k + iy + i < K ?
-                    half(x_ptr[i]) : half(0);
+                half val = (loop_k + iy + i < K) ? half(x_ptr[i]) : half(0);
+                *(sb + 64 * ib + 8 * ly + lx) = val;
             }
         }
 
+        // Advance Q4_K block position
         il = (il + 2 < 16) ? il + 2 : il % 2;
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Perform simdgroup matrix multiply-accumulate
-        threadgroup const half* lsma = sa + 4 * 64 * (sgitg % 2);
-        threadgroup const half* lsmb = sb + 2 * 64 * (sgitg / 2);
+        // Simdgroup matrix multiply-accumulate
+        // Each simdgroup computes 32x16 output: 32 N rows x 16 M rows
+        threadgroup const half* lsma = sa + 4 * 64 * (sgitg % 2);  // Weight tiles
+        threadgroup const half* lsmb = sb + 2 * 64 * (sgitg / 2);  // Input tiles
 
         for (short ik = 0; ik < SGMM_NK / 8; ik++) {
             simdgroup_barrier(mem_flags::mem_none);
 
+            // Load 4 weight 8x8 tiles (32 N rows)
             for (short i = 0; i < 4; i++) {
                 simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
             }
 
             simdgroup_barrier(mem_flags::mem_none);
 
+            // Load 2 input 8x8 tiles (16 M rows)
             for (short i = 0; i < 2; i++) {
                 simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
             }
 
             simdgroup_barrier(mem_flags::mem_none);
 
+            // Compute: mc[i] = mb[i/4] @ ma[i%4]
+            // Result: 8 matrices of 8x8 covering 16x32 output
             for (short i = 0; i < 8; i++) {
-                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
             }
 
             lsma += 8 * 64;
@@ -1012,48 +1029,60 @@ kernel void matmul_q4k_simdgroup(
         }
     }
 
-    // Write results to global memory (row-major: Y[M, N])
-    // Each simdgroup computes a 32x16 output tile
-    const uint sg_row = r0 + 32 * (sgitg & 1);   // Row offset for this simdgroup
-    const uint sg_col = r1 + 16 * (sgitg >> 1);  // Col offset for this simdgroup
-    device float* C = Y + sg_row * N + sg_col;
+    // Write results to global memory
+    // Output Y[M, N] row-major: Y[m, n] at address m * N + n
+    // This simdgroup computed output for:
+    //   N rows: r0 + 32*(sgitg%2) .. r0 + 32*(sgitg%2) + 31
+    //   M rows: r1 + 16*(sgitg/2) .. r1 + 16*(sgitg/2) + 15
+    // But we need to transpose because mc = input @ weight gives [M_tile, N_tile]
 
-    if (sg_row + 32 <= M && sg_col + 16 <= N) {
-        // Full tile - can store directly with row-major stride N
+    const uint sg_n = r0 + 32 * (sgitg % 2);   // N start for this simdgroup
+    const uint sg_m = r1 + 16 * (sgitg / 2);   // M start for this simdgroup
+
+    // The mc matrices contain [M_local, N_local] data
+    // mc[i] where i/4 selects M block, i%4 selects N block
+    // So mc[0..3] are M rows 0-7 with N cols 0-7, 8-15, 16-23, 24-31
+    //    mc[4..7] are M rows 8-15 with N cols 0-7, 8-15, 16-23, 24-31
+
+    if (sg_m + 16 <= M && sg_n + 32 <= N) {
+        // Full tile - store with row-major layout
+        // Y[sg_m + m_off, sg_n + n_off] = mc[...][m_local][n_local]
+        device float* C = Y + sg_m * N + sg_n;
+
         for (short i = 0; i < 8; i++) {
-            // mc[i] is 8x8, we have 4 row-tiles and 2 col-tiles
-            // i%4 = col tile (0-3 -> 0,8,16,24 col offset within 32-row block)
-            // i/4 = row tile (0-1 -> 0,8 row offset within 16-col block)
-            // Actually for row-major: row offset = 8*(i%4), col offset = 8*(i/4)
-            simdgroup_store(mc[i], C + 8 * (i % 4) * N + 8 * (i / 4), N, 0, false);
+            // i/4 gives M block (0 or 1 -> rows 0-7 or 8-15)
+            // i%4 gives N block (0-3 -> cols 0-7, 8-15, 16-23, 24-31)
+            simdgroup_store(mc[i], C + 8 * (i / 4) * N + 8 * (i % 4), N, 0, false);
         }
     } else {
         // Partial tile - use threadgroup memory as intermediate
         threadgroup float* sc = (threadgroup float*)(shmem);
 
+        // Store all mc matrices to threadgroup memory with stride 8
         for (short i = 0; i < 8; i++) {
             simdgroup_store(mc[i], sc + 64 * i, 8, 0, false);
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Each thread copies one element if in bounds
-        // sc layout: 8 matrices of 8x8 = 512 floats
-        // Reorganize to row-major output
-        const short local_row = tiitg % 32;
-        const short local_col = tiitg / 32;
-        const uint out_row = sg_row + local_row;
-        const uint out_col = sg_col + local_col;
+        // Each thread copies elements that are in bounds
+        // 128 threads, need to cover 16x32 = 512 elements
+        for (uint idx = tiitg; idx < 16 * 32; idx += 128) {
+            const uint local_m = idx / 32;  // 0..15
+            const uint local_n = idx % 32;  // 0..31
+            const uint out_m = sg_m + local_m;
+            const uint out_n = sg_n + local_n;
 
-        if (out_row < M && out_col < N && local_col < 16) {
-            // Map local (row, col) to sc index
-            // sc has 4 row-tiles (i%4) and 2 col-tiles (i/4) of 8x8 each
-            const short tile_row = local_row / 8;  // 0-3
-            const short tile_col = local_col / 8;  // 0-1
-            const short in_tile_row = local_row % 8;
-            const short in_tile_col = local_col % 8;
-            const short tile_idx = tile_row + tile_col * 4;
-            Y[out_row * N + out_col] = sc[tile_idx * 64 + in_tile_row * 8 + in_tile_col];
+            if (out_m < M && out_n < N) {
+                // Map to sc index
+                const uint m_block = local_m / 8;    // 0 or 1
+                const uint n_block = local_n / 8;    // 0..3
+                const uint in_m = local_m % 8;
+                const uint in_n = local_n % 8;
+                const uint tile_idx = m_block * 4 + n_block;
+
+                Y[out_m * N + out_n] = sc[tile_idx * 64 + in_m * 8 + in_n];
+            }
         }
     }
 }

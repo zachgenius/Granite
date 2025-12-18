@@ -345,6 +345,10 @@ add_executable(granite_attention_bench tools/benchmark_attention.mm)
 set_source_files_properties(tools/benchmark_attention.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 target_link_libraries(granite_attention_bench PRIVATE granite metal-cpp "-framework Metal" "-framework Foundation")
 
+add_executable(test_simdgroup_matmul tools/test_simdgroup_matmul.mm)
+set_source_files_properties(tools/test_simdgroup_matmul.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+target_link_libraries(test_simdgroup_matmul PRIVATE granite metal-cpp "-framework Metal" "-framework Foundation")
+
 # =============================================================================
 # Installation
 # =============================================================================

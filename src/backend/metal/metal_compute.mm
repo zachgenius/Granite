@@ -282,20 +282,22 @@ public:
         encoder->setBytes(&K, sizeof(K), 4);
         encoder->setBytes(&N, sizeof(N), 5);
 
-        // Grid: (N cols, M/4 row groups)
-        // Each simdgroup handles 4 rows x 1 col
+        // Grid of threadgroups: (N cols, M/4 row groups)
+        // Each threadgroup (1 simdgroup of 32 threads) handles 4 rows x 1 col
+        // IMPORTANT: Use dispatchThreadgroups so that all 32 threads in a simdgroup
+        // share the same threadgroup_position_in_grid, enabling K-parallel reduction.
         uint32_t grid_M = (M + 3) / 4;
         MTL::Size grid_size = MTL::Size::Make(N, grid_M, 1);
         MTL::Size threadgroup_size = MTL::Size::Make(32, 1, 1);  // 1 simdgroup
-        encoder->dispatchThreads(grid_size, threadgroup_size);
+        encoder->dispatchThreadgroups(grid_size, threadgroup_size);
 
         return {};
     }
 
     // Simdgroup matrix matmul dispatch for prefill
     // Uses simdgroup_half8x8 matrices and simdgroup_multiply_accumulate
-    // Tile sizes: 64 rows x 32 cols per threadgroup, 4 simdgroups
-    // Requires 8KB threadgroup memory (4KB for weights, 2KB for activations)
+    // Tile sizes: NR0=64 for N (output cols), NR1=32 for M (batch rows)
+    // Requires 8KB threadgroup memory (4KB for weights + 2KB for activations)
     Result<void> dispatch_matmul_simdgroup(
         const char* kernel_name,
         MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
@@ -319,14 +321,16 @@ public:
         constexpr size_t shmem_size = 8192;  // 8KB: 4KB for weights + 2KB for activations
         encoder->setThreadgroupMemoryLength(shmem_size, 0);
 
-        // Tile sizes: 64 rows x 32 cols per threadgroup
-        constexpr uint32_t NR0 = 64;  // Output rows per threadgroup
-        constexpr uint32_t NR1 = 32;  // Output cols per threadgroup
+        // Kernel uses:
+        //   r0 = tgpig.y * NR0 for N dimension (64 output columns per TG)
+        //   r1 = tgpig.x * NR1 for M dimension (32 batch rows per TG)
+        constexpr uint32_t NR0 = 64;  // N (output cols) per threadgroup
+        constexpr uint32_t NR1 = 32;  // M (batch rows) per threadgroup
 
-        // Grid of threadgroups
-        uint32_t num_tg_rows = (M + NR0 - 1) / NR0;
-        uint32_t num_tg_cols = (N + NR1 - 1) / NR1;
-        MTL::Size grid_size = MTL::Size::Make(num_tg_cols, num_tg_rows, 1);
+        // Grid: x = M tiles, y = N tiles (matches kernel's tgpig usage)
+        uint32_t num_m_tiles = (M + NR1 - 1) / NR1;  // tgpig.x range
+        uint32_t num_n_tiles = (N + NR0 - 1) / NR0;  // tgpig.y range
+        MTL::Size grid_size = MTL::Size::Make(num_m_tiles, num_n_tiles, 1);
 
         // 128 threads per threadgroup (4 simdgroups of 32 threads)
         MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
@@ -540,12 +544,15 @@ Result<void> MetalCompute::matmul_q4k(
     MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
     uint32_t M, uint32_t K, uint32_t N)
 {
-    // TODO: simdgroup matrix kernel for very large batches (M >= 256)
-    // Uses simdgroup_half8x8 matrices and simdgroup_multiply_accumulate
-    // for maximum throughput. Currently disabled - needs algorithm verification.
-    // if (M >= 256) {
-    //     return impl_->dispatch_matmul_simdgroup("matmul_q4k_simdgroup", X, W, Y, M, K, N);
-    // }
+    // TODO: Simdgroup matrix kernel for large batches (M >= 256)
+    // Uses simdgroup_half8x8 matrices and simdgroup_multiply_accumulate.
+    // Currently disabled - algorithm has correctness issues with memory layout.
+    // The kernel produces incorrect output due to issues in:
+    //   1. sa/sb threadgroup memory layout vs simdgroup_load expectations
+    //   2. K-dimension iteration tracking (il variable logic)
+    //   3. Output write indexing for row-major layout
+    // See llama.cpp's kernel_mul_mm for reference implementation.
+    // For now, the SIMD kernel (matmul_q4k_simd) provides functional prefill.
 
     // Use SIMD K-parallel kernel for larger batches (M >= 32)
     if (M >= 32) {
