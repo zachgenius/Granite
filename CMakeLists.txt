@@ -12,6 +12,7 @@ endif()
 
 # Options
 option(GRANITE_BUILD_METAL "Build Metal backend (Apple only)" ON)
+option(GRANITE_BUILD_VULKAN "Build Vulkan backend (Linux/Android/Windows)" OFF)
 option(GRANITE_BUILD_CPU "Build CPU backend" ON)
 option(GRANITE_BUILD_TESTS "Build tests" ON)
 option(GRANITE_BUILD_EXAMPLES "Build examples" ON)
@@ -202,6 +203,36 @@ if(GRANITE_BUILD_CPU)
             target_compile_options(granite PRIVATE -mavx2)
             target_compile_definitions(granite PRIVATE GRANITE_HAS_AVX2=1)
         endif()
+    endif()
+endif()
+
+# =============================================================================
+# Vulkan Backend (Linux/Android/Windows)
+# =============================================================================
+
+if(GRANITE_BUILD_VULKAN)
+    find_package(Vulkan REQUIRED)
+
+    set(GRANITE_VULKAN_SOURCES
+        src/backend/vulkan/vulkan_backend.cpp
+        src/backend/vulkan/vulkan_compute.cpp
+        src/operators/vulkan/vulkan_operators.cpp
+    )
+
+    target_sources(granite PRIVATE ${GRANITE_VULKAN_SOURCES})
+
+    target_link_libraries(granite
+        PRIVATE
+            Vulkan::Vulkan
+    )
+
+    target_compile_definitions(granite PUBLIC GRANITE_HAS_VULKAN=1)
+
+    # Optional: Link shaderc for runtime shader compilation
+    find_package(unofficial-shaderc CONFIG QUIET)
+    if(unofficial-shaderc_FOUND)
+        target_link_libraries(granite PRIVATE unofficial::shaderc::shaderc)
+        target_compile_definitions(granite PRIVATE GRANITE_HAS_SHADERC=1)
     endif()
 endif()
 

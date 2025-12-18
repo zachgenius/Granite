@@ -308,6 +308,12 @@ void register_cpu_operators() {}
 void register_metal_operators() {}
 #endif
 
+#ifdef GRANITE_HAS_VULKAN
+// Defined in src/operators/vulkan/vulkan_operators.cpp
+#else
+void register_vulkan_operators() {}
+#endif
+
 namespace {
     bool operators_initialized = false;
 }
@@ -323,6 +329,10 @@ void initialize_operators() {
 
 #ifdef GRANITE_HAS_METAL
     register_metal_operators();
+#endif
+
+#ifdef GRANITE_HAS_VULKAN
+    register_vulkan_operators();
 #endif
 
     operators_initialized = true;
