@@ -1,6 +1,93 @@
-// Metal shader source code for LLM inference kernels
-// This file contains all Metal compute kernels as embedded strings
+// =============================================================================
+// Metal Shader Source for LLM Inference Kernels
+// =============================================================================
+//
+// This file contains all Metal compute kernels for Granite's GPU-accelerated
+// LLM inference. Kernels are embedded as a string and compiled at runtime.
+//
 // NOTE: This file is included inside namespace granite {} in metal_compute.mm
+//
+// =============================================================================
+// TABLE OF CONTENTS
+// =============================================================================
+//
+// 1. QUANTIZATION FORMATS
+//    - block_q4_K:  4-bit (256 elem/block, 144 bytes) - high quality K-quants
+//    - block_q8_0:  8-bit (32 elem/block, 34 bytes) - simple 8-bit
+//    - block_q4_0:  4-bit (32 elem/block, 18 bytes) - legacy 4-bit
+//    - block_iq4_nl: 4-bit (32 elem/block, 18 bytes) - non-linear i-quants
+//    - block_iq4_xs: 4-bit (256 elem/block, 136 bytes) - extended i-quants
+//    - block_q6_K:  6-bit (256 elem/block, 210 bytes) - high precision
+//    - block_q5_K:  5-bit (256 elem/block, 176 bytes) - balanced quality/size
+//    - block_q3_K:  3-bit (256 elem/block, 110 bytes) - aggressive compression
+//    - block_q2_K:  2-bit (256 elem/block, 84 bytes) - maximum compression
+//    - block_iq3_s: 3-bit (256 elem/block) - importance-based i-quants
+//
+// 2. MATRIX-VECTOR KERNELS (DECODE - Single Token)
+//    - matvec_q4k:      Q4_K decode (SIMD-optimized, llama.cpp style)
+//    - matvec_q8_0:     Q8_0 decode
+//    - matvec_q4_0:     Q4_0 decode
+//    - matvec_iq4_nl:   IQ4_NL decode (lookup table)
+//    - matvec_iq4_xs:   IQ4_XS decode (super-block scales)
+//    - matvec_q6k:      Q6_K decode
+//    - matvec_q5k:      Q5_K decode
+//    - matvec_q3k:      Q3_K decode
+//    - matvec_q2k:      Q2_K decode
+//    - matvec_iq3_s:    IQ3_S decode
+//    - matvec_residual_*: Fused matvec + residual addition
+//
+// 3. MATRIX-MATRIX KERNELS (PREFILL - Batched)
+//    - matmul_q4k:      Q4_K batched multiply
+//    - matmul_q8_0:     Q8_0 batched multiply
+//    - matmul_q4_0:     Q4_0 batched multiply
+//    - matmul_iq4_nl:   IQ4_NL batched multiply
+//    - matmul_iq4_xs:   IQ4_XS batched multiply (SIMD-optimized)
+//    - matmul_iq3_s:    IQ3_S batched multiply (SIMD-optimized)
+//
+// 4. FUSED KERNELS
+//    - fused_qkv_matvec_q4k:  Q+K+V projections in single dispatch
+//    - rms_norm_matvec_*:     RMSNorm + MatVec fusion
+//
+// 5. ATTENTION KERNELS
+//    - attention_decode:              Single query attention (FP32 KV)
+//    - multihead_attention_decode:    Multi-head decode (FP32 KV)
+//    - multihead_attention_decode_f16kv: Multi-head decode (FP16 KV)
+//    - flash_attention_decode:        Flash attention style
+//    - attention_prefill:             Batched attention (FP32 KV)
+//    - attention_prefill_f16kv:       Batched attention (FP16 KV)
+//    - attention_tree_f16kv:          Tree attention for speculative decoding
+//    - paged_attention_decode:        Paged KV cache attention
+//    - batched_paged_attention_decode: Batched paged attention
+//
+// 6. UTILITY KERNELS
+//    - copy_to_kv_cache:     Copy Q/K projections to KV cache
+//    - silu_elementwise:     SiLU activation
+//    - add_vectors:          Vector addition
+//    - rope_f32/rope_f16:    Rotary position embeddings
+//    - rms_norm:             RMS normalization
+//    - softmax:              Softmax activation
+//
+// =============================================================================
+// PERFORMANCE NOTES
+// =============================================================================
+//
+// Memory Bandwidth:
+//   - M3 Max theoretical: ~400 GB/s
+//   - Good efficiency target: > 50% of theoretical
+//   - Matvec kernels are memory-bound (low arithmetic intensity)
+//
+// Threading Model:
+//   - SIMD width: 32 threads (Apple Silicon)
+//   - Most kernels use 2-8 SIMD groups per threadgroup (64-256 threads)
+//   - Q4_K kernels: 2 SIMD groups (64 threads) matches llama.cpp
+//
+// Quantization Trade-offs:
+//   - Q4_K: Best quality/size for 4-bit (144 bytes/256 elems = 4.5 bits/elem)
+//   - Q8_0: Simple, fast, good quality (34 bytes/32 elems = 8.5 bits/elem)
+//   - IQ4_*: Better quality than Q4 at same size via non-linear LUT
+//   - Q2_K: Maximum compression (84 bytes/256 elems = 2.6 bits/elem)
+//
+// =============================================================================
 
 #pragma once
 
@@ -9,21 +96,48 @@ static const char* METAL_SHADER_SOURCE = R"(
 #include <metal_stdlib>
 using namespace metal;
 
+// =============================================================================
+// CONSTANTS AND QUANTIZATION BLOCK DEFINITIONS
+// =============================================================================
+
+// Super-block size for K-quants (Q4_K, Q6_K, Q5_K, Q3_K, Q2_K)
 constant constexpr uint QK_K = 256;
+
+// Simple quant block sizes
 constant constexpr uint QK8_0 = 32;  // Q8_0 block size
 
+// -----------------------------------------------------------------------------
+// Q4_K: 256 elements per super-block, 144 bytes
+// -----------------------------------------------------------------------------
+// High-quality 4-bit quantization with sub-block scales and mins.
+// Memory layout: d[2] + dmin[2] + scales[12] + qs[128] = 144 bytes
+//
+// Dequantization formula (for 64-element sub-block j):
+//   w[i] = d * sc[j] * q[i] - dmin * m[j]
+// where sc/m are 6-bit scales/mins packed in the scales array.
+//
+// The 256 elements are split into 8 groups of 32, with pairs sharing scales:
+//   - Groups 0,1 use scales[0..1]
+//   - Groups 2,3 use scales[2..3]
+//   - etc.
+// -----------------------------------------------------------------------------
 struct block_q4_K {
-    half d;
-    half dmin;
-    uint8_t scales[12];
-    uint8_t qs[128];
+    half d;             // super-block scale for quantized scales
+    half dmin;          // super-block scale for quantized mins
+    uint8_t scales[12]; // 6-bit scales and mins (packed)
+    uint8_t qs[128];    // 4-bit quants: 256 values / 2 per byte
 };
 
+// -----------------------------------------------------------------------------
 // Q8_0: 32 elements per block, 34 bytes
-// Simple format: FP16 scale + 32 int8 values
+// -----------------------------------------------------------------------------
+// Simple 8-bit quantization: w[i] = d * qs[i]
+// Highest quality of the standard formats, ~8.5 bits per weight.
+// Used for activations and some weight tensors where quality matters.
+// -----------------------------------------------------------------------------
 struct block_q8_0 {
-    half d;           // scale
-    int8_t qs[32];    // quantized values
+    half d;           // scale factor
+    int8_t qs[32];    // quantized values (-128 to 127)
 };
 
 // Q4_0: 32 elements per block, 18 bytes
