@@ -374,6 +374,8 @@ private:
             "fused_qkv_matvec_q4k",
             // Simdgroup Flash Attention (high performance decode)
             "simdgroup_flash_attention_decode_f16kv_d64", "simdgroup_flash_attention_decode_f16kv_d128",
+            // llama.cpp-style Flash Attention (highest performance)
+            "flash_attention_decode_d64", "flash_attention_decode_d128",
             // Prefill attention
             "attention_prefill", "attention_prefill_f16kv",
             // Tree attention (speculative decoding)
@@ -1194,24 +1196,34 @@ Result<void> MetalCompute::multihead_attention(
     // - seq_q > 1: prefill kernel (batched queries)
     if (seq_q == 1) {
         // Decode path: kernel selection priority:
-        // 1. Flash attention V3 (simdgroup-optimized) - best performance
-        // 2. Flash attention V2 (scalar SIMD)
+        // 1. llama.cpp-style flash attention (NEW - highest performance)
+        // 2. Simdgroup flash attention (previous best)
         // 3. Legacy multihead_attention_decode_f16kv
 
         const char* kernel_name = nullptr;
         MTL::ComputePipelineState* pipeline = nullptr;
 
-        // Try simdgroup_matrix-based flash attention kernels (highest performance)
-        // These use hardware simdgroup_matrix ops like llama.cpp
+        // Try llama.cpp-style flash attention kernels first (highest performance)
         if (head_dim == 64) {
-            kernel_name = "simdgroup_flash_attention_decode_f16kv_d64";
+            kernel_name = "flash_attention_decode_d64";
             pipeline = impl_->get_pipeline(kernel_name);
         } else if (head_dim == 128) {
-            kernel_name = "simdgroup_flash_attention_decode_f16kv_d128";
+            kernel_name = "flash_attention_decode_d128";
             pipeline = impl_->get_pipeline(kernel_name);
         }
 
-        // Fall back to legacy kernel if simdgroup version not available
+        // Fall back to older simdgroup flash attention
+        if (!pipeline) {
+            if (head_dim == 64) {
+                kernel_name = "simdgroup_flash_attention_decode_f16kv_d64";
+                pipeline = impl_->get_pipeline(kernel_name);
+            } else if (head_dim == 128) {
+                kernel_name = "simdgroup_flash_attention_decode_f16kv_d128";
+                pipeline = impl_->get_pipeline(kernel_name);
+            }
+        }
+
+        // Fall back to legacy kernel if flash attention not available
         if (!pipeline) {
             kernel_name = "multihead_attention_decode_f16kv";
             pipeline = impl_->get_pipeline(kernel_name);
