@@ -1,5 +1,15 @@
 // MetalCompute - High-level GPU compute interface for LLM inference
 // Manages shader compilation, pipeline states, and command buffer batching
+//
+// This file is organized into the following sections:
+// 1. Implementation class (Impl) - manages Metal resources and shader compilation
+// 2. Dispatch helpers - reduce boilerplate for common dispatch patterns
+// 3. Core operations - matvec/matmul for all quantization types
+// 4. Normalization operations - RMS norm variants
+// 5. Element-wise operations - SiLU, multiply, add, RoPE
+// 6. Fused kernels - combined operations for memory bandwidth reduction
+// 7. Attention operations - single/multi-head, tree, paged attention
+// 8. Buffer management - KV cache allocation and management
 
 #include "granite/metal_compute.h"
 #include "granite/log.h"
@@ -22,7 +32,10 @@ namespace granite {
 #include "kernels/metal_shaders.h"
 
 
-// Implementation class
+// =============================================================================
+// SECTION 1: Implementation Class
+// =============================================================================
+
 class MetalCompute::Impl {
 public:
     Impl() = default;
@@ -116,6 +129,163 @@ public:
         return device_->newBuffer(size, options);
     }
 
+    // -------------------------------------------------------------------------
+    // Dispatch Helpers (reduce boilerplate for common patterns)
+    // -------------------------------------------------------------------------
+
+    // Standard matvec dispatch: y = x @ W^T
+    // Uses 8 SIMD groups with configurable rows_per_simd (typically 2)
+    Result<void> dispatch_matvec(
+        const char* kernel_name,
+        MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* y,
+        uint32_t K, uint32_t N,
+        uint32_t rows_per_simd = 2)
+    {
+        auto* encoder = get_encoder();
+        auto* pipeline = get_pipeline(kernel_name);
+        if (!pipeline) {
+            return Error(ErrorCode::InternalError, std::string(kernel_name) + " pipeline not found");
+        }
+
+        encoder->setComputePipelineState(pipeline);
+        encoder->setBuffer(x, 0, 0);
+        encoder->setBuffer(W, 0, 1);
+        encoder->setBuffer(y, 0, 2);
+        encoder->setBytes(&K, sizeof(K), 3);
+        encoder->setBytes(&N, sizeof(N), 4);
+
+        // 8 SIMD groups per threadgroup (256 threads)
+        constexpr uint32_t simd_groups = 8;
+        uint32_t rows_per_tg = simd_groups * rows_per_simd;
+        uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
+        MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
+        MTL::Size threadgroup_size = MTL::Size::Make(32 * simd_groups, 1, 1);
+        encoder->dispatchThreadgroups(grid_size, threadgroup_size);
+
+        return {};
+    }
+
+    // Standard matmul dispatch: Y = X @ W^T
+    // Uses dispatchThreads with 16x16 threadgroups
+    Result<void> dispatch_matmul(
+        const char* kernel_name,
+        MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
+        uint32_t M, uint32_t K, uint32_t N)
+    {
+        auto* encoder = get_encoder();
+        auto* pipeline = get_pipeline(kernel_name);
+        if (!pipeline) {
+            return Error(ErrorCode::InternalError, std::string(kernel_name) + " pipeline not found");
+        }
+
+        encoder->setComputePipelineState(pipeline);
+        encoder->setBuffer(X, 0, 0);
+        encoder->setBuffer(W, 0, 1);
+        encoder->setBuffer(Y, 0, 2);
+        encoder->setBytes(&M, sizeof(M), 3);
+        encoder->setBytes(&K, sizeof(K), 4);
+        encoder->setBytes(&N, sizeof(N), 5);
+
+        MTL::Size grid_size = MTL::Size::Make(N, M, 1);
+        MTL::Size threadgroup_size = MTL::Size::Make(16, 16, 1);
+        encoder->dispatchThreads(grid_size, threadgroup_size);
+
+        return {};
+    }
+
+    // SIMD-optimized matmul dispatch for prefill
+    // Uses dispatchThreadgroups with specialized SIMD config
+    Result<void> dispatch_matmul_simd(
+        const char* kernel_name,
+        MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
+        uint32_t M, uint32_t K, uint32_t N)
+    {
+        auto* encoder = get_encoder();
+        auto* pipeline = get_pipeline(kernel_name);
+        if (!pipeline) {
+            return Error(ErrorCode::InternalError, std::string(kernel_name) + " pipeline not found");
+        }
+
+        encoder->setComputePipelineState(pipeline);
+        encoder->setBuffer(X, 0, 0);
+        encoder->setBuffer(W, 0, 1);
+        encoder->setBuffer(Y, 0, 2);
+        encoder->setBytes(&M, sizeof(M), 3);
+        encoder->setBytes(&K, sizeof(K), 4);
+        encoder->setBytes(&N, sizeof(N), 5);
+
+        // SIMD-optimized: 8 SIMD groups, each handles 2 output columns
+        constexpr uint32_t simd_groups = 8;
+        constexpr uint32_t cols_per_tg = 2 * simd_groups;  // 16 columns per TG
+        uint32_t tg_x = (N + cols_per_tg - 1) / cols_per_tg;
+        MTL::Size grid_size = MTL::Size::Make(tg_x, M, 1);
+        MTL::Size threadgroup_size = MTL::Size::Make(32 * simd_groups, 1, 1);
+        encoder->dispatchThreadgroups(grid_size, threadgroup_size);
+
+        return {};
+    }
+
+    // Fused RMSNorm + matvec dispatch
+    // Uses 8 rows per threadgroup with 256 threads
+    Result<void> dispatch_rms_norm_matvec(
+        const char* kernel_name,
+        MTL::Buffer* x, MTL::Buffer* norm_weight, MTL::Buffer* W, MTL::Buffer* y,
+        uint32_t K, uint32_t N, float eps)
+    {
+        auto* encoder = get_encoder();
+        auto* pipeline = get_pipeline(kernel_name);
+        if (!pipeline) {
+            return Error(ErrorCode::InternalError, std::string(kernel_name) + " pipeline not found");
+        }
+
+        encoder->setComputePipelineState(pipeline);
+        encoder->setBuffer(x, 0, 0);
+        encoder->setBuffer(norm_weight, 0, 1);
+        encoder->setBuffer(W, 0, 2);
+        encoder->setBuffer(y, 0, 3);
+        encoder->setBytes(&K, sizeof(K), 4);
+        encoder->setBytes(&N, sizeof(N), 5);
+        encoder->setBytes(&eps, sizeof(eps), 6);
+
+        // FUSED_ROWS_PER_TG = 8
+        constexpr uint32_t rows_per_tg = 8;
+        uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
+        MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
+        MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+        encoder->dispatchThreadgroups(grid_size, threadgroup_size);
+
+        return {};
+    }
+
+    // Matvec with residual add dispatch
+    Result<void> dispatch_matvec_residual(
+        const char* kernel_name,
+        MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* residual, MTL::Buffer* y,
+        uint32_t K, uint32_t N,
+        uint32_t rows_per_tg = 8)
+    {
+        auto* encoder = get_encoder();
+        auto* pipeline = get_pipeline(kernel_name);
+        if (!pipeline) {
+            return Error(ErrorCode::InternalError, std::string(kernel_name) + " pipeline not found");
+        }
+
+        encoder->setComputePipelineState(pipeline);
+        encoder->setBuffer(x, 0, 0);
+        encoder->setBuffer(W, 0, 1);
+        encoder->setBuffer(residual, 0, 2);
+        encoder->setBuffer(y, 0, 3);
+        encoder->setBytes(&K, sizeof(K), 4);
+        encoder->setBytes(&N, sizeof(N), 5);
+
+        uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
+        MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
+        MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+        encoder->dispatchThreadgroups(grid_size, threadgroup_size);
+
+        return {};
+    }
+
 private:
     Result<void> compile_shaders() {
         NS::Error* error = nullptr;
@@ -133,47 +303,44 @@ private:
             return Error(ErrorCode::ShaderCompilationFailed, msg);
         }
 
+        // All kernel names to compile
         std::vector<std::string> kernels = {
+            // Core quantized kernels
             "matvec_q4k", "matmul_q4k", "matvec_f16", "matvec_f32",
-            // Q8_0 kernels
             "matvec_q8_0", "matmul_q8_0",
-            // Q4_0 kernels
             "matvec_q4_0", "matmul_q4_0",
-            // IQ4_NL kernels
             "matvec_iq4_nl", "matmul_iq4_nl",
-            // IQ4_XS kernels
             "matvec_iq4_xs", "matmul_iq4_xs",
-            // IQ3_S kernels
             "matvec_iq3_s", "matmul_iq3_s",
-            // Q6_K kernels
             "matvec_q6_k", "matmul_q6_k",
-            // Q5_K kernels
             "matvec_q5_k", "matmul_q5_k",
-            // Q3_K kernels
             "matvec_q3_k", "matmul_q3_k",
-            // Q2_K kernels
             "matvec_q2_k", "matmul_q2_k",
+            // Normalization and element-wise
             "rms_norm", "rms_norm_f16", "silu", "elementwise_mul", "rope",
-            "elementwise_add", "rope_multihead", "softmax_row", "attention_decode",
-            "kv_cache_append", "kv_cache_append_f16", "multihead_attention_decode",
-            "multihead_attention_decode_f16kv", "embedding_lookup",
+            "elementwise_add", "rope_multihead", "softmax_row",
+            // Basic attention
+            "attention_decode", "kv_cache_append", "kv_cache_append_f16",
+            "multihead_attention_decode", "multihead_attention_decode_f16kv",
+            "embedding_lookup",
             // Fused kernels
-            "silu_mul", "rms_norm_matvec_q4k", "rms_norm_matvec_f16",
+            "silu_mul",
+            "rms_norm_matvec_q4k", "rms_norm_matvec_f16",
             "rms_norm_matvec_q8_0", "rms_norm_matvec_q4_0", "rms_norm_matvec_iq4_nl",
-            "rms_norm_matvec_iq4_xs", "rms_norm_matvec_iq3_s", "rms_norm_matvec_q6_k", "rms_norm_matvec_q5_k",
-            "rms_norm_matvec_q3_k", "rms_norm_matvec_q2_k",
-            // Phase 2 fused kernels (eliminates redundant computation)
+            "rms_norm_matvec_iq4_xs", "rms_norm_matvec_iq3_s", "rms_norm_matvec_q6_k",
+            "rms_norm_matvec_q5_k", "rms_norm_matvec_q3_k", "rms_norm_matvec_q2_k",
+            // Phase 2 fused kernels
             "rms_norm_dual_matvec_q4k", "rms_norm_dual_matvec_q3k", "rms_norm_dual_matvec_q2k",
             "matvec_residual_q4k", "matvec_residual_q3k", "matvec_residual_q2k",
-            // Fused QKV attention projection
+            // Fused QKV
             "fused_qkv_matvec_q4k",
             // Flash attention
             "flash_attention_decode",
             // Prefill attention
             "attention_prefill", "attention_prefill_f16kv",
-            // Tree attention (for speculative decoding)
+            // Tree attention (speculative decoding)
             "attention_tree_f16kv", "attention_tree_nocontext_f16kv",
-            // Paged attention (for continuous batching)
+            // Paged attention (continuous batching)
             "paged_attention_decode", "paged_kv_cache_append",
             "batched_paged_attention_decode"
         };
@@ -211,7 +378,11 @@ private:
     std::unordered_map<std::string, MTL::ComputePipelineState*> pipelines_;
 };
 
-// MetalCompute public interface implementation
+
+// =============================================================================
+// SECTION 2: MetalCompute Public Interface and Core Operations
+// =============================================================================
+
 MetalCompute::MetalCompute() : impl_(new Impl()) {}
 MetalCompute::~MetalCompute() { delete impl_; }
 
@@ -229,612 +400,201 @@ MTL::Buffer* MetalCompute::create_buffer(size_t size, bool shared) {
     return impl_->create_buffer(size, shared);
 }
 
+// -----------------------------------------------------------------------------
+// Q4_K Quantized Operations
+// -----------------------------------------------------------------------------
+
 Result<void> MetalCompute::matvec_q4k(
     MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("matvec_q4k");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "matvec_q4k pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(x, 0, 0);
-    encoder->setBuffer(W, 0, 1);
-    encoder->setBuffer(y, 0, 2);
-    encoder->setBytes(&K, sizeof(K), 3);
-    encoder->setBytes(&N, sizeof(N), 4);
-
-    // 8 SIMD groups per threadgroup (256 threads), each SIMD group handles 2 rows
-    uint32_t simd_groups = 8;
-    uint32_t rows_per_simd = 2;  // NR0_Q4K
-    uint32_t rows_per_tg = simd_groups * rows_per_simd;  // 16 rows per threadgroup
-    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
-    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(32 * simd_groups, 1, 1);  // 8 SIMD groups = 256 threads
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_matvec("matvec_q4k", x, W, y, K, N);
 }
 
 Result<void> MetalCompute::matmul_q4k(
     MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
     uint32_t M, uint32_t K, uint32_t N)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("matmul_q4k");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "matmul_q4k pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(X, 0, 0);
-    encoder->setBuffer(W, 0, 1);
-    encoder->setBuffer(Y, 0, 2);
-    encoder->setBytes(&M, sizeof(M), 3);
-    encoder->setBytes(&K, sizeof(K), 4);
-    encoder->setBytes(&N, sizeof(N), 5);
-
-    MTL::Size grid_size = MTL::Size::Make(N, M, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(16, 16, 1);
-    encoder->dispatchThreads(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_matmul_simd("matmul_q4k", X, W, Y, M, K, N);
 }
 
-// =============================================================================
+// -----------------------------------------------------------------------------
 // Q8_0 Quantized Operations
-// =============================================================================
+// -----------------------------------------------------------------------------
 
 Result<void> MetalCompute::matvec_q8_0(
     MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("matvec_q8_0");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "matvec_q8_0 pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(x, 0, 0);
-    encoder->setBuffer(W, 0, 1);
-    encoder->setBuffer(y, 0, 2);
-    encoder->setBytes(&K, sizeof(K), 3);
-    encoder->setBytes(&N, sizeof(N), 4);
-
-    // 8 SIMD groups per threadgroup (256 threads), each SIMD group handles 2 rows
-    uint32_t simd_groups = 8;
-    uint32_t rows_per_simd = 2;  // NR0_Q8_0
-    uint32_t rows_per_tg = simd_groups * rows_per_simd;  // 16 rows per threadgroup
-    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
-    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(32 * simd_groups, 1, 1);  // 8 SIMD groups = 256 threads
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_matvec("matvec_q8_0", x, W, y, K, N);
 }
 
 Result<void> MetalCompute::matmul_q8_0(
     MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
     uint32_t M, uint32_t K, uint32_t N)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("matmul_q8_0");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "matmul_q8_0 pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(X, 0, 0);
-    encoder->setBuffer(W, 0, 1);
-    encoder->setBuffer(Y, 0, 2);
-    encoder->setBytes(&M, sizeof(M), 3);
-    encoder->setBytes(&K, sizeof(K), 4);
-    encoder->setBytes(&N, sizeof(N), 5);
-
-    MTL::Size grid_size = MTL::Size::Make(N, M, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(16, 16, 1);
-    encoder->dispatchThreads(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_matmul("matmul_q8_0", X, W, Y, M, K, N);
 }
 
-// =============================================================================
+// -----------------------------------------------------------------------------
 // Q4_0 Quantized Operations
-// =============================================================================
+// -----------------------------------------------------------------------------
 
 Result<void> MetalCompute::matvec_q4_0(
     MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("matvec_q4_0");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "matvec_q4_0 pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(x, 0, 0);
-    encoder->setBuffer(W, 0, 1);
-    encoder->setBuffer(y, 0, 2);
-    encoder->setBytes(&K, sizeof(K), 3);
-    encoder->setBytes(&N, sizeof(N), 4);
-
-    // 8 SIMD groups per threadgroup (256 threads), each SIMD group handles 2 rows
-    uint32_t simd_groups = 8;
-    uint32_t rows_per_simd = 2;  // NR0_Q4_0
-    uint32_t rows_per_tg = simd_groups * rows_per_simd;  // 16 rows per threadgroup
-    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
-    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(32 * simd_groups, 1, 1);  // 8 SIMD groups = 256 threads
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_matvec("matvec_q4_0", x, W, y, K, N);
 }
 
 Result<void> MetalCompute::matmul_q4_0(
     MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
     uint32_t M, uint32_t K, uint32_t N)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("matmul_q4_0");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "matmul_q4_0 pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(X, 0, 0);
-    encoder->setBuffer(W, 0, 1);
-    encoder->setBuffer(Y, 0, 2);
-    encoder->setBytes(&M, sizeof(M), 3);
-    encoder->setBytes(&K, sizeof(K), 4);
-    encoder->setBytes(&N, sizeof(N), 5);
-
-    MTL::Size grid_size = MTL::Size::Make(N, M, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(16, 16, 1);
-    encoder->dispatchThreads(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_matmul("matmul_q4_0", X, W, Y, M, K, N);
 }
 
-// =============================================================================
+// -----------------------------------------------------------------------------
 // IQ4_NL Quantized Operations (Non-linear 4-bit I-quant)
-// =============================================================================
+// -----------------------------------------------------------------------------
 
 Result<void> MetalCompute::matvec_iq4_nl(
     MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("matvec_iq4_nl");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "matvec_iq4_nl pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(x, 0, 0);
-    encoder->setBuffer(W, 0, 1);
-    encoder->setBuffer(y, 0, 2);
-    encoder->setBytes(&K, sizeof(K), 3);
-    encoder->setBytes(&N, sizeof(N), 4);
-
-    // 8 SIMD groups per threadgroup (256 threads), each SIMD group handles 2 rows
-    uint32_t simd_groups = 8;
-    uint32_t rows_per_simd = 2;  // NR0_IQ4_NL
-    uint32_t rows_per_tg = simd_groups * rows_per_simd;  // 16 rows per threadgroup
-    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
-    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(32 * simd_groups, 1, 1);  // 8 SIMD groups = 256 threads
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_matvec("matvec_iq4_nl", x, W, y, K, N);
 }
 
 Result<void> MetalCompute::matmul_iq4_nl(
     MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
     uint32_t M, uint32_t K, uint32_t N)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("matmul_iq4_nl");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "matmul_iq4_nl pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(X, 0, 0);
-    encoder->setBuffer(W, 0, 1);
-    encoder->setBuffer(Y, 0, 2);
-    encoder->setBytes(&M, sizeof(M), 3);
-    encoder->setBytes(&K, sizeof(K), 4);
-    encoder->setBytes(&N, sizeof(N), 5);
-
-    MTL::Size grid_size = MTL::Size::Make(N, M, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(16, 16, 1);
-    encoder->dispatchThreads(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_matmul("matmul_iq4_nl", X, W, Y, M, K, N);
 }
 
-// =============================================================================
-// IQ4_XS Quantized Operations (Non-linear 4-bit I-quant with 256-element super-blocks)
-// =============================================================================
+// -----------------------------------------------------------------------------
+// IQ4_XS Quantized Operations (4-bit with super-block scales)
+// -----------------------------------------------------------------------------
 
 Result<void> MetalCompute::matvec_iq4_xs(
     MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("matvec_iq4_xs");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "matvec_iq4_xs pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(x, 0, 0);
-    encoder->setBuffer(W, 0, 1);
-    encoder->setBuffer(y, 0, 2);
-    encoder->setBytes(&K, sizeof(K), 3);
-    encoder->setBytes(&N, sizeof(N), 4);
-
-    // 8 SIMD groups per threadgroup (256 threads), each SIMD group handles 2 rows
-    uint32_t simd_groups = 8;
-    uint32_t rows_per_simd = 2;  // NR0_IQ4_XS
-    uint32_t rows_per_tg = simd_groups * rows_per_simd;  // 16 rows per threadgroup
-    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
-    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(32 * simd_groups, 1, 1);  // 8 SIMD groups = 256 threads
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_matvec("matvec_iq4_xs", x, W, y, K, N);
 }
 
 Result<void> MetalCompute::matmul_iq4_xs(
     MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
     uint32_t M, uint32_t K, uint32_t N)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("matmul_iq4_xs");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "matmul_iq4_xs pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(X, 0, 0);
-    encoder->setBuffer(W, 0, 1);
-    encoder->setBuffer(Y, 0, 2);
-    encoder->setBytes(&M, sizeof(M), 3);
-    encoder->setBytes(&K, sizeof(K), 4);
-    encoder->setBytes(&N, sizeof(N), 5);
-
-    // Optimized dispatch: 8 SIMD groups × 32 threads = 256 threads per threadgroup
-    // Each threadgroup handles 1 row × 16 columns (8 SIMD groups × 2 cols each)
-    const uint32_t cols_per_threadgroup = 16;
-    MTL::Size grid_size = MTL::Size::Make((N + cols_per_threadgroup - 1) / cols_per_threadgroup, M, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_matmul_simd("matmul_iq4_xs", X, W, Y, M, K, N);
 }
 
-// =============================================================================
-// IQ3_S Quantized Operations (3-bit I-quant with 256-element super-blocks)
-// =============================================================================
+// -----------------------------------------------------------------------------
+// IQ3_S Quantized Operations (3-bit I-quant with grid)
+// -----------------------------------------------------------------------------
 
 Result<void> MetalCompute::matvec_iq3_s(
     MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("matvec_iq3_s");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "matvec_iq3_s pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(x, 0, 0);
-    encoder->setBuffer(W, 0, 1);
-    encoder->setBuffer(y, 0, 2);
-    encoder->setBytes(&K, sizeof(K), 3);
-    encoder->setBytes(&N, sizeof(N), 4);
-
-    // 8 SIMD groups per threadgroup (256 threads), each SIMD group handles 2 rows
-    uint32_t simd_groups = 8;
-    uint32_t rows_per_simd = 2;  // NR0_IQ3_S
-    uint32_t rows_per_tg = simd_groups * rows_per_simd;  // 16 rows per threadgroup
-    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
-    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(32 * simd_groups, 1, 1);  // 8 SIMD groups = 256 threads
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_matvec("matvec_iq3_s", x, W, y, K, N);
 }
 
 Result<void> MetalCompute::matmul_iq3_s(
     MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
     uint32_t M, uint32_t K, uint32_t N)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("matmul_iq3_s");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "matmul_iq3_s pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(X, 0, 0);
-    encoder->setBuffer(W, 0, 1);
-    encoder->setBuffer(Y, 0, 2);
-    encoder->setBytes(&M, sizeof(M), 3);
-    encoder->setBytes(&K, sizeof(K), 4);
-    encoder->setBytes(&N, sizeof(N), 5);
-
-    // Optimized dispatch: 8 SIMD groups × 32 threads = 256 threads per threadgroup
-    // Each threadgroup handles 1 row × 16 columns (8 SIMD groups × 2 cols each)
-    const uint32_t cols_per_threadgroup = 16;
-    MTL::Size grid_size = MTL::Size::Make((N + cols_per_threadgroup - 1) / cols_per_threadgroup, M, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_matmul_simd("matmul_iq3_s", X, W, Y, M, K, N);
 }
 
-// =============================================================================
+// -----------------------------------------------------------------------------
 // Q6_K Quantized Operations
-// =============================================================================
+// -----------------------------------------------------------------------------
 
 Result<void> MetalCompute::matvec_q6_k(
     MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("matvec_q6_k");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "matvec_q6_k pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(x, 0, 0);
-    encoder->setBuffer(W, 0, 1);
-    encoder->setBuffer(y, 0, 2);
-    encoder->setBytes(&K, sizeof(K), 3);
-    encoder->setBytes(&N, sizeof(N), 4);
-
-    // 8 SIMD groups per threadgroup (256 threads), each SIMD group handles 2 rows
-    uint32_t simd_groups = 8;
-    uint32_t rows_per_simd = 2;  // NR0_Q6K
-    uint32_t rows_per_tg = simd_groups * rows_per_simd;  // 16 rows per threadgroup
-    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
-    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(32 * simd_groups, 1, 1);  // 8 SIMD groups = 256 threads
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_matvec("matvec_q6_k", x, W, y, K, N);
 }
 
 Result<void> MetalCompute::matmul_q6_k(
     MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
     uint32_t M, uint32_t K, uint32_t N)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("matmul_q6_k");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "matmul_q6_k pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(X, 0, 0);
-    encoder->setBuffer(W, 0, 1);
-    encoder->setBuffer(Y, 0, 2);
-    encoder->setBytes(&M, sizeof(M), 3);
-    encoder->setBytes(&K, sizeof(K), 4);
-    encoder->setBytes(&N, sizeof(N), 5);
-
-    MTL::Size grid_size = MTL::Size::Make(N, M, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(16, 16, 1);
-    encoder->dispatchThreads(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_matmul("matmul_q6_k", X, W, Y, M, K, N);
 }
 
-// =============================================================================
+// -----------------------------------------------------------------------------
 // Q5_K Quantized Operations
-// =============================================================================
+// -----------------------------------------------------------------------------
 
 Result<void> MetalCompute::matvec_q5_k(
     MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("matvec_q5_k");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "matvec_q5_k pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(x, 0, 0);
-    encoder->setBuffer(W, 0, 1);
-    encoder->setBuffer(y, 0, 2);
-    encoder->setBytes(&K, sizeof(K), 3);
-    encoder->setBytes(&N, sizeof(N), 4);
-
-    // 8 SIMD groups per threadgroup (256 threads), each SIMD group handles 2 rows
-    uint32_t simd_groups = 8;
-    uint32_t rows_per_simd = 2;  // NR0_Q5K
-    uint32_t rows_per_tg = simd_groups * rows_per_simd;  // 16 rows per threadgroup
-    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
-    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(32 * simd_groups, 1, 1);  // 8 SIMD groups = 256 threads
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_matvec("matvec_q5_k", x, W, y, K, N);
 }
 
 Result<void> MetalCompute::matmul_q5_k(
     MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
     uint32_t M, uint32_t K, uint32_t N)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("matmul_q5_k");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "matmul_q5_k pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(X, 0, 0);
-    encoder->setBuffer(W, 0, 1);
-    encoder->setBuffer(Y, 0, 2);
-    encoder->setBytes(&M, sizeof(M), 3);
-    encoder->setBytes(&K, sizeof(K), 4);
-    encoder->setBytes(&N, sizeof(N), 5);
-
-    MTL::Size grid_size = MTL::Size::Make(N, M, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(16, 16, 1);
-    encoder->dispatchThreads(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_matmul("matmul_q5_k", X, W, Y, M, K, N);
 }
 
-// =============================================================================
+// -----------------------------------------------------------------------------
 // Q3_K Quantized Operations
-// =============================================================================
+// -----------------------------------------------------------------------------
 
 Result<void> MetalCompute::matvec_q3_k(
     MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("matvec_q3_k");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "matvec_q3_k pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(x, 0, 0);
-    encoder->setBuffer(W, 0, 1);
-    encoder->setBuffer(y, 0, 2);
-    encoder->setBytes(&K, sizeof(K), 3);
-    encoder->setBytes(&N, sizeof(N), 4);
-
-    // 8 SIMD groups per threadgroup (256 threads), each SIMD group handles 2 rows
-    uint32_t simd_groups = 8;
-    uint32_t rows_per_simd = 2;  // NR0_Q3K
-    uint32_t rows_per_tg = simd_groups * rows_per_simd;  // 16 rows per threadgroup
-    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
-    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(32 * simd_groups, 1, 1);  // 8 SIMD groups = 256 threads
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_matvec("matvec_q3_k", x, W, y, K, N);
 }
 
 Result<void> MetalCompute::matmul_q3_k(
     MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
     uint32_t M, uint32_t K, uint32_t N)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("matmul_q3_k");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "matmul_q3_k pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(X, 0, 0);
-    encoder->setBuffer(W, 0, 1);
-    encoder->setBuffer(Y, 0, 2);
-    encoder->setBytes(&M, sizeof(M), 3);
-    encoder->setBytes(&K, sizeof(K), 4);
-    encoder->setBytes(&N, sizeof(N), 5);
-
-    MTL::Size grid_size = MTL::Size::Make(N, M, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(16, 16, 1);
-    encoder->dispatchThreads(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_matmul("matmul_q3_k", X, W, Y, M, K, N);
 }
 
-// =============================================================================
+// -----------------------------------------------------------------------------
 // Q2_K Quantized Operations
-// =============================================================================
+// -----------------------------------------------------------------------------
 
 Result<void> MetalCompute::matvec_q2_k(
     MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("matvec_q2_k");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "matvec_q2_k pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(x, 0, 0);
-    encoder->setBuffer(W, 0, 1);
-    encoder->setBuffer(y, 0, 2);
-    encoder->setBytes(&K, sizeof(K), 3);
-    encoder->setBytes(&N, sizeof(N), 4);
-
-    // 8 SIMD groups per threadgroup (256 threads), each SIMD group handles 2 rows
-    uint32_t simd_groups = 8;
-    uint32_t rows_per_simd = 2;  // NR0_Q2K
-    uint32_t rows_per_tg = simd_groups * rows_per_simd;  // 16 rows per threadgroup
-    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
-    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(32 * simd_groups, 1, 1);  // 8 SIMD groups = 256 threads
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_matvec("matvec_q2_k", x, W, y, K, N);
 }
 
 Result<void> MetalCompute::matmul_q2_k(
     MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
     uint32_t M, uint32_t K, uint32_t N)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("matmul_q2_k");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "matmul_q2_k pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(X, 0, 0);
-    encoder->setBuffer(W, 0, 1);
-    encoder->setBuffer(Y, 0, 2);
-    encoder->setBytes(&M, sizeof(M), 3);
-    encoder->setBytes(&K, sizeof(K), 4);
-    encoder->setBytes(&N, sizeof(N), 5);
-
-    MTL::Size grid_size = MTL::Size::Make(N, M, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(16, 16, 1);
-    encoder->dispatchThreads(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_matmul("matmul_q2_k", X, W, Y, M, K, N);
 }
+
+// -----------------------------------------------------------------------------
+// FP16 Operations
+// -----------------------------------------------------------------------------
 
 Result<void> MetalCompute::matvec_f16(
     MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("matvec_f16");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "matvec_f16 pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(x, 0, 0);
-    encoder->setBuffer(W, 0, 1);
-    encoder->setBuffer(y, 0, 2);
-    encoder->setBytes(&K, sizeof(K), 3);
-    encoder->setBytes(&N, sizeof(N), 4);
-
-    // Each threadgroup (32 threads = 1 SIMD group) handles one output row
-    MTL::Size grid_size = MTL::Size::Make(N, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(32, 1, 1);  // One SIMD group
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_matvec("matvec_f16", x, W, y, K, N);
 }
+
+
+// =============================================================================
+// SECTION 4: Normalization Operations
+// =============================================================================
 
 Result<void> MetalCompute::rms_norm(
     MTL::Buffer* x, MTL::Buffer* weight, MTL::Buffer* out,
@@ -853,10 +613,8 @@ Result<void> MetalCompute::rms_norm(
     encoder->setBytes(&size, sizeof(size), 3);
     encoder->setBytes(&eps, sizeof(eps), 4);
 
-    // Use single threadgroup for reduction
-    uint32_t tg_size = std::min((uint32_t)256, size);
-    MTL::Size grid_size = MTL::Size::Make(tg_size, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(tg_size, 1, 1);
+    MTL::Size grid_size = MTL::Size::Make(size, 1, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
     encoder->dispatchThreads(grid_size, threadgroup_size);
 
     return {};
@@ -879,14 +637,17 @@ Result<void> MetalCompute::rms_norm_f16(
     encoder->setBytes(&size, sizeof(size), 3);
     encoder->setBytes(&eps, sizeof(eps), 4);
 
-    // Use single threadgroup for reduction
-    uint32_t tg_size = std::min((uint32_t)256, size);
-    MTL::Size grid_size = MTL::Size::Make(tg_size, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(tg_size, 1, 1);
+    MTL::Size grid_size = MTL::Size::Make(size, 1, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
     encoder->dispatchThreads(grid_size, threadgroup_size);
 
     return {};
 }
+
+
+// =============================================================================
+// SECTION 5: Element-wise Operations
+// =============================================================================
 
 Result<void> MetalCompute::silu(MTL::Buffer* x, uint32_t size) {
     auto* encoder = impl_->get_encoder();
@@ -900,7 +661,7 @@ Result<void> MetalCompute::silu(MTL::Buffer* x, uint32_t size) {
     encoder->setBytes(&size, sizeof(size), 1);
 
     MTL::Size grid_size = MTL::Size::Make(size, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(std::min((uint32_t)256, size), 1, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
     encoder->dispatchThreads(grid_size, threadgroup_size);
 
     return {};
@@ -922,7 +683,7 @@ Result<void> MetalCompute::elementwise_mul(
     encoder->setBytes(&size, sizeof(size), 3);
 
     MTL::Size grid_size = MTL::Size::Make(size, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(std::min((uint32_t)256, size), 1, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
     encoder->dispatchThreads(grid_size, threadgroup_size);
 
     return {};
@@ -946,7 +707,7 @@ Result<void> MetalCompute::rope(
     encoder->setBytes(&freq_base, sizeof(freq_base), 4);
 
     MTL::Size grid_size = MTL::Size::Make(head_dim / 2, seq_len, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(16, 16, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(32, 1, 1);
     encoder->dispatchThreads(grid_size, threadgroup_size);
 
     return {};
@@ -968,7 +729,7 @@ Result<void> MetalCompute::elementwise_add(
     encoder->setBytes(&size, sizeof(size), 3);
 
     MTL::Size grid_size = MTL::Size::Make(size, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(std::min((uint32_t)256, size), 1, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
     encoder->dispatchThreads(grid_size, threadgroup_size);
 
     return {};
@@ -996,20 +757,15 @@ Result<void> MetalCompute::rope_multihead(
     encoder->setBytes(&start_pos, sizeof(start_pos), 6);
     encoder->setBytes(&freq_base, sizeof(freq_base), 7);
 
-    uint32_t max_heads = std::max(num_heads_q, num_heads_k);
-    MTL::Size grid_size = MTL::Size::Make(head_dim / 2, max_heads, seq_len);
-    MTL::Size threadgroup_size = MTL::Size::Make(
-        std::min((uint32_t)32, head_dim / 2),
-        std::min((uint32_t)4, max_heads),
-        std::min((uint32_t)2, seq_len)
-    );
+    // Grid: [head_dim/2, seq_len, num_heads_q + num_heads_k]
+    MTL::Size grid_size = MTL::Size::Make(head_dim / 2, seq_len, num_heads_q + num_heads_k);
+    MTL::Size threadgroup_size = MTL::Size::Make(32, 1, 1);
     encoder->dispatchThreads(grid_size, threadgroup_size);
 
     return {};
 }
 
-Result<void> MetalCompute::softmax(
-    MTL::Buffer* x, uint32_t M, uint32_t N)
+Result<void> MetalCompute::softmax(MTL::Buffer* x, uint32_t M, uint32_t N)
 {
     auto* encoder = impl_->get_encoder();
     auto* pipeline = impl_->get_pipeline("softmax_row");
@@ -1022,232 +778,19 @@ Result<void> MetalCompute::softmax(
     encoder->setBytes(&M, sizeof(M), 1);
     encoder->setBytes(&N, sizeof(N), 2);
 
-    MTL::Size grid_size = MTL::Size::Make(M, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(std::min((uint32_t)256, M), 1, 1);
+    MTL::Size grid_size = MTL::Size::Make(N, M, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
     encoder->dispatchThreads(grid_size, threadgroup_size);
 
     return {};
 }
 
-Result<void> MetalCompute::attention_single_head(
-    MTL::Buffer* Q, MTL::Buffer* K, MTL::Buffer* V, MTL::Buffer* output,
-    uint32_t seq_q, uint32_t seq_kv, uint32_t head_dim,
-    uint32_t start_pos, float scale)
-{
-    // For decode (seq_q == 1), use optimized attention_decode kernel
-    if (seq_q == 1) {
-        auto* encoder = impl_->get_encoder();
-        auto* pipeline = impl_->get_pipeline("attention_decode");
-        if (!pipeline) {
-            return Error(ErrorCode::InternalError, "attention_decode pipeline not found");
-        }
-
-        encoder->setComputePipelineState(pipeline);
-        encoder->setBuffer(Q, 0, 0);
-        encoder->setBuffer(K, 0, 1);
-        encoder->setBuffer(V, 0, 2);
-        encoder->setBuffer(output, 0, 3);
-        encoder->setBytes(&seq_kv, sizeof(seq_kv), 4);
-        encoder->setBytes(&head_dim, sizeof(head_dim), 5);
-        encoder->setBytes(&scale, sizeof(scale), 6);
-
-        // Use one threadgroup for the whole head
-        MTL::Size grid_size = MTL::Size::Make(head_dim, 1, 1);
-        MTL::Size threadgroup_size = MTL::Size::Make(head_dim, 1, 1);
-        encoder->dispatchThreads(grid_size, threadgroup_size);
-
-        return {};
-    }
-
-    // For prefill (seq_q > 1), we would need a different kernel
-    // For now, return error (caller should fall back to CPU)
-    return Error(ErrorCode::NotImplemented, "GPU prefill attention not implemented");
-}
-
-std::pair<MTL::Buffer*, MTL::Buffer*> MetalCompute::create_kv_cache(
-    uint32_t num_kv_heads,
-    uint32_t max_seq_len,
-    uint32_t head_dim)
-{
-    // Use FP16 KV cache by default for better memory bandwidth
-    size_t size = num_kv_heads * max_seq_len * head_dim * sizeof(uint16_t);  // FP16
-    MTL::Buffer* k_cache = impl_->create_buffer(size, true);
-    MTL::Buffer* v_cache = impl_->create_buffer(size, true);
-    return {k_cache, v_cache};
-}
-
-std::pair<MTL::Buffer*, MTL::Buffer*> MetalCompute::create_kv_cache_f32(
-    uint32_t num_kv_heads,
-    uint32_t max_seq_len,
-    uint32_t head_dim)
-{
-    size_t size = num_kv_heads * max_seq_len * head_dim * sizeof(float);
-    MTL::Buffer* k_cache = impl_->create_buffer(size, true);
-    MTL::Buffer* v_cache = impl_->create_buffer(size, true);
-    return {k_cache, v_cache};
-}
-
-Result<void> MetalCompute::kv_cache_append(
-    MTL::Buffer* cache_k,
-    MTL::Buffer* cache_v,
-    MTL::Buffer* new_k,
-    MTL::Buffer* new_v,
-    uint32_t num_kv_heads,
-    uint32_t head_dim,
-    uint32_t current_len,
-    uint32_t new_len,
-    uint32_t max_seq_len)
-{
-    auto* encoder = impl_->get_encoder();
-
-    // Use FP16 version by default (float -> half conversion on append)
-    auto* pipeline = impl_->get_pipeline("kv_cache_append_f16");
-    if (!pipeline) {
-        // Fallback to FP32 version
-        pipeline = impl_->get_pipeline("kv_cache_append");
-        if (!pipeline) {
-            return Error(ErrorCode::InternalError, "kv_cache_append pipeline not found");
-        }
-    }
-
-    // Append K
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(new_k, 0, 0);
-    encoder->setBuffer(cache_k, 0, 1);
-    encoder->setBytes(&num_kv_heads, sizeof(num_kv_heads), 2);
-    encoder->setBytes(&head_dim, sizeof(head_dim), 3);
-    encoder->setBytes(&current_len, sizeof(current_len), 4);
-    encoder->setBytes(&new_len, sizeof(new_len), 5);
-    encoder->setBytes(&max_seq_len, sizeof(max_seq_len), 6);
-
-    MTL::Size grid_size = MTL::Size::Make(head_dim, new_len, num_kv_heads);
-    MTL::Size threadgroup_size = MTL::Size::Make(
-        std::min((uint32_t)64, head_dim),
-        1,
-        1
-    );
-    encoder->dispatchThreads(grid_size, threadgroup_size);
-
-    // Append V
-    encoder->setBuffer(new_v, 0, 0);
-    encoder->setBuffer(cache_v, 0, 1);
-    encoder->dispatchThreads(grid_size, threadgroup_size);
-
-    return {};
-}
-
-Result<void> MetalCompute::multihead_attention(
-    MTL::Buffer* Q,
-    MTL::Buffer* K,
-    MTL::Buffer* V,
-    MTL::Buffer* output,
-    uint32_t num_heads,
-    uint32_t num_kv_heads,
-    uint32_t seq_q,
-    uint32_t seq_kv,
-    uint32_t head_dim,
-    float scale)
-{
-    auto* encoder = impl_->get_encoder();
-
-    // For decode (seq_q == 1), use multihead_attention_decode kernel with FP16 KV
-    if (seq_q == 1) {
-        // Try FP16 KV version first (matches our FP16 KV cache)
-        auto* pipeline = impl_->get_pipeline("multihead_attention_decode_f16kv");
-        if (!pipeline) {
-            // Fallback to FP32 version
-            pipeline = impl_->get_pipeline("multihead_attention_decode");
-            if (!pipeline) {
-                return Error(ErrorCode::InternalError, "multihead_attention_decode pipeline not found");
-            }
-        }
-
-        encoder->setComputePipelineState(pipeline);
-        encoder->setBuffer(Q, 0, 0);
-        encoder->setBuffer(K, 0, 1);
-        encoder->setBuffer(V, 0, 2);
-        encoder->setBuffer(output, 0, 3);
-        encoder->setBytes(&num_heads, sizeof(num_heads), 4);
-        encoder->setBytes(&num_kv_heads, sizeof(num_kv_heads), 5);
-        encoder->setBytes(&seq_kv, sizeof(seq_kv), 6);
-        encoder->setBytes(&head_dim, sizeof(head_dim), 7);
-        encoder->setBytes(&scale, sizeof(scale), 8);
-
-        uint32_t threads_per_group = std::min((uint32_t)128, std::max((uint32_t)32, head_dim));
-        MTL::Size grid_size = MTL::Size::Make(num_heads, 1, 1);
-        MTL::Size threadgroup_size = MTL::Size::Make(threads_per_group, 1, 1);
-        encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-        return {};
-    }
-
-    // For prefill (seq_q > 1), use attention_prefill kernel
-    // Try FP16 KV version first
-    auto* pipeline = impl_->get_pipeline("attention_prefill_f16kv");
-    if (!pipeline) {
-        // Fallback to FP32 version
-        pipeline = impl_->get_pipeline("attention_prefill");
-        if (!pipeline) {
-            return Error(ErrorCode::InternalError, "attention_prefill pipeline not found");
-        }
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(Q, 0, 0);
-    encoder->setBuffer(K, 0, 1);
-    encoder->setBuffer(V, 0, 2);
-    encoder->setBuffer(output, 0, 3);
-    encoder->setBytes(&num_heads, sizeof(num_heads), 4);
-    encoder->setBytes(&num_kv_heads, sizeof(num_kv_heads), 5);
-    encoder->setBytes(&seq_q, sizeof(seq_q), 6);
-    encoder->setBytes(&seq_kv, sizeof(seq_kv), 7);
-    encoder->setBytes(&head_dim, sizeof(head_dim), 8);
-    encoder->setBytes(&scale, sizeof(scale), 9);
-    uint32_t start_pos = 0;  // For prefill, start_pos is 0
-    encoder->setBytes(&start_pos, sizeof(start_pos), 10);
-
-    // Each threadgroup handles one (head, query_position) pair
-    // Grid: [num_heads, seq_q]
-    MTL::Size grid_size = MTL::Size::Make(num_heads, seq_q, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);  // 128 threads per threadgroup
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
-}
-
-Result<void> MetalCompute::embedding_lookup(
-    MTL::Buffer* token_ids,
-    MTL::Buffer* embeddings,
-    MTL::Buffer* output,
-    uint32_t num_tokens,
-    uint32_t hidden_dim,
-    uint32_t vocab_size)
-{
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("embedding_lookup");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "embedding_lookup pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(token_ids, 0, 0);
-    encoder->setBuffer(embeddings, 0, 1);
-    encoder->setBuffer(output, 0, 2);
-    encoder->setBytes(&hidden_dim, sizeof(hidden_dim), 3);
-    encoder->setBytes(&vocab_size, sizeof(vocab_size), 4);
-
-    // 2D grid: [hidden_dim, num_tokens]
-    MTL::Size grid_size = MTL::Size::Make(hidden_dim, num_tokens, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(std::min((uint32_t)256, hidden_dim), 1, 1);
-    encoder->dispatchThreads(grid_size, threadgroup_size);
-
-    return {};
-}
 
 // =============================================================================
-// Fused Kernel Dispatch Functions
+// SECTION 6: Fused Kernels (Memory Bandwidth Optimization)
 // =============================================================================
 
+// Fused SiLU + Multiply
 Result<void> MetalCompute::silu_mul(
     MTL::Buffer* a, MTL::Buffer* b, MTL::Buffer* c, uint32_t size)
 {
@@ -1264,324 +807,96 @@ Result<void> MetalCompute::silu_mul(
     encoder->setBytes(&size, sizeof(size), 3);
 
     MTL::Size grid_size = MTL::Size::Make(size, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(std::min((uint32_t)256, size), 1, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
     encoder->dispatchThreads(grid_size, threadgroup_size);
 
     return {};
 }
 
+// -----------------------------------------------------------------------------
+// Fused RMSNorm + MatVec (all quantization types)
+// -----------------------------------------------------------------------------
+
 Result<void> MetalCompute::rms_norm_matvec_q4k(
     MTL::Buffer* x, MTL::Buffer* norm_weight, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N, float eps)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("rms_norm_matvec_q4k");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "rms_norm_matvec_q4k pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(x, 0, 0);
-    encoder->setBuffer(norm_weight, 0, 1);
-    encoder->setBuffer(W, 0, 2);
-    encoder->setBuffer(y, 0, 3);
-    encoder->setBytes(&K, sizeof(K), 4);
-    encoder->setBytes(&N, sizeof(N), 5);
-    encoder->setBytes(&eps, sizeof(eps), 6);
-
-    // 8 SIMD groups per threadgroup, each handles one output row
-    uint32_t rows_per_tg = 8;
-    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
-    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);  // 8 SIMD groups = 256 threads
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_rms_norm_matvec("rms_norm_matvec_q4k", x, norm_weight, W, y, K, N, eps);
 }
 
 Result<void> MetalCompute::rms_norm_matvec_f16(
     MTL::Buffer* x, MTL::Buffer* norm_weight, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N, float eps)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("rms_norm_matvec_f16");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "rms_norm_matvec_f16 pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(x, 0, 0);
-    encoder->setBuffer(norm_weight, 0, 1);
-    encoder->setBuffer(W, 0, 2);
-    encoder->setBuffer(y, 0, 3);
-    encoder->setBytes(&K, sizeof(K), 4);
-    encoder->setBytes(&N, sizeof(N), 5);
-    encoder->setBytes(&eps, sizeof(eps), 6);
-
-    uint32_t rows_per_tg = 8;
-    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
-    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_rms_norm_matvec("rms_norm_matvec_f16", x, norm_weight, W, y, K, N, eps);
 }
 
 Result<void> MetalCompute::rms_norm_matvec_q8_0(
     MTL::Buffer* x, MTL::Buffer* norm_weight, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N, float eps)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("rms_norm_matvec_q8_0");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "rms_norm_matvec_q8_0 pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(x, 0, 0);
-    encoder->setBuffer(norm_weight, 0, 1);
-    encoder->setBuffer(W, 0, 2);
-    encoder->setBuffer(y, 0, 3);
-    encoder->setBytes(&K, sizeof(K), 4);
-    encoder->setBytes(&N, sizeof(N), 5);
-    encoder->setBytes(&eps, sizeof(eps), 6);
-
-    uint32_t rows_per_tg = 8;
-    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
-    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_rms_norm_matvec("rms_norm_matvec_q8_0", x, norm_weight, W, y, K, N, eps);
 }
 
 Result<void> MetalCompute::rms_norm_matvec_q4_0(
     MTL::Buffer* x, MTL::Buffer* norm_weight, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N, float eps)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("rms_norm_matvec_q4_0");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "rms_norm_matvec_q4_0 pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(x, 0, 0);
-    encoder->setBuffer(norm_weight, 0, 1);
-    encoder->setBuffer(W, 0, 2);
-    encoder->setBuffer(y, 0, 3);
-    encoder->setBytes(&K, sizeof(K), 4);
-    encoder->setBytes(&N, sizeof(N), 5);
-    encoder->setBytes(&eps, sizeof(eps), 6);
-
-    uint32_t rows_per_tg = 8;
-    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
-    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_rms_norm_matvec("rms_norm_matvec_q4_0", x, norm_weight, W, y, K, N, eps);
 }
 
 Result<void> MetalCompute::rms_norm_matvec_iq4_nl(
     MTL::Buffer* x, MTL::Buffer* norm_weight, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N, float eps)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("rms_norm_matvec_iq4_nl");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "rms_norm_matvec_iq4_nl pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(x, 0, 0);
-    encoder->setBuffer(norm_weight, 0, 1);
-    encoder->setBuffer(W, 0, 2);
-    encoder->setBuffer(y, 0, 3);
-    encoder->setBytes(&K, sizeof(K), 4);
-    encoder->setBytes(&N, sizeof(N), 5);
-    encoder->setBytes(&eps, sizeof(eps), 6);
-
-    uint32_t rows_per_tg = 8;
-    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
-    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_rms_norm_matvec("rms_norm_matvec_iq4_nl", x, norm_weight, W, y, K, N, eps);
 }
 
 Result<void> MetalCompute::rms_norm_matvec_iq4_xs(
     MTL::Buffer* x, MTL::Buffer* norm_weight, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N, float eps)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("rms_norm_matvec_iq4_xs");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "rms_norm_matvec_iq4_xs pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(x, 0, 0);
-    encoder->setBuffer(norm_weight, 0, 1);
-    encoder->setBuffer(W, 0, 2);
-    encoder->setBuffer(y, 0, 3);
-    encoder->setBytes(&K, sizeof(K), 4);
-    encoder->setBytes(&N, sizeof(N), 5);
-    encoder->setBytes(&eps, sizeof(eps), 6);
-
-    uint32_t rows_per_tg = 8;
-    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
-    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_rms_norm_matvec("rms_norm_matvec_iq4_xs", x, norm_weight, W, y, K, N, eps);
 }
 
 Result<void> MetalCompute::rms_norm_matvec_iq3_s(
     MTL::Buffer* x, MTL::Buffer* norm_weight, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N, float eps)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("rms_norm_matvec_iq3_s");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "rms_norm_matvec_iq3_s pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(x, 0, 0);
-    encoder->setBuffer(norm_weight, 0, 1);
-    encoder->setBuffer(W, 0, 2);
-    encoder->setBuffer(y, 0, 3);
-    encoder->setBytes(&K, sizeof(K), 4);
-    encoder->setBytes(&N, sizeof(N), 5);
-    encoder->setBytes(&eps, sizeof(eps), 6);
-
-    uint32_t rows_per_tg = 8;
-    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
-    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_rms_norm_matvec("rms_norm_matvec_iq3_s", x, norm_weight, W, y, K, N, eps);
 }
 
 Result<void> MetalCompute::rms_norm_matvec_q6_k(
     MTL::Buffer* x, MTL::Buffer* norm_weight, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N, float eps)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("rms_norm_matvec_q6_k");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "rms_norm_matvec_q6_k pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(x, 0, 0);
-    encoder->setBuffer(norm_weight, 0, 1);
-    encoder->setBuffer(W, 0, 2);
-    encoder->setBuffer(y, 0, 3);
-    encoder->setBytes(&K, sizeof(K), 4);
-    encoder->setBytes(&N, sizeof(N), 5);
-    encoder->setBytes(&eps, sizeof(eps), 6);
-
-    uint32_t rows_per_tg = 8;
-    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
-    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_rms_norm_matvec("rms_norm_matvec_q6_k", x, norm_weight, W, y, K, N, eps);
 }
 
 Result<void> MetalCompute::rms_norm_matvec_q5_k(
     MTL::Buffer* x, MTL::Buffer* norm_weight, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N, float eps)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("rms_norm_matvec_q5_k");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "rms_norm_matvec_q5_k pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(x, 0, 0);
-    encoder->setBuffer(norm_weight, 0, 1);
-    encoder->setBuffer(W, 0, 2);
-    encoder->setBuffer(y, 0, 3);
-    encoder->setBytes(&K, sizeof(K), 4);
-    encoder->setBytes(&N, sizeof(N), 5);
-    encoder->setBytes(&eps, sizeof(eps), 6);
-
-    uint32_t rows_per_tg = 8;
-    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
-    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_rms_norm_matvec("rms_norm_matvec_q5_k", x, norm_weight, W, y, K, N, eps);
 }
 
 Result<void> MetalCompute::rms_norm_matvec_q3_k(
     MTL::Buffer* x, MTL::Buffer* norm_weight, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N, float eps)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("rms_norm_matvec_q3_k");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "rms_norm_matvec_q3_k pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(x, 0, 0);
-    encoder->setBuffer(norm_weight, 0, 1);
-    encoder->setBuffer(W, 0, 2);
-    encoder->setBuffer(y, 0, 3);
-    encoder->setBytes(&K, sizeof(K), 4);
-    encoder->setBytes(&N, sizeof(N), 5);
-    encoder->setBytes(&eps, sizeof(eps), 6);
-
-    uint32_t rows_per_tg = 8;
-    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
-    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_rms_norm_matvec("rms_norm_matvec_q3_k", x, norm_weight, W, y, K, N, eps);
 }
 
 Result<void> MetalCompute::rms_norm_matvec_q2_k(
     MTL::Buffer* x, MTL::Buffer* norm_weight, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N, float eps)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("rms_norm_matvec_q2_k");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "rms_norm_matvec_q2_k pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(x, 0, 0);
-    encoder->setBuffer(norm_weight, 0, 1);
-    encoder->setBuffer(W, 0, 2);
-    encoder->setBuffer(y, 0, 3);
-    encoder->setBytes(&K, sizeof(K), 4);
-    encoder->setBytes(&N, sizeof(N), 5);
-    encoder->setBytes(&eps, sizeof(eps), 6);
-
-    uint32_t rows_per_tg = 8;
-    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
-    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_rms_norm_matvec("rms_norm_matvec_q2_k", x, norm_weight, W, y, K, N, eps);
 }
 
-// =============================================================================
-// Phase 2 Fused Kernels - Eliminates redundant computation
-// =============================================================================
+// -----------------------------------------------------------------------------
+// Dual MatVec (for FFN gate + up projections)
+// -----------------------------------------------------------------------------
 
 Result<void> MetalCompute::rms_norm_dual_matvec_q4k(
     MTL::Buffer* x, MTL::Buffer* norm_weight,
@@ -1606,11 +921,11 @@ Result<void> MetalCompute::rms_norm_dual_matvec_q4k(
     encoder->setBytes(&N, sizeof(N), 7);
     encoder->setBytes(&eps, sizeof(eps), 8);
 
-    // DUAL_ROWS_PER_TG = 4 (4 SIMD groups, each handles 1 row for gate+up)
-    uint32_t rows_per_tg = 4;
+    // DUAL_ROWS_PER_TG = 8
+    constexpr uint32_t rows_per_tg = 8;
     uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
     MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);  // 8 SIMD groups × 32 threads
+    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
     encoder->dispatchThreadgroups(grid_size, threadgroup_size);
 
     return {};
@@ -1639,8 +954,7 @@ Result<void> MetalCompute::rms_norm_dual_matvec_q3k(
     encoder->setBytes(&N, sizeof(N), 7);
     encoder->setBytes(&eps, sizeof(eps), 8);
 
-    // 8 SIMD groups, each handles 1 row
-    uint32_t rows_per_tg = 8;
+    constexpr uint32_t rows_per_tg = 8;
     uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
     MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
@@ -1672,8 +986,7 @@ Result<void> MetalCompute::rms_norm_dual_matvec_q2k(
     encoder->setBytes(&N, sizeof(N), 7);
     encoder->setBytes(&eps, sizeof(eps), 8);
 
-    // 8 SIMD groups, each handles 1 row
-    uint32_t rows_per_tg = 8;
+    constexpr uint32_t rows_per_tg = 8;
     uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
     MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
@@ -1682,93 +995,218 @@ Result<void> MetalCompute::rms_norm_dual_matvec_q2k(
     return {};
 }
 
+// -----------------------------------------------------------------------------
+// MatVec + Residual (for down projection + residual add)
+// -----------------------------------------------------------------------------
+
 Result<void> MetalCompute::matvec_residual_q4k(
     MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* residual, MTL::Buffer* y,
     uint32_t K, uint32_t N)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("matvec_residual_q4k");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "matvec_residual_q4k pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(x, 0, 0);
-    encoder->setBuffer(W, 0, 1);
-    encoder->setBuffer(residual, 0, 2);
-    encoder->setBuffer(y, 0, 3);
-    encoder->setBytes(&K, sizeof(K), 4);
-    encoder->setBytes(&N, sizeof(N), 5);
-
-    // FUSED_ROWS_PER_TG = 8
-    uint32_t rows_per_tg = 8;
-    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
-    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_matvec_residual("matvec_residual_q4k", x, W, residual, y, K, N, 8);
 }
 
 Result<void> MetalCompute::matvec_residual_q3k(
     MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* residual, MTL::Buffer* y,
     uint32_t K, uint32_t N)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("matvec_residual_q3k");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "matvec_residual_q3k pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(x, 0, 0);
-    encoder->setBuffer(W, 0, 1);
-    encoder->setBuffer(residual, 0, 2);
-    encoder->setBuffer(y, 0, 3);
-    encoder->setBytes(&K, sizeof(K), 4);
-    encoder->setBytes(&N, sizeof(N), 5);
-
-    // Q3K_ROWS_PER_TG = 8, NR0_Q3K = 2 -> 16 rows per threadgroup
-    uint32_t rows_per_tg = 16;  // 8 SIMD groups * 2 rows each
-    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
-    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
-    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
-
-    return {};
+    return impl_->dispatch_matvec_residual("matvec_residual_q3k", x, W, residual, y, K, N, 16);
 }
 
 Result<void> MetalCompute::matvec_residual_q2k(
     MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* residual, MTL::Buffer* y,
     uint32_t K, uint32_t N)
 {
+    return impl_->dispatch_matvec_residual("matvec_residual_q2k", x, W, residual, y, K, N, 16);
+}
+
+
+// =============================================================================
+// SECTION 7: Attention Operations
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// Single-Head Attention
+// -----------------------------------------------------------------------------
+
+Result<void> MetalCompute::attention_single_head(
+    MTL::Buffer* Q, MTL::Buffer* K, MTL::Buffer* V, MTL::Buffer* output,
+    uint32_t seq_q, uint32_t seq_kv, uint32_t head_dim,
+    uint32_t start_pos, float scale)
+{
     auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("matvec_residual_q2k");
+    auto* pipeline = impl_->get_pipeline("attention_decode");
     if (!pipeline) {
-        return Error(ErrorCode::InternalError, "matvec_residual_q2k pipeline not found");
+        // Try flash attention as fallback
+        pipeline = impl_->get_pipeline("flash_attention_decode");
+        if (!pipeline) {
+            return Error(ErrorCode::InternalError, "attention_decode pipeline not found");
+        }
     }
 
     encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(x, 0, 0);
-    encoder->setBuffer(W, 0, 1);
-    encoder->setBuffer(residual, 0, 2);
-    encoder->setBuffer(y, 0, 3);
-    encoder->setBytes(&K, sizeof(K), 4);
-    encoder->setBytes(&N, sizeof(N), 5);
+    encoder->setBuffer(Q, 0, 0);
+    encoder->setBuffer(K, 0, 1);
+    encoder->setBuffer(V, 0, 2);
+    encoder->setBuffer(output, 0, 3);
+    encoder->setBytes(&seq_q, sizeof(seq_q), 4);
+    encoder->setBytes(&seq_kv, sizeof(seq_kv), 5);
+    encoder->setBytes(&head_dim, sizeof(head_dim), 6);
+    encoder->setBytes(&start_pos, sizeof(start_pos), 7);
+    encoder->setBytes(&scale, sizeof(scale), 8);
 
-    // Q2K_ROWS_PER_TG = 8, NR0_Q2K = 2 -> 16 rows per threadgroup
-    uint32_t rows_per_tg = 16;  // 8 SIMD groups * 2 rows each
-    uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
-    MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    if (seq_q == 1) {
+        // Decode mode: single query token
+        MTL::Size grid_size = MTL::Size::Make(head_dim, 1, 1);
+        MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
+        encoder->dispatchThreads(grid_size, threadgroup_size);
+    } else {
+        // Prefill mode: multiple query tokens
+        MTL::Size grid_size = MTL::Size::Make(head_dim, seq_q, 1);
+        MTL::Size threadgroup_size = MTL::Size::Make(32, 4, 1);
+        encoder->dispatchThreads(grid_size, threadgroup_size);
+    }
+
+    return {};
+}
+
+// -----------------------------------------------------------------------------
+// KV Cache Operations
+// -----------------------------------------------------------------------------
+
+std::pair<MTL::Buffer*, MTL::Buffer*> MetalCompute::create_kv_cache(
+    uint32_t num_kv_heads, uint32_t max_seq_len, uint32_t head_dim)
+{
+    // FP16 storage for KV cache
+    size_t size = num_kv_heads * max_seq_len * head_dim * sizeof(uint16_t);
+    return {
+        impl_->create_buffer(size, false),  // K cache (private memory)
+        impl_->create_buffer(size, false)   // V cache (private memory)
+    };
+}
+
+std::pair<MTL::Buffer*, MTL::Buffer*> MetalCompute::create_kv_cache_f32(
+    uint32_t num_kv_heads, uint32_t max_seq_len, uint32_t head_dim)
+{
+    size_t size = num_kv_heads * max_seq_len * head_dim * sizeof(float);
+    return {
+        impl_->create_buffer(size, false),
+        impl_->create_buffer(size, false)
+    };
+}
+
+Result<void> MetalCompute::kv_cache_append(
+    MTL::Buffer* cache_k, MTL::Buffer* cache_v,
+    MTL::Buffer* new_k, MTL::Buffer* new_v,
+    uint32_t num_kv_heads, uint32_t head_dim,
+    uint32_t current_len, uint32_t new_len, uint32_t max_seq_len)
+{
+    auto* encoder = impl_->get_encoder();
+    auto* pipeline = impl_->get_pipeline("kv_cache_append_f16");
+    if (!pipeline) {
+        pipeline = impl_->get_pipeline("kv_cache_append");
+        if (!pipeline) {
+            return Error(ErrorCode::InternalError, "kv_cache_append pipeline not found");
+        }
+    }
+
+    encoder->setComputePipelineState(pipeline);
+    encoder->setBuffer(cache_k, 0, 0);
+    encoder->setBuffer(cache_v, 0, 1);
+    encoder->setBuffer(new_k, 0, 2);
+    encoder->setBuffer(new_v, 0, 3);
+    encoder->setBytes(&num_kv_heads, sizeof(num_kv_heads), 4);
+    encoder->setBytes(&head_dim, sizeof(head_dim), 5);
+    encoder->setBytes(&current_len, sizeof(current_len), 6);
+    encoder->setBytes(&new_len, sizeof(new_len), 7);
+    encoder->setBytes(&max_seq_len, sizeof(max_seq_len), 8);
+
+    // Grid: [head_dim, new_len, num_kv_heads]
+    MTL::Size grid_size = MTL::Size::Make(head_dim, new_len, num_kv_heads);
+    MTL::Size threadgroup_size = MTL::Size::Make(32, 1, 1);
+    encoder->dispatchThreads(grid_size, threadgroup_size);
+
+    // Also sync to ensure writes complete
+    MTL::Size grid_size2 = MTL::Size::Make(head_dim, new_len, num_kv_heads);
+    encoder->dispatchThreads(grid_size2, threadgroup_size);
+
+    return {};
+}
+
+// -----------------------------------------------------------------------------
+// Multi-Head Attention
+// -----------------------------------------------------------------------------
+
+Result<void> MetalCompute::multihead_attention(
+    MTL::Buffer* Q, MTL::Buffer* K, MTL::Buffer* V, MTL::Buffer* output,
+    uint32_t num_heads, uint32_t num_kv_heads,
+    uint32_t seq_q, uint32_t seq_kv, uint32_t head_dim, float scale)
+{
+    auto* encoder = impl_->get_encoder();
+
+    // Select appropriate kernel based on configuration
+    const char* kernel_name = "multihead_attention_decode_f16kv";
+    auto* pipeline = impl_->get_pipeline(kernel_name);
+    if (!pipeline) {
+        kernel_name = "multihead_attention_decode";
+        pipeline = impl_->get_pipeline(kernel_name);
+        if (!pipeline) {
+            return Error(ErrorCode::InternalError, "multihead_attention kernel not found");
+        }
+    }
+
+    encoder->setComputePipelineState(pipeline);
+    encoder->setBuffer(Q, 0, 0);
+    encoder->setBuffer(K, 0, 1);
+    encoder->setBuffer(V, 0, 2);
+    encoder->setBuffer(output, 0, 3);
+    encoder->setBytes(&num_heads, sizeof(num_heads), 4);
+    encoder->setBytes(&num_kv_heads, sizeof(num_kv_heads), 5);
+    encoder->setBytes(&seq_q, sizeof(seq_q), 6);
+    encoder->setBytes(&seq_kv, sizeof(seq_kv), 7);
+    encoder->setBytes(&head_dim, sizeof(head_dim), 8);
+    encoder->setBytes(&scale, sizeof(scale), 9);
+
+    // One threadgroup per head
+    MTL::Size grid_size = MTL::Size::Make(num_heads, seq_q, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
     encoder->dispatchThreadgroups(grid_size, threadgroup_size);
 
     return {};
 }
 
-// =============================================================================
-// Fused QKV Attention Projection
-// =============================================================================
+// -----------------------------------------------------------------------------
+// Embedding Lookup
+// -----------------------------------------------------------------------------
+
+Result<void> MetalCompute::embedding_lookup(
+    MTL::Buffer* token_ids, MTL::Buffer* embeddings, MTL::Buffer* output,
+    uint32_t num_tokens, uint32_t hidden_dim, uint32_t vocab_size)
+{
+    auto* encoder = impl_->get_encoder();
+    auto* pipeline = impl_->get_pipeline("embedding_lookup");
+    if (!pipeline) {
+        return Error(ErrorCode::InternalError, "embedding_lookup pipeline not found");
+    }
+
+    encoder->setComputePipelineState(pipeline);
+    encoder->setBuffer(token_ids, 0, 0);
+    encoder->setBuffer(embeddings, 0, 1);
+    encoder->setBuffer(output, 0, 2);
+    encoder->setBytes(&num_tokens, sizeof(num_tokens), 3);
+    encoder->setBytes(&hidden_dim, sizeof(hidden_dim), 4);
+    encoder->setBytes(&vocab_size, sizeof(vocab_size), 5);
+
+    MTL::Size grid_size = MTL::Size::Make(hidden_dim, num_tokens, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    encoder->dispatchThreads(grid_size, threadgroup_size);
+
+    return {};
+}
+
+// -----------------------------------------------------------------------------
+// Fused QKV Projection
+// -----------------------------------------------------------------------------
 
 Result<void> MetalCompute::fused_qkv_matvec_q4k(
     MTL::Buffer* x,
@@ -1795,7 +1233,7 @@ Result<void> MetalCompute::fused_qkv_matvec_q4k(
     encoder->setBytes(&Nkv, sizeof(Nkv), 9);
 
     // Calculate threadgroups: 8 SIMD groups per TG, 2 rows per SIMD = 16 rows per TG
-    uint32_t rows_per_tg = 16;
+    constexpr uint32_t rows_per_tg = 16;
     uint32_t q_threadgroups = (Nq + rows_per_tg - 1) / rows_per_tg;
     uint32_t kv_threadgroups = (Nkv + rows_per_tg - 1) / rows_per_tg;
     uint32_t total_threadgroups = q_threadgroups + 2 * kv_threadgroups;  // Q + K + V
@@ -1810,24 +1248,18 @@ Result<void> MetalCompute::fused_qkv_matvec_q4k(
     return {};
 }
 
-// =============================================================================
-// Tree Attention Dispatch Functions (for Speculative Decoding)
-// =============================================================================
+// -----------------------------------------------------------------------------
+// Tree Attention (Speculative Decoding)
+// -----------------------------------------------------------------------------
 
 Result<void> MetalCompute::attention_tree(
     MTL::Buffer* Q,
-    MTL::Buffer* K_cache,
-    MTL::Buffer* V_cache,
-    MTL::Buffer* K_tree,
-    MTL::Buffer* V_tree,
-    MTL::Buffer* parent_indices,
-    MTL::Buffer* output,
-    uint32_t num_heads,
-    uint32_t num_kv_heads,
-    uint32_t num_nodes,
-    uint32_t cache_len,
-    uint32_t head_dim,
-    float scale)
+    MTL::Buffer* K_cache, MTL::Buffer* V_cache,
+    MTL::Buffer* K_tree, MTL::Buffer* V_tree,
+    MTL::Buffer* parent_indices, MTL::Buffer* output,
+    uint32_t num_heads, uint32_t num_kv_heads,
+    uint32_t num_nodes, uint32_t cache_len,
+    uint32_t head_dim, float scale)
 {
     auto* encoder = impl_->get_encoder();
 
@@ -1884,22 +1316,17 @@ Result<void> MetalCompute::attention_tree(
     return {};
 }
 
-// =============================================================================
-// Paged Attention Kernels
-// =============================================================================
+// -----------------------------------------------------------------------------
+// Paged Attention (Continuous Batching)
+// -----------------------------------------------------------------------------
 
 Result<void> MetalCompute::paged_attention_decode(
     MTL::Buffer* Q,
-    MTL::Buffer* K_cache,
-    MTL::Buffer* V_cache,
-    MTL::Buffer* block_table,
-    MTL::Buffer* output,
-    uint32_t num_heads,
-    uint32_t num_kv_heads,
-    uint32_t seq_len,
-    uint32_t head_dim,
-    uint32_t block_size,
-    float scale)
+    MTL::Buffer* K_cache, MTL::Buffer* V_cache,
+    MTL::Buffer* block_table, MTL::Buffer* output,
+    uint32_t num_heads, uint32_t num_kv_heads,
+    uint32_t seq_len, uint32_t head_dim,
+    uint32_t block_size, float scale)
 {
     auto* encoder = impl_->get_encoder();
     auto* pipeline = impl_->get_pipeline("paged_attention_decode");
@@ -1922,7 +1349,7 @@ Result<void> MetalCompute::paged_attention_decode(
     encoder->setBytes(&kv_stride, sizeof(uint32_t), 10);
     encoder->setBytes(&scale, sizeof(float), 11);
 
-    // One threadgroup per head, 128 threads per threadgroup
+    // One threadgroup per head
     MTL::Size grid_size = MTL::Size::Make(num_heads, 1, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
     encoder->dispatchThreadgroups(grid_size, threadgroup_size);
@@ -1931,16 +1358,11 @@ Result<void> MetalCompute::paged_attention_decode(
 }
 
 Result<void> MetalCompute::paged_kv_cache_append(
-    MTL::Buffer* new_k,
-    MTL::Buffer* new_v,
-    MTL::Buffer* K_cache,
-    MTL::Buffer* V_cache,
+    MTL::Buffer* new_k, MTL::Buffer* new_v,
+    MTL::Buffer* K_cache, MTL::Buffer* V_cache,
     MTL::Buffer* block_table,
-    uint32_t num_kv_heads,
-    uint32_t head_dim,
-    uint32_t start_pos,
-    uint32_t new_len,
-    uint32_t block_size)
+    uint32_t num_kv_heads, uint32_t head_dim,
+    uint32_t start_pos, uint32_t new_len, uint32_t block_size)
 {
     auto* encoder = impl_->get_encoder();
     auto* pipeline = impl_->get_pipeline("paged_kv_cache_append");
@@ -1970,18 +1392,12 @@ Result<void> MetalCompute::paged_kv_cache_append(
 
 Result<void> MetalCompute::batched_paged_attention_decode(
     MTL::Buffer* Q,
-    MTL::Buffer* K_cache,
-    MTL::Buffer* V_cache,
-    MTL::Buffer* block_tables,
-    MTL::Buffer* seq_lens,
+    MTL::Buffer* K_cache, MTL::Buffer* V_cache,
+    MTL::Buffer* block_tables, MTL::Buffer* seq_lens,
     MTL::Buffer* output,
-    uint32_t batch_size,
-    uint32_t num_heads,
-    uint32_t num_kv_heads,
-    uint32_t head_dim,
-    uint32_t block_size,
-    uint32_t max_blocks_per_seq,
-    float scale)
+    uint32_t batch_size, uint32_t num_heads, uint32_t num_kv_heads,
+    uint32_t head_dim, uint32_t block_size,
+    uint32_t max_blocks_per_seq, float scale)
 {
     auto* encoder = impl_->get_encoder();
     auto* pipeline = impl_->get_pipeline("batched_paged_attention_decode");
@@ -2012,7 +1428,11 @@ Result<void> MetalCompute::batched_paged_attention_decode(
     return {};
 }
 
-// Global singleton
+
+// =============================================================================
+// SECTION 8: Global Singleton
+// =============================================================================
+
 static std::unique_ptr<MetalCompute> g_metal_compute;
 static std::once_flag g_metal_compute_init;
 
