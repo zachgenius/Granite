@@ -1,7 +1,6 @@
 // benchmark_attention.mm - Isolated benchmark for attention kernel performance
 //
 // Tests raw attention kernel performance without transformer overhead
-// Compares old single-threadgroup vs new multi-threadgroup implementation
 
 #include <granite/granite.h>
 #ifdef GRANITE_HAS_METAL
@@ -79,7 +78,7 @@ int main(int argc, char** argv) {
     return 1;
 #else
     std::cout << "╔══════════════════════════════════════════════════════════════════╗\n";
-    std::cout << "║       Attention Kernel Benchmark (Old vs Multi-TG)               ║\n";
+    std::cout << "║            Attention Kernel Benchmark                            ║\n";
     std::cout << "╚══════════════════════════════════════════════════════════════════╝\n\n";
 
     // Initialize Metal device
@@ -128,10 +127,9 @@ int main(int argc, char** argv) {
     std::cout << "Running " << benchmark_runs << " iterations, " << batch_size << " per batch\n\n";
 
     // Header
-    std::cout << "┌────────────────────────┬────────────────────────────────────┬────────────────────────────────────┬─────────┐\n";
-    std::cout << "│                        │         OLD (Single-TG)            │         NEW (Multi-TG)             │         │\n";
-    std::cout << "│ Test                   │  Avg µs  │  BW GB/s │  Eff %       │  Avg µs  │  BW GB/s │  Eff %       │ Speedup │\n";
-    std::cout << "├────────────────────────┼──────────┼──────────┼──────────────┼──────────┼──────────┼──────────────┼─────────┤\n";
+    std::cout << "┌────────────────────────┬──────────┬──────────┬──────────────┐\n";
+    std::cout << "│ Test                   │  Avg µs  │  BW GB/s │  Eff %       │\n";
+    std::cout << "├────────────────────────┼──────────┼──────────┼──────────────┤\n";
 
     for (const auto& test : tests) {
         // Calculate sizes
@@ -141,25 +139,13 @@ int main(int argc, char** argv) {
         size_t output_bytes = test.num_heads * test.head_dim * sizeof(float);
         size_t total_bytes = q_bytes + k_bytes + v_bytes + output_bytes;
 
-        // Allocate main buffers
+        // Allocate buffers
         MTL::Buffer* q_buf = gpu.create_buffer(q_bytes);
         MTL::Buffer* k_buf = gpu.create_buffer(k_bytes);
         MTL::Buffer* v_buf = gpu.create_buffer(v_bytes);
         MTL::Buffer* output_buf = gpu.create_buffer(output_bytes);
 
-        // Allocate temporary buffers for multi-TG kernel
-        constexpr uint32_t CHUNK_SIZE = 256;
-        uint32_t num_chunks = (test.seq_kv + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        size_t partial_out_bytes = test.num_heads * num_chunks * test.head_dim * sizeof(float);
-        size_t partial_max_bytes = test.num_heads * num_chunks * sizeof(float);
-        size_t partial_sum_bytes = test.num_heads * num_chunks * sizeof(float);
-
-        MTL::Buffer* partial_out_buf = gpu.create_buffer(partial_out_bytes);
-        MTL::Buffer* partial_max_buf = gpu.create_buffer(partial_max_bytes);
-        MTL::Buffer* partial_sum_buf = gpu.create_buffer(partial_sum_bytes);
-
-        if (!q_buf || !k_buf || !v_buf || !output_buf ||
-            !partial_out_buf || !partial_max_buf || !partial_sum_buf) {
+        if (!q_buf || !k_buf || !v_buf || !output_buf) {
             std::cerr << "Failed to allocate buffers for " << test.name << "\n";
             continue;
         }
@@ -192,58 +178,34 @@ int main(int argc, char** argv) {
         float scale = 1.0f / sqrtf(static_cast<float>(test.head_dim));
         uint32_t seq_q = 1;
 
-        // Benchmark OLD kernel
-        auto old_kernel = [&]() {
+        // Benchmark attention kernel
+        auto kernel = [&]() {
             gpu.multihead_attention(
                 q_buf, k_buf, v_buf, output_buf,
                 test.num_heads, test.num_kv_heads, seq_q, test.seq_kv,
                 test.head_dim, scale
             );
         };
-        BenchResult old_result = run_benchmark(gpu, old_kernel, total_bytes,
-                                               warmup_runs, benchmark_runs, batch_size);
-
-        // Benchmark NEW multi-TG kernel
-        auto new_kernel = [&]() {
-            gpu.multihead_attention_fast(
-                q_buf, k_buf, v_buf, output_buf,
-                partial_out_buf, partial_max_buf, partial_sum_buf,
-                test.num_heads, test.num_kv_heads, test.seq_kv,
-                test.head_dim, scale
-            );
-        };
-        BenchResult new_result = run_benchmark(gpu, new_kernel, total_bytes,
-                                               warmup_runs, benchmark_runs, batch_size);
-
-        double speedup = old_result.avg_us / new_result.avg_us;
+        BenchResult result = run_benchmark(gpu, kernel, total_bytes,
+                                           warmup_runs, benchmark_runs, batch_size);
 
         // Print results
         std::cout << "│ " << std::setw(22) << std::left << test.name << " │ "
-                  << std::setw(8) << std::right << old_result.avg_us << " │ "
-                  << std::setw(8) << old_result.bandwidth_gb_s << " │ "
-                  << std::setw(6) << old_result.efficiency_pct << "%      │ "
-                  << std::setw(8) << new_result.avg_us << " │ "
-                  << std::setw(8) << new_result.bandwidth_gb_s << " │ "
-                  << std::setw(6) << new_result.efficiency_pct << "%      │ "
-                  << std::setw(6) << speedup << "x │\n";
+                  << std::setw(8) << std::right << result.avg_us << " │ "
+                  << std::setw(8) << result.bandwidth_gb_s << " │ "
+                  << std::setw(6) << result.efficiency_pct << "%      │\n";
 
         // Cleanup
         q_buf->release();
         k_buf->release();
         v_buf->release();
         output_buf->release();
-        partial_out_buf->release();
-        partial_max_buf->release();
-        partial_sum_buf->release();
     }
 
-    std::cout << "└────────────────────────┴──────────┴──────────┴──────────────┴──────────┴──────────┴──────────────┴─────────┘\n\n";
+    std::cout << "└────────────────────────┴──────────┴──────────┴──────────────┘\n\n";
 
     std::cout << "Legend:\n";
-    std::cout << "  OLD: Single threadgroup per attention head (128 threads × num_heads)\n";
-    std::cout << "  NEW: Multiple threadgroups per head (256 threads × num_heads × num_chunks)\n";
     std::cout << "  Eff %: Memory bandwidth efficiency (actual / 400 GB/s)\n";
-    std::cout << "  Speedup > 1.0 = NEW is faster\n";
 
     return 0;
 #endif

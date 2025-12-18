@@ -662,28 +662,6 @@ public:
         float scale
     );
 
-    // High-performance multi-threadgroup attention (decode only, seq_q=1)
-    // Uses multiple threadgroups per head for better GPU utilization
-    // Requires temporary buffers for partial results:
-    //   - temp_partial_out: [num_heads, num_chunks, head_dim] floats
-    //   - temp_partial_max: [num_heads, num_chunks] floats
-    //   - temp_partial_sum: [num_heads, num_chunks] floats
-    // where num_chunks = ceil(seq_kv / 256)
-    Result<void> multihead_attention_fast(
-        MTL::Buffer* Q,
-        MTL::Buffer* K,
-        MTL::Buffer* V,
-        MTL::Buffer* output,
-        MTL::Buffer* temp_partial_out,
-        MTL::Buffer* temp_partial_max,
-        MTL::Buffer* temp_partial_sum,
-        uint32_t num_heads,
-        uint32_t num_kv_heads,
-        uint32_t seq_kv,
-        uint32_t head_dim,
-        float scale
-    );
-
     // =============================================================================
     // Tree Attention (for Speculative Decoding)
     // =============================================================================
