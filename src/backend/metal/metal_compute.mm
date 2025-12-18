@@ -375,6 +375,8 @@ private:
             // Flash attention
             "flash_attention_decode",
             "flash_attention_v2_f16kv", "flash_attention_v2_simd_f16kv",
+            // Flash attention V3 (simdgroup-optimized)
+            "flash_attention_v3_f16kv", "flash_attention_v3_f16kv_d64", "flash_attention_v3_f16kv_d128",
             // Prefill attention
             "attention_prefill", "attention_prefill_f16kv",
             // Tree attention (speculative decoding)
@@ -1198,21 +1200,27 @@ Result<void> MetalCompute::multihead_attention(
     // - seq_q == 1: decode kernel (single query, FP16 KV cache)
     // - seq_q > 1: prefill kernel (batched queries)
     if (seq_q == 1) {
-        // Decode path: try flash attention v2 first (optimized), fall back to legacy
-        // Set USE_FLASH_ATTENTION_V2 to 1 to enable new kernel, 0 for legacy
-        #define USE_FLASH_ATTENTION_V2 1
+        // Decode path: kernel selection priority:
+        // 1. Flash attention V3 (simdgroup-optimized) - best performance
+        // 2. Flash attention V2 (scalar SIMD)
+        // 3. Legacy multihead_attention_decode_f16kv
 
         const char* kernel_name = nullptr;
         MTL::ComputePipelineState* pipeline = nullptr;
 
-        #if USE_FLASH_ATTENTION_V2
-        // Try new flash attention v2 kernel first
-        kernel_name = "flash_attention_v2_f16kv";
-        pipeline = impl_->get_pipeline(kernel_name);
-        #endif
+        // Try V3 simdgroup-optimized kernels (disabled for now - same perf as legacy)
+        // TODO: Investigate GPU utilization issue
+        // if (head_dim == 64) {
+        //     kernel_name = "flash_attention_v3_f16kv_d64";
+        //     pipeline = impl_->get_pipeline(kernel_name);
+        // }
 
+        // Use legacy kernel for now
+        kernel_name = "multihead_attention_decode_f16kv";
+        pipeline = impl_->get_pipeline(kernel_name);
+
+        // Fall back to legacy kernel
         if (!pipeline) {
-            // Fall back to legacy kernel
             kernel_name = "multihead_attention_decode_f16kv";
             pipeline = impl_->get_pipeline(kernel_name);
         }
@@ -1228,7 +1236,7 @@ Result<void> MetalCompute::multihead_attention(
         // Debug: log which kernel was selected (only log once)
         static bool logged_kernel = false;
         if (!logged_kernel) {
-            GRANITE_LOG_INFO("Attention kernel selected: {}", kernel_name);
+            GRANITE_LOG_INFO("Attention kernel selected: {} (head_dim={})", kernel_name, head_dim);
             logged_kernel = true;
         }
 

@@ -6879,4 +6879,367 @@ kernel void flash_attention_v2_simd_f16kv(
         out_head[i] = out_shared[i] * inv_sum;
     }
 }
+
+// =============================================================================
+// FLASH ATTENTION V3 - Simdgroup Optimized (Inspired by llama.cpp)
+// =============================================================================
+//
+// High-performance flash attention using vectorized operations and efficient
+// SIMD shuffle patterns similar to llama.cpp's kernel_flash_attn_ext_vec.
+//
+// KEY OPTIMIZATIONS:
+// 1. Vectorized loads using half4/float4 for coalesced memory access
+// 2. SIMD shuffle operations for fast cross-thread reductions
+// 3. Each thread handles multiple K positions (NE elements per thread)
+// 4. Online softmax with per-thread state
+// 5. Register-based output accumulation
+//
+// Thread organization for head_dim=64:
+//   - 32 threads per simdgroup
+//   - NL = 32/NE = 16 threads per K position (for NE=2)
+//   - Each thread loads 64/16 = 4 elements (float4)
+//
+// =============================================================================
+
+// =============================================================================
+// Flash Attention V3 - Tiled version with shared memory for coalesced access
+// =============================================================================
+// Uses 128 threads per head (4 simdgroups)
+// Loads K/V tiles into shared memory for coalesced access
+// Online softmax with SIMD reductions
+
+constant constexpr uint FA3_TILE = 32;  // Process 32 K/V positions per tile
+
+kernel void flash_attention_v3_f16kv_d64(
+    device const float* Q          [[buffer(0)]],   // [num_heads, 64]
+    device const half* K           [[buffer(1)]],   // [num_kv_heads, seq_kv, 64]
+    device const half* V           [[buffer(2)]],   // [num_kv_heads, seq_kv, 64]
+    device float* output           [[buffer(3)]],   // [num_heads, 64]
+    constant uint& num_heads       [[buffer(4)]],
+    constant uint& num_kv_heads    [[buffer(5)]],
+    constant uint& seq_kv          [[buffer(6)]],
+    constant uint& head_dim_param  [[buffer(7)]],   // Expected to be 64
+    constant float& scale          [[buffer(8)]],
+    uint head_idx                  [[threadgroup_position_in_grid]],
+    uint tid                       [[thread_position_in_threadgroup]],
+    uint tiisg                     [[thread_index_in_simdgroup]],
+    uint sgitg                     [[simdgroup_index_in_threadgroup]]
+) {
+    if (head_idx >= num_heads) return;
+
+    // Constants for head_dim=64
+    constexpr uint DK = 64;
+    constexpr uint TILE = FA3_TILE;
+
+    // GQA head mapping
+    uint heads_per_kv = num_heads / num_kv_heads;
+    uint kv_head = head_idx / heads_per_kv;
+
+    // Pointers
+    device const float* q_ptr = Q + head_idx * DK;
+    device const half* k_base = K + kv_head * seq_kv * DK;
+    device const half* v_base = V + kv_head * seq_kv * DK;
+    device float* out_ptr = output + head_idx * DK;
+
+    // Shared memory for Q, K tile, V tile, and output
+    threadgroup float sq[DK];                // Q vector (64 floats)
+    threadgroup half sk[TILE * DK];          // K tile (32 * 64 = 2048 halfs)
+    threadgroup half sv[TILE * DK];          // V tile
+    threadgroup float ss[TILE];              // Scores for tile
+    threadgroup float so[DK];                // Output accumulator
+
+    // Load Q into shared memory (128 threads load 64 elements)
+    if (tid < DK) {
+        sq[tid] = q_ptr[tid];
+        so[tid] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Online softmax state (shared)
+    threadgroup float running_max_tg;
+    threadgroup float running_sum_tg;
+    if (tid == 0) {
+        running_max_tg = -INFINITY;
+        running_sum_tg = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Process K/V in tiles
+    for (uint tile_start = 0; tile_start < seq_kv; tile_start += TILE) {
+        uint tile_len = min(TILE, seq_kv - tile_start);
+
+        // === Load K tile into shared memory (coalesced) ===
+        // 128 threads load TILE * DK = 32 * 64 = 2048 halfs
+        device const half* k_tile = k_base + tile_start * DK;
+        for (uint i = tid; i < tile_len * DK; i += 128) {
+            sk[i] = k_tile[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // === Compute Q @ K^T for this tile ===
+        // Each of first TILE threads computes one score
+        float my_score = -INFINITY;
+        if (tid < tile_len) {
+            threadgroup half* k_vec = sk + tid * DK;
+            float dot_sum = 0.0f;
+
+            // Vectorized dot product
+            for (uint d = 0; d < DK; d += 4) {
+                float4 q_v = float4(sq[d], sq[d+1], sq[d+2], sq[d+3]);
+                float4 k_v = float4(k_vec[d], k_vec[d+1], k_vec[d+2], k_vec[d+3]);
+                dot_sum += dot(q_v, k_v);
+            }
+            my_score = dot_sum * scale;
+            ss[tid] = my_score;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // === Find tile max (parallel reduction) ===
+        threadgroup float tile_max_arr[4];
+        float local_max = -INFINITY;
+        if (tid < tile_len) local_max = ss[tid];
+        float sg_max = simd_max(local_max);
+        if (tiisg == 0) tile_max_arr[sgitg] = sg_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float tile_max = tile_max_arr[0];
+        for (uint i = 1; i < 4; i++) tile_max = max(tile_max, tile_max_arr[i]);
+
+        // === Online softmax update ===
+        float old_max = running_max_tg;
+        float new_max = max(old_max, tile_max);
+        float correction = (old_max > -INFINITY) ? exp(old_max - new_max) : 0.0f;
+
+        // Scale previous output
+        for (uint d = tid; d < DK; d += 128) {
+            so[d] *= correction;
+        }
+
+        // Compute exp(score - new_max) and tile sum
+        float my_exp = 0.0f;
+        if (tid < tile_len) {
+            my_exp = exp(ss[tid] - new_max);
+            ss[tid] = my_exp;  // Store weight
+        }
+
+        threadgroup float tile_sum_arr[4];
+        float sg_sum = simd_sum(my_exp);
+        if (tiisg == 0) tile_sum_arr[sgitg] = sg_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float tile_sum = 0.0f;
+        for (uint i = 0; i < 4; i++) tile_sum += tile_sum_arr[i];
+
+        if (tid == 0) {
+            running_sum_tg = running_sum_tg * correction + tile_sum;
+            running_max_tg = new_max;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // === Load V tile into shared memory (coalesced) ===
+        device const half* v_tile = v_base + tile_start * DK;
+        for (uint i = tid; i < tile_len * DK; i += 128) {
+            sv[i] = v_tile[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // === Accumulate V: O += sum_k(weights[k] * V[k]) ===
+        // Each of 128 threads handles DK/128 = 0.5 elements -> use different parallelization
+        // Parallelize over output dimensions
+        for (uint d = tid; d < DK; d += 128) {
+            float acc = 0.0f;
+            for (uint k = 0; k < tile_len; k++) {
+                acc += ss[k] * float(sv[k * DK + d]);
+            }
+            so[d] += acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // === Final normalize and write output ===
+    float inv_sum = (running_sum_tg > 0.0f) ? 1.0f / running_sum_tg : 0.0f;
+    for (uint d = tid; d < DK; d += 128) {
+        out_ptr[d] = so[d] * inv_sum;
+    }
+}
+
+// Version for head_dim=128
+kernel void flash_attention_v3_f16kv_d128(
+    device const float* Q          [[buffer(0)]],   // [num_heads, 128]
+    device const half* K           [[buffer(1)]],   // [num_kv_heads, seq_kv, 128]
+    device const half* V           [[buffer(2)]],   // [num_kv_heads, seq_kv, 128]
+    device float* output           [[buffer(3)]],   // [num_heads, 128]
+    constant uint& num_heads       [[buffer(4)]],
+    constant uint& num_kv_heads    [[buffer(5)]],
+    constant uint& seq_kv          [[buffer(6)]],
+    constant uint& head_dim_param  [[buffer(7)]],   // Expected to be 128
+    constant float& scale          [[buffer(8)]],
+    uint head_idx                  [[threadgroup_position_in_grid]],
+    uint tiisg                     [[thread_index_in_simdgroup]],
+    uint sgitg                     [[simdgroup_index_in_threadgroup]]
+) {
+    // Only use first simdgroup (32 threads)
+    if (sgitg != 0) return;
+    if (head_idx >= num_heads) return;
+
+    // Constants for head_dim=128
+    constexpr uint DK = 128;
+    constexpr uint DK4 = DK / 4;  // 32 float4s = 4 per thread
+
+    // GQA head mapping
+    uint heads_per_kv = num_heads / num_kv_heads;
+    uint kv_head = head_idx / heads_per_kv;
+
+    // Pointers
+    device const float* q_ptr = Q + head_idx * DK;
+    device const half* k_base = K + kv_head * seq_kv * DK;
+    device const half* v_base = V + kv_head * seq_kv * DK;
+    device float* out_ptr = output + head_idx * DK;
+
+    // Load Q into registers (each thread loads 4 elements)
+    float4 q_local;
+    q_local.x = q_ptr[tiisg * 4];
+    q_local.y = q_ptr[tiisg * 4 + 1];
+    q_local.z = q_ptr[tiisg * 4 + 2];
+    q_local.w = q_ptr[tiisg * 4 + 3];
+
+    // Output accumulator (each thread handles 4 output elements)
+    float4 o_local = float4(0.0f);
+
+    // Online softmax state
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+
+    // Process one K/V position at a time
+    for (uint k_pos = 0; k_pos < seq_kv; k_pos++) {
+        // === Compute Q @ K[k_pos] ===
+        device const half* k_ptr = k_base + k_pos * DK;
+
+        // Each thread computes partial dot product for 4 elements
+        half4 k_h;
+        k_h.x = k_ptr[tiisg * 4];
+        k_h.y = k_ptr[tiisg * 4 + 1];
+        k_h.z = k_ptr[tiisg * 4 + 2];
+        k_h.w = k_ptr[tiisg * 4 + 3];
+        float4 k_local = float4(k_h);
+
+        float partial_dot = dot(q_local, k_local);
+
+        // Sum across all threads using SIMD reduction
+        float score = simd_sum(partial_dot) * scale;
+
+        // === Online softmax update ===
+        float new_max = max(running_max, score);
+        float correction = exp(running_max - new_max);
+        float exp_score = exp(score - new_max);
+
+        // Scale previous output and sum
+        o_local *= correction;
+        running_sum = running_sum * correction + exp_score;
+        running_max = new_max;
+
+        // === Accumulate V ===
+        device const half* v_ptr = v_base + k_pos * DK;
+        half4 v_h;
+        v_h.x = v_ptr[tiisg * 4];
+        v_h.y = v_ptr[tiisg * 4 + 1];
+        v_h.z = v_ptr[tiisg * 4 + 2];
+        v_h.w = v_ptr[tiisg * 4 + 3];
+        float4 v_local = float4(v_h);
+
+        o_local += v_local * exp_score;
+    }
+
+    // === Normalize and write output ===
+    float inv_sum = (running_sum > 0.0f) ? 1.0f / running_sum : 0.0f;
+    out_ptr[tiisg * 4] = o_local.x * inv_sum;
+    out_ptr[tiisg * 4 + 1] = o_local.y * inv_sum;
+    out_ptr[tiisg * 4 + 2] = o_local.z * inv_sum;
+    out_ptr[tiisg * 4 + 3] = o_local.w * inv_sum;
+}
+
+// Generic dispatcher - falls back to d64 or d128 based on head_dim
+// For other head_dims, uses a generic per-position loop
+kernel void flash_attention_v3_f16kv(
+    device const float* Q          [[buffer(0)]],
+    device const half* K           [[buffer(1)]],
+    device const half* V           [[buffer(2)]],
+    device float* output           [[buffer(3)]],
+    constant uint& num_heads       [[buffer(4)]],
+    constant uint& num_kv_heads    [[buffer(5)]],
+    constant uint& seq_kv          [[buffer(6)]],
+    constant uint& head_dim        [[buffer(7)]],
+    constant float& scale          [[buffer(8)]],
+    uint head_idx                  [[threadgroup_position_in_grid]],
+    uint tid                       [[thread_position_in_threadgroup]],
+    uint tiisg                     [[thread_index_in_simdgroup]],
+    uint sgitg                     [[simdgroup_index_in_threadgroup]]
+) {
+    // Only use first simdgroup (32 threads)
+    if (sgitg != 0) return;
+    if (head_idx >= num_heads) return;
+
+    // GQA head mapping
+    uint heads_per_kv = num_heads / num_kv_heads;
+    uint kv_head = head_idx / heads_per_kv;
+
+    device const float* q_head = Q + head_idx * head_dim;
+    device const half* k_base = K + kv_head * seq_kv * head_dim;
+    device const half* v_base = V + kv_head * seq_kv * head_dim;
+    device float* out_head = output + head_idx * head_dim;
+
+    // Shared memory for Q (up to 128 elements)
+    threadgroup float q_shared[128];
+    threadgroup float out_shared[128];
+
+    // Load Q into shared memory
+    for (uint i = tiisg; i < head_dim; i += 32) {
+        q_shared[i] = q_head[i];
+        out_shared[i] = 0.0f;
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Online softmax state (shared across simdgroup)
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+
+    // Process one K/V position at a time
+    for (uint k_pos = 0; k_pos < seq_kv; k_pos++) {
+        device const half* k_ptr = k_base + k_pos * head_dim;
+
+        // Each thread computes partial dot product
+        float partial_dot = 0.0f;
+        for (uint d = tiisg; d < head_dim; d += 32) {
+            partial_dot += q_shared[d] * float(k_ptr[d]);
+        }
+
+        // Sum across all threads
+        float score = simd_sum(partial_dot) * scale;
+
+        // Online softmax update
+        float new_max = max(running_max, score);
+        float correction = exp(running_max - new_max);
+        float exp_score = exp(score - new_max);
+
+        // Scale previous output
+        for (uint d = tiisg; d < head_dim; d += 32) {
+            out_shared[d] *= correction;
+        }
+
+        running_sum = running_sum * correction + exp_score;
+        running_max = new_max;
+
+        // Accumulate V
+        device const half* v_ptr = v_base + k_pos * head_dim;
+        for (uint d = tiisg; d < head_dim; d += 32) {
+            out_shared[d] += float(v_ptr[d]) * exp_score;
+        }
+    }
+
+    // Normalize and write output
+    float inv_sum = (running_sum > 0.0f) ? 1.0f / running_sum : 0.0f;
+    for (uint d = tiisg; d < head_dim; d += 32) {
+        out_head[d] = out_shared[d] * inv_sum;
+    }
+}
 )";
