@@ -373,6 +373,12 @@ int main(int argc, char* argv[]) {
                 next_token = j;
             }
         }
+
+        // Debug: show what we're getting
+        GRANITE_LOG_INFO("Step {}: seq_len={}, next_token={}, max_logit={:.2f}, first5_logits=[{:.2f},{:.2f},{:.2f},{:.2f},{:.2f}]",
+            i, seq_len, next_token, max_logit,
+            last_logits[0], last_logits[1], last_logits[2], last_logits[3], last_logits[4]);
+
         backend->unmap_buffer(logits.buffer());
 
         // Check for EOS

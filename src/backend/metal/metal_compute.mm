@@ -292,6 +292,49 @@ public:
         return {};
     }
 
+    // Simdgroup matrix matmul dispatch for prefill
+    // Uses simdgroup_half8x8 matrices and simdgroup_multiply_accumulate
+    // Tile sizes: 64 rows x 32 cols per threadgroup, 4 simdgroups
+    // Requires 8KB threadgroup memory (4KB for weights, 2KB for activations)
+    Result<void> dispatch_matmul_simdgroup(
+        const char* kernel_name,
+        MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
+        uint32_t M, uint32_t K, uint32_t N)
+    {
+        auto* encoder = get_encoder();
+        auto* pipeline = get_pipeline(kernel_name);
+        if (!pipeline) {
+            return Error(ErrorCode::InternalError, std::string(kernel_name) + " pipeline not found");
+        }
+
+        encoder->setComputePipelineState(pipeline);
+        encoder->setBuffer(X, 0, 0);
+        encoder->setBuffer(W, 0, 1);
+        encoder->setBuffer(Y, 0, 2);
+        encoder->setBytes(&M, sizeof(M), 3);
+        encoder->setBytes(&K, sizeof(K), 4);
+        encoder->setBytes(&N, sizeof(N), 5);
+
+        // Set threadgroup memory for simdgroup operations
+        constexpr size_t shmem_size = 8192;  // 8KB: 4KB for weights + 2KB for activations
+        encoder->setThreadgroupMemoryLength(shmem_size, 0);
+
+        // Tile sizes: 64 rows x 32 cols per threadgroup
+        constexpr uint32_t NR0 = 64;  // Output rows per threadgroup
+        constexpr uint32_t NR1 = 32;  // Output cols per threadgroup
+
+        // Grid of threadgroups
+        uint32_t num_tg_rows = (M + NR0 - 1) / NR0;
+        uint32_t num_tg_cols = (N + NR1 - 1) / NR1;
+        MTL::Size grid_size = MTL::Size::Make(num_tg_cols, num_tg_rows, 1);
+
+        // 128 threads per threadgroup (4 simdgroups of 32 threads)
+        MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
+        encoder->dispatchThreadgroups(grid_size, threadgroup_size);
+
+        return {};
+    }
+
     // Fused RMSNorm + matvec dispatch
     // Uses 8 rows per threadgroup with 256 threads
     Result<void> dispatch_rms_norm_matvec(
@@ -374,6 +417,7 @@ private:
         std::vector<std::string> kernels = {
             // Core quantized kernels
             "matvec_q4k", "matmul_q4k", "matmul_q4k_vec", "matmul_q4k_tiled", "matmul_q4k_simd",
+            "matmul_q4k_simdgroup",  // simdgroup_half8x8 optimized matmul
             "matvec_f16", "matvec_f32",
             "matvec_q8_0", "matmul_q8_0",
             "matvec_q4_0", "matmul_q4_0",
@@ -496,14 +540,26 @@ Result<void> MetalCompute::matmul_q4k(
     MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
     uint32_t M, uint32_t K, uint32_t N)
 {
-    // Use SIMD kernel for larger batches (M >= 32), tiled for medium, scalar/vec for small
+    // TODO: simdgroup matrix kernel for very large batches (M >= 256)
+    // Uses simdgroup_half8x8 matrices and simdgroup_multiply_accumulate
+    // for maximum throughput. Currently disabled - needs algorithm verification.
+    // if (M >= 256) {
+    //     return impl_->dispatch_matmul_simdgroup("matmul_q4k_simdgroup", X, W, Y, M, K, N);
+    // }
+
+    // Use SIMD K-parallel kernel for larger batches (M >= 32)
     if (M >= 32) {
         return impl_->dispatch_matmul_simd("matmul_q4k_simd", X, W, Y, M, K, N);
-    } else if (M > 2) {
+    }
+    // Use tiled kernel for medium batches
+    if (M > 2) {
         return impl_->dispatch_matmul_tiled("matmul_q4k_tiled", X, W, Y, M, K, N);
-    } else if (M > 1) {
+    }
+    // Use vectorized kernel for M=2
+    if (M > 1) {
         return impl_->dispatch_matmul("matmul_q4k_vec", X, W, Y, M, K, N);
     }
+    // Scalar kernel for M=1
     return impl_->dispatch_matmul("matmul_q4k", X, W, Y, M, K, N);
 }
 
@@ -1163,20 +1219,22 @@ std::pair<MTL::Buffer*, MTL::Buffer*> MetalCompute::create_kv_cache(
     uint32_t num_kv_heads, uint32_t max_seq_len, uint32_t head_dim)
 {
     // FP16 storage for KV cache
+    // Use shared memory so CPU can sync data during prefill->decode transition
     size_t size = num_kv_heads * max_seq_len * head_dim * sizeof(uint16_t);
     return {
-        impl_->create_buffer(size, false),  // K cache (private memory)
-        impl_->create_buffer(size, false)   // V cache (private memory)
+        impl_->create_buffer(size, true),  // K cache (shared memory for CPU sync)
+        impl_->create_buffer(size, true)   // V cache (shared memory for CPU sync)
     };
 }
 
 std::pair<MTL::Buffer*, MTL::Buffer*> MetalCompute::create_kv_cache_f32(
     uint32_t num_kv_heads, uint32_t max_seq_len, uint32_t head_dim)
 {
+    // Use shared memory so CPU can sync data
     size_t size = num_kv_heads * max_seq_len * head_dim * sizeof(float);
     return {
-        impl_->create_buffer(size, false),
-        impl_->create_buffer(size, false)
+        impl_->create_buffer(size, true),  // K cache (shared memory)
+        impl_->create_buffer(size, true)   // V cache (shared memory)
     };
 }
 
@@ -1195,25 +1253,32 @@ Result<void> MetalCompute::kv_cache_append(
         }
     }
 
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(cache_k, 0, 0);
-    encoder->setBuffer(cache_v, 0, 1);
-    encoder->setBuffer(new_k, 0, 2);
-    encoder->setBuffer(new_v, 0, 3);
-    encoder->setBytes(&num_kv_heads, sizeof(num_kv_heads), 4);
-    encoder->setBytes(&head_dim, sizeof(head_dim), 5);
-    encoder->setBytes(&current_len, sizeof(current_len), 6);
-    encoder->setBytes(&new_len, sizeof(new_len), 7);
-    encoder->setBytes(&max_seq_len, sizeof(max_seq_len), 8);
-
     // Grid: [head_dim, new_len, num_kv_heads]
     MTL::Size grid_size = MTL::Size::Make(head_dim, new_len, num_kv_heads);
     MTL::Size threadgroup_size = MTL::Size::Make(32, 1, 1);
+
+    // Append K to cache_k
+    // Kernel signature: new_kv (FP32) at buffer(0), cache (FP16) at buffer(1)
+    encoder->setComputePipelineState(pipeline);
+    encoder->setBuffer(new_k, 0, 0);     // Source: new K (FP32)
+    encoder->setBuffer(cache_k, 0, 1);   // Dest: K cache (FP16)
+    encoder->setBytes(&num_kv_heads, sizeof(num_kv_heads), 2);
+    encoder->setBytes(&head_dim, sizeof(head_dim), 3);
+    encoder->setBytes(&current_len, sizeof(current_len), 4);
+    encoder->setBytes(&new_len, sizeof(new_len), 5);
+    encoder->setBytes(&max_seq_len, sizeof(max_seq_len), 6);
     encoder->dispatchThreads(grid_size, threadgroup_size);
 
-    // Also sync to ensure writes complete
-    MTL::Size grid_size2 = MTL::Size::Make(head_dim, new_len, num_kv_heads);
-    encoder->dispatchThreads(grid_size2, threadgroup_size);
+    // Append V to cache_v
+    encoder->setComputePipelineState(pipeline);
+    encoder->setBuffer(new_v, 0, 0);     // Source: new V (FP32)
+    encoder->setBuffer(cache_v, 0, 1);   // Dest: V cache (FP16)
+    encoder->setBytes(&num_kv_heads, sizeof(num_kv_heads), 2);
+    encoder->setBytes(&head_dim, sizeof(head_dim), 3);
+    encoder->setBytes(&current_len, sizeof(current_len), 4);
+    encoder->setBytes(&new_len, sizeof(new_len), 5);
+    encoder->setBytes(&max_seq_len, sizeof(max_seq_len), 6);
+    encoder->dispatchThreads(grid_size, threadgroup_size);
 
     return {};
 }
@@ -1352,9 +1417,10 @@ Result<void> MetalCompute::embedding_lookup(
     encoder->setBuffer(token_ids, 0, 0);
     encoder->setBuffer(embeddings, 0, 1);
     encoder->setBuffer(output, 0, 2);
-    encoder->setBytes(&num_tokens, sizeof(num_tokens), 3);
-    encoder->setBytes(&hidden_dim, sizeof(hidden_dim), 4);
-    encoder->setBytes(&vocab_size, sizeof(vocab_size), 5);
+    // Note: kernel uses buffer(3)=hidden_dim, buffer(4)=vocab_size
+    // num_tokens is encoded in grid size, not as a parameter
+    encoder->setBytes(&hidden_dim, sizeof(hidden_dim), 3);
+    encoder->setBytes(&vocab_size, sizeof(vocab_size), 4);
 
     MTL::Size grid_size = MTL::Size::Make(hidden_dim, num_tokens, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
