@@ -374,6 +374,7 @@ private:
             "fused_qkv_matvec_q4k",
             // Flash attention
             "flash_attention_decode",
+            "flash_attention_v2_f16kv", "flash_attention_v2_simd_f16kv",
             // Prefill attention
             "attention_prefill", "attention_prefill_f16kv",
             // Tree attention (speculative decoding)
@@ -1197,16 +1198,38 @@ Result<void> MetalCompute::multihead_attention(
     // - seq_q == 1: decode kernel (single query, FP16 KV cache)
     // - seq_q > 1: prefill kernel (batched queries)
     if (seq_q == 1) {
-        // Decode path: use legacy kernel (new kernels need debugging)
-        // Kernel signature: Q, K, V, output, num_heads, num_kv_heads, seq_kv, head_dim, scale
-        const char* kernel_name = "multihead_attention_decode_f16kv";
-        auto* pipeline = impl_->get_pipeline(kernel_name);
+        // Decode path: try flash attention v2 first (optimized), fall back to legacy
+        // Set USE_FLASH_ATTENTION_V2 to 1 to enable new kernel, 0 for legacy
+        #define USE_FLASH_ATTENTION_V2 1
+
+        const char* kernel_name = nullptr;
+        MTL::ComputePipelineState* pipeline = nullptr;
+
+        #if USE_FLASH_ATTENTION_V2
+        // Try new flash attention v2 kernel first
+        kernel_name = "flash_attention_v2_f16kv";
+        pipeline = impl_->get_pipeline(kernel_name);
+        #endif
+
+        if (!pipeline) {
+            // Fall back to legacy kernel
+            kernel_name = "multihead_attention_decode_f16kv";
+            pipeline = impl_->get_pipeline(kernel_name);
+        }
+
         if (!pipeline) {
             kernel_name = "multihead_attention_decode";
             pipeline = impl_->get_pipeline(kernel_name);
             if (!pipeline) {
                 return Error(ErrorCode::InternalError, "multihead_attention_decode kernel not found");
             }
+        }
+
+        // Debug: log which kernel was selected (only log once)
+        static bool logged_kernel = false;
+        if (!logged_kernel) {
+            GRANITE_LOG_INFO("Attention kernel selected: {}", kernel_name);
+            logged_kernel = true;
         }
 
         encoder->setComputePipelineState(pipeline);
