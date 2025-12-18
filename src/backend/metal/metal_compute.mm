@@ -1197,7 +1197,7 @@ Result<void> MetalCompute::multihead_attention(
     // - seq_q == 1: decode kernel (single query, FP16 KV cache)
     // - seq_q > 1: prefill kernel (batched queries)
     if (seq_q == 1) {
-        // Decode path: multihead_attention_decode_f16kv
+        // Decode path: use legacy kernel (new kernels need debugging)
         // Kernel signature: Q, K, V, output, num_heads, num_kv_heads, seq_kv, head_dim, scale
         const char* kernel_name = "multihead_attention_decode_f16kv";
         auto* pipeline = impl_->get_pipeline(kernel_name);
@@ -1256,6 +1256,72 @@ Result<void> MetalCompute::multihead_attention(
         MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
         encoder->dispatchThreadgroups(grid_size, threadgroup_size);
     }
+
+    return {};
+}
+
+// -----------------------------------------------------------------------------
+// Multi-Threadgroup Flash Attention (High-Performance)
+// -----------------------------------------------------------------------------
+
+Result<void> MetalCompute::multihead_attention_fast(
+    MTL::Buffer* Q, MTL::Buffer* K, MTL::Buffer* V, MTL::Buffer* output,
+    MTL::Buffer* temp_partial_out, MTL::Buffer* temp_partial_max, MTL::Buffer* temp_partial_sum,
+    uint32_t num_heads, uint32_t num_kv_heads,
+    uint32_t seq_kv, uint32_t head_dim, float scale)
+{
+    auto* encoder = impl_->get_encoder();
+
+    // Constants for chunking
+    constexpr uint32_t CHUNK_SIZE = 256;
+    uint32_t num_chunks = (seq_kv + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+    // Phase 1: Compute partial attention for each chunk
+    auto* partial_pipeline = impl_->get_pipeline("flash_attention_decode_partial");
+    if (!partial_pipeline) {
+        // Fallback to old kernel if new one not available
+        return multihead_attention(Q, K, V, output, num_heads, num_kv_heads, 1, seq_kv, head_dim, scale);
+    }
+
+    encoder->setComputePipelineState(partial_pipeline);
+    encoder->setBuffer(Q, 0, 0);
+    encoder->setBuffer(K, 0, 1);
+    encoder->setBuffer(V, 0, 2);
+    encoder->setBuffer(temp_partial_out, 0, 3);
+    encoder->setBuffer(temp_partial_max, 0, 4);
+    encoder->setBuffer(temp_partial_sum, 0, 5);
+    encoder->setBytes(&num_heads, sizeof(num_heads), 6);
+    encoder->setBytes(&num_kv_heads, sizeof(num_kv_heads), 7);
+    encoder->setBytes(&seq_kv, sizeof(seq_kv), 8);
+    encoder->setBytes(&head_dim, sizeof(head_dim), 9);
+    encoder->setBytes(&num_chunks, sizeof(num_chunks), 10);
+    encoder->setBytes(&scale, sizeof(scale), 11);
+
+    // Grid: [num_heads * num_chunks] - flattened for consistent scalar types
+    uint32_t total_threadgroups = num_heads * num_chunks;
+    MTL::Size grid_size = MTL::Size::Make(total_threadgroups, 1, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
+
+    // Phase 2: Reduce partial results
+    auto* reduce_pipeline = impl_->get_pipeline("flash_attention_decode_reduce");
+    if (!reduce_pipeline) {
+        return Error(ErrorCode::InternalError, "flash_attention_decode_reduce kernel not found");
+    }
+
+    encoder->setComputePipelineState(reduce_pipeline);
+    encoder->setBuffer(temp_partial_out, 0, 0);
+    encoder->setBuffer(temp_partial_max, 0, 1);
+    encoder->setBuffer(temp_partial_sum, 0, 2);
+    encoder->setBuffer(output, 0, 3);
+    encoder->setBytes(&num_heads, sizeof(num_heads), 4);
+    encoder->setBytes(&num_chunks, sizeof(num_chunks), 5);
+    encoder->setBytes(&head_dim, sizeof(head_dim), 6);
+
+    // One threadgroup per head for reduction
+    MTL::Size reduce_grid = MTL::Size::Make(num_heads, 1, 1);
+    MTL::Size reduce_tg = MTL::Size::Make(256, 1, 1);
+    encoder->dispatchThreadgroups(reduce_grid, reduce_tg);
 
     return {};
 }
