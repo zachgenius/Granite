@@ -261,6 +261,10 @@ target_link_libraries(granite_tree_bench PRIVATE granite)
 add_executable(granite_bench_vs_llamacpp tools/benchmark_vs_llamacpp.cpp)
 target_link_libraries(granite_bench_vs_llamacpp PRIVATE granite)
 
+add_executable(granite_matvec_bench tools/benchmark_matvec.mm)
+set_source_files_properties(tools/benchmark_matvec.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+target_link_libraries(granite_matvec_bench PRIVATE granite metal-cpp "-framework Metal" "-framework Foundation")
+
 # =============================================================================
 # Installation
 # =============================================================================

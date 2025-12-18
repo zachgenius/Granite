@@ -38,6 +38,11 @@ public:
     // Get Metal device
     MTL::Device* device() const;
 
+    // Profiling API
+    void enable_profiling(bool enable);
+    void reset_profiling_stats();
+    void get_profiling_stats(uint64_t& dispatches, uint64_t& syncs, double& sync_time_ms, uint64_t& cmd_buffers) const;
+
     // =============================================================================
     // LLM Operations - Quantized Matrix Multiply
     // =============================================================================

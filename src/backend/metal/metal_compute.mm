@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 #include <mutex>
+#include <chrono>
 
 namespace granite {
 
@@ -38,6 +39,16 @@ namespace granite {
 
 class MetalCompute::Impl {
 public:
+    // Profiling stats
+    struct ProfilingStats {
+        uint64_t dispatch_count = 0;
+        uint64_t sync_count = 0;
+        double sync_time_ms = 0.0;
+        uint64_t command_buffer_count = 0;
+    };
+    ProfilingStats stats_;
+    bool profiling_enabled_ = false;
+
     Impl() = default;
     ~Impl() { shutdown(); }
 
@@ -88,8 +99,17 @@ public:
                 current_encoder_->endEncoding();
                 current_encoder_ = nullptr;
             }
+
+            auto start = std::chrono::high_resolution_clock::now();
             current_command_buffer_->commit();
             current_command_buffer_->waitUntilCompleted();
+            auto end = std::chrono::high_resolution_clock::now();
+
+            if (profiling_enabled_) {
+                stats_.sync_count++;
+                stats_.sync_time_ms += std::chrono::duration<double, std::milli>(end - start).count();
+            }
+
             current_command_buffer_->release();
             current_command_buffer_ = nullptr;
         }
@@ -113,9 +133,26 @@ public:
         if (!current_encoder_) {
             current_command_buffer_ = command_queue_->commandBuffer();
             current_encoder_ = current_command_buffer_->computeCommandEncoder();
+            if (profiling_enabled_) {
+                stats_.command_buffer_count++;
+            }
+        }
+        if (profiling_enabled_) {
+            stats_.dispatch_count++;
         }
         return current_encoder_;
     }
+
+    void enable_profiling(bool enable) {
+        profiling_enabled_ = enable;
+        if (enable) {
+            stats_ = ProfilingStats{};  // Reset stats
+        }
+    }
+
+    ProfilingStats get_stats() const { return stats_; }
+
+    void reset_stats() { stats_ = ProfilingStats{}; }
 
     MTL::ComputePipelineState* get_pipeline(const std::string& name) {
         auto it = pipelines_.find(name);
@@ -134,7 +171,7 @@ public:
     // -------------------------------------------------------------------------
 
     // Standard matvec dispatch: y = x @ W^T
-    // Uses 8 SIMD groups with configurable rows_per_simd (typically 2)
+    // Uses 2 SIMD groups (64 threads) matching llama.cpp for better occupancy
     Result<void> dispatch_matvec(
         const char* kernel_name,
         MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* y,
@@ -154,8 +191,9 @@ public:
         encoder->setBytes(&K, sizeof(K), 3);
         encoder->setBytes(&N, sizeof(N), 4);
 
-        // 8 SIMD groups per threadgroup (256 threads)
-        constexpr uint32_t simd_groups = 8;
+        // 2 SIMD groups per threadgroup (64 threads) - matches llama.cpp
+        // Smaller threadgroups = better occupancy and more parallelism
+        constexpr uint32_t simd_groups = 2;
         uint32_t rows_per_tg = simd_groups * rows_per_simd;
         uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
         MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
@@ -395,6 +433,17 @@ void MetalCompute::sync() { impl_->sync(); }
 void MetalCompute::commit() { impl_->commit(); }
 bool MetalCompute::is_initialized() const { return impl_->is_initialized(); }
 MTL::Device* MetalCompute::device() const { return impl_->device(); }
+
+// Profiling API
+void MetalCompute::enable_profiling(bool enable) { impl_->enable_profiling(enable); }
+void MetalCompute::reset_profiling_stats() { impl_->reset_stats(); }
+void MetalCompute::get_profiling_stats(uint64_t& dispatches, uint64_t& syncs, double& sync_time_ms, uint64_t& cmd_buffers) const {
+    auto stats = impl_->get_stats();
+    dispatches = stats.dispatch_count;
+    syncs = stats.sync_count;
+    sync_time_ms = stats.sync_time_ms;
+    cmd_buffers = stats.command_buffer_count;
+}
 
 MTL::Buffer* MetalCompute::create_buffer(size_t size, bool shared) {
     return impl_->create_buffer(size, shared);

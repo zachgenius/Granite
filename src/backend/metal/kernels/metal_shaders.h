@@ -88,7 +88,8 @@ inline void get_scale_min_k4(int j, const device uint8_t* q, thread uint8_t& sc,
 }
 
 // Original matvec for Q4_K - kept for fallback
-constant constexpr uint ROWS_PER_TG = 8;
+// ROWS_PER_TG = number of SIMD groups per threadgroup (2 for Q4_K, matching llama.cpp)
+constant constexpr uint ROWS_PER_TG = 2;
 
 kernel void matvec_q4k_basic(
     device const float* x          [[buffer(0)]],
