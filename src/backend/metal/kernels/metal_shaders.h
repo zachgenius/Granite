@@ -140,17 +140,30 @@ struct block_q8_0 {
     int8_t qs[32];    // quantized values (-128 to 127)
 };
 
+// -----------------------------------------------------------------------------
 // Q4_0: 32 elements per block, 18 bytes
-// Legacy format: FP16 scale + 16 bytes (4-bit quants, 2 per byte)
-// Dequantization: w = d * (q - 8) where q is 0-15
+// -----------------------------------------------------------------------------
+// Legacy 4-bit format with simple symmetric quantization.
+// Dequantization: w = d * (q - 8), where q is 4-bit unsigned (0-15)
+// Less accurate than Q4_K but simpler and compatible with older models.
+// -----------------------------------------------------------------------------
 struct block_q4_0 {
-    half d;           // scale
-    uint8_t qs[16];   // 4-bit quants (2 per byte)
+    half d;           // scale factor
+    uint8_t qs[16];   // 4-bit quants packed 2 per byte (low nibble first)
 };
 
+// -----------------------------------------------------------------------------
 // Q6_K: 256 elements per super-block, 210 bytes
-// 6-bit quantization with 8-bit sub-block scales
+// -----------------------------------------------------------------------------
+// 6-bit quantization with 8-bit per-16-element scales.
 // Layout: ql[128] + qh[64] + scales[16] + d[2]
+//
+// Each 6-bit value is split: 4 low bits in ql, 2 high bits in qh.
+// Dequantization: w = d * scale[i/16] * ((ql_part | (qh_part << 4)) - 32)
+//
+// Higher precision than Q4_K, useful when quality is critical.
+// ~6.6 bits per weight effective.
+// -----------------------------------------------------------------------------
 struct block_q6_K {
     uint8_t ql[128];    // lower 4 bits of 6-bit quants (2 per byte)
     uint8_t qh[64];     // upper 2 bits of 6-bit quants (4 per byte)
@@ -158,32 +171,54 @@ struct block_q6_K {
     half d;             // super-block scale
 };
 
+// -----------------------------------------------------------------------------
 // Q5_K: 256 elements per super-block, 176 bytes
-// 5-bit quantization with 6-bit sub-block scales/mins
+// -----------------------------------------------------------------------------
+// 5-bit quantization with 6-bit sub-block scales/mins.
 // Layout: d[2] + dmin[2] + scales[12] + qh[32] + qs[128]
+//
+// Each 5-bit value is split: 4 low bits in qs, 1 high bit in qh.
+// Dequantization: w = d * scale * ((q_low | (q_high << 4))) - dmin * min
+//
+// Good balance between quality and compression (~5.5 bits per weight).
+// -----------------------------------------------------------------------------
 struct block_q5_K {
     half d;             // super-block scale for quantized scales
     half dmin;          // super-block scale for quantized mins
-    uint8_t scales[12]; // scales and mins, quantized with 6 bits
+    uint8_t scales[12]; // 6-bit scales and mins (packed)
     uint8_t qh[32];     // high bit of quants (1 bit per element)
     uint8_t qs[128];    // low 4 bits of quants (2 per byte)
 };
 
+// -----------------------------------------------------------------------------
 // Q3_K: 256 elements per super-block, 110 bytes
-// 3-bit quantization with 6-bit sub-block scales
+// -----------------------------------------------------------------------------
+// 3-bit quantization for aggressive compression (~3.4 bits per weight).
 // Layout: hmask[32] + qs[64] + scales[12] + d[2]
-// Each weight = 2 low bits from qs + 1 high bit from hmask
+//
+// Each weight = 2 low bits from qs + 1 high bit from hmask.
+// Uses 6-bit scales like Q4_K/Q5_K.
+//
+// Noticeable quality loss vs Q4_K but 25% smaller.
+// -----------------------------------------------------------------------------
 struct block_q3_K {
-    uint8_t hmask[32];  // high bit of 3-bit quants (1 bit per element)
+    uint8_t hmask[32];  // high bit of 3-bit quants (1 per element, bit-packed)
     uint8_t qs[64];     // low 2 bits of 3-bit quants (4 per byte)
-    uint8_t scales[12]; // scales, quantized with 6 bits
+    uint8_t scales[12]; // 6-bit scales (packed)
     half d;             // super-block scale
 };
 
+// -----------------------------------------------------------------------------
 // Q2_K: 256 elements per super-block, 84 bytes
-// 2-bit quantization with 4-bit sub-block scales/mins
+// -----------------------------------------------------------------------------
+// 2-bit quantization for maximum compression (~2.6 bits per weight).
 // Layout: scales[16] + qs[64] + d[2] + dmin[2]
+//
 // Dequantization: w = d * (scale & 0xF) * q2 - dmin * (scale >> 4)
+// Uses 4-bit scales and mins packed together.
+//
+// Significant quality loss - use only when model size is critical.
+// -----------------------------------------------------------------------------
 struct block_q2_K {
     uint8_t scales[16]; // 4-bit scales (low nibble) and mins (high nibble)
     uint8_t qs[64];     // 2-bit quants (4 per byte)
@@ -293,19 +328,51 @@ kernel void matvec_q4k_basic(
 }
 
 // =============================================================================
-// Optimized matvec for Q4_K - llama.cpp style
+// OPTIMIZED MATVEC FOR Q4_K (llama.cpp style)
 // =============================================================================
-// Key optimizations (from llama.cpp):
-// 1. Process 2 rows per SIMD group (nr0 = 2)
-// 2. Register-based input caching (no shared memory, no barriers)
-// 3. Strided block access (4 threads per block)
-// 4. uint16_t reading for better memory bandwidth
-// 5. Smart accumulation using 1/256 multiplier
+//
+// This is the primary decode kernel for Q4_K quantized models. It implements
+// y = x @ W^T where W is Q4_K quantized [N, K] and x is FP32 [K].
+//
+// THREAD INDEXING (32 threads per SIMD group):
+// -----------------------------------------------------------------------------
+//   tiisg = 0..31   (thread index in SIMD group)
+//   ix = tiisg / 8  (0..3) - which quarter of the 256-element super-block
+//   it = tiisg % 8  (0..7) - position within quarter
+//   iq = it / 4     (0..1) - which half of 64-element sub-block
+//   ir = it % 4     (0..3) - position within 16-element chunk
+//
+// MEMORY ACCESS PATTERN:
+// -----------------------------------------------------------------------------
+//   - Each SIMD group processes 2 output rows (NR0_Q4K = 2)
+//   - 4 threads cooperate on each Q4_K super-block (stride of 4)
+//   - Input values are cached in registers (32 floats per thread)
+//   - Weights are read as uint16 for better memory bandwidth
+//   - No threadgroup memory or barriers (register-only computation)
+//
+// PERFORMANCE CHARACTERISTICS:
+// -----------------------------------------------------------------------------
+//   - Memory bound: ~144 bytes weight + 1024 bytes input per 256 MACs
+//   - Arithmetic intensity: ~0.22 FLOP/byte (very low)
+//   - Target efficiency: >50% of theoretical bandwidth
+//   - Threadgroup: 64 threads (2 SIMD groups) for better occupancy
+//
+// SCALE EXTRACTION:
+// -----------------------------------------------------------------------------
+//   The Q4_K scales are packed in a complex 6-bit format. We use bitmasks
+//   to extract them efficiently:
+//   - kmask1 (0x3f3f): Extract low 6 bits from each byte
+//   - kmask2 (0x0f0f): Extract low 4 bits from each byte
+//   - kmask3 (0xc0c0): Extract high 2 bits from each byte
+//
+// =============================================================================
 
 constant constexpr short NR0_Q4K = 2;  // Rows per SIMD group
-constant constexpr ushort kmask1 = 0x3f3f;
-constant constexpr ushort kmask2 = 0x0f0f;
-constant constexpr ushort kmask3 = 0xc0c0;
+
+// Bitmasks for extracting 6-bit scales from packed format
+constant constexpr ushort kmask1 = 0x3f3f;  // Low 6 bits of each byte
+constant constexpr ushort kmask2 = 0x0f0f;  // Low 4 bits of each byte
+constant constexpr ushort kmask3 = 0xc0c0;  // High 2 bits of each byte
 
 kernel void matvec_q4k(
     device const float* x          [[buffer(0)]],
@@ -4741,8 +4808,57 @@ kernel void flash_attention_decode_simd(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-// FP16 KV cache version - reads K/V from half precision
-// Q stays FP32 (output of Q4_K projection), K/V are FP16
+// =============================================================================
+// MULTI-HEAD ATTENTION DECODE (FP16 KV Cache)
+// =============================================================================
+//
+// Primary attention kernel for single-token decode with FP16 KV cache.
+// Computes: output = softmax(Q @ K^T / sqrt(head_dim)) @ V
+//
+// INPUT TENSORS:
+// -----------------------------------------------------------------------------
+//   Q:      [num_heads, head_dim] - FP32 query (from Q4_K projection)
+//   K:      [num_kv_heads, seq_kv, head_dim] - FP16 key cache
+//   V:      [num_kv_heads, seq_kv, head_dim] - FP16 value cache
+//   output: [num_heads, head_dim] - FP32 output
+//
+// GROUPED QUERY ATTENTION (GQA):
+// -----------------------------------------------------------------------------
+//   Supports GQA where num_heads > num_kv_heads.
+//   heads_per_kv = num_heads / num_kv_heads
+//   Multiple Q heads share the same K/V head.
+//
+// THREAD INDEXING:
+// -----------------------------------------------------------------------------
+//   - One threadgroup per attention head (grid: num_heads)
+//   - 128 threads per threadgroup (4 SIMD groups)
+//   - Each thread processes seq_kv/128 KV positions in step 1
+//   - SIMD reductions for max and sum
+//
+// ALGORITHM (3 STEPS):
+// -----------------------------------------------------------------------------
+//   Step 1: Q @ K^T - compute attention scores
+//     - Each thread computes dot products for strided K positions
+//     - Track local max for numerical stability
+//     - Store scores in threadgroup memory (FP16)
+//
+//   Step 2: Softmax
+//     - SIMD reduction for global max across threadgroup
+//     - Compute exp(score - max) and sum
+//     - SIMD reduction for sum, normalize
+//
+//   Step 3: scores @ V - compute output
+//     - Each SIMD group handles portion of head_dim
+//     - Accumulate weighted V vectors
+//
+// PERFORMANCE NOTES:
+// -----------------------------------------------------------------------------
+//   - Limited to seq_kv <= 4096 (threadgroup memory constraint)
+//   - FP16 KV reduces memory bandwidth by 2x vs FP32
+//   - Score computation is memory-bound (reading all K vectors)
+//   - V accumulation has better arithmetic intensity
+//
+// =============================================================================
 kernel void multihead_attention_decode_f16kv(
     device const float* Q          [[buffer(0)]],
     device const half* K           [[buffer(1)]],

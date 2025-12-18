@@ -265,6 +265,10 @@ add_executable(granite_matvec_bench tools/benchmark_matvec.mm)
 set_source_files_properties(tools/benchmark_matvec.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 target_link_libraries(granite_matvec_bench PRIVATE granite metal-cpp "-framework Metal" "-framework Foundation")
 
+add_executable(granite_attention_bench tools/benchmark_attention.mm)
+set_source_files_properties(tools/benchmark_attention.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+target_link_libraries(granite_attention_bench PRIVATE granite metal-cpp "-framework Metal" "-framework Foundation")
+
 # =============================================================================
 # Installation
 # =============================================================================
