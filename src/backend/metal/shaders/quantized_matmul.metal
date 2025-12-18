@@ -294,6 +294,242 @@ kernel void matvec_q4k_simd(
 }
 
 // =============================================================================
+// SIMD-Optimized Q4_K Matrix Multiplication (Prefill)
+// =============================================================================
+// Uses simdgroup operations for cooperative tiled computation
+// Each simdgroup computes a 4x4 output tile cooperatively
+// Much more efficient than scalar per-element computation
+//
+// Computes: Y = X @ W^T where W is Q4_K quantized
+// X: [M, K] float
+// W: [N, K] Q4_K quantized
+// Y: [M, N] float
+
+// Tile configuration for SIMD matmul
+constant constexpr uint SIMD_TILE_M = 4;   // Output rows per simdgroup
+constant constexpr uint SIMD_TILE_N = 4;   // Output cols per simdgroup
+constant constexpr uint SIMD_SIZE = 32;    // Threads per simdgroup
+
+kernel void matmul_q4k_simd(
+    device const float* X          [[buffer(0)]],  // Input [M, K]
+    device const void* W           [[buffer(1)]],  // Weights [N, K/QK_K] Q4_K blocks
+    device float* Y                [[buffer(2)]],  // Output [M, N]
+    constant uint& M               [[buffer(3)]],  // Batch size (num tokens)
+    constant uint& K               [[buffer(4)]],  // Input dimension
+    constant uint& N               [[buffer(5)]],  // Output dimension
+    uint2 tgid                     [[threadgroup_position_in_grid]],
+    uint simd_lane                 [[thread_index_in_simdgroup]],
+    uint simd_gid                  [[simdgroup_index_in_threadgroup]]
+) {
+    // Each threadgroup handles SIMD_TILE_M x (SIMD_TILE_N * num_simdgroups) output tile
+    // Each simdgroup handles SIMD_TILE_M x SIMD_TILE_N output tile
+    const uint num_blocks_k = K / QK_K;
+    const device block_q4_K* weights = (const device block_q4_K*)W;
+
+    // Tile position in output matrix
+    // tgid.y = row tile index, tgid.x = col tile index
+    uint tile_row = tgid.y * SIMD_TILE_M;
+    uint tile_col = (tgid.x * 8 + simd_gid) * SIMD_TILE_N;  // 8 simdgroups per TG
+
+    // Early exit if out of bounds
+    if (tile_row >= M || tile_col >= N) return;
+
+    // Each thread in simdgroup accumulates partial results for its assigned (row, col) pairs
+    // Lane assignment: lane 0-3 handle row 0, lane 4-7 handle row 1, etc.
+    // Within each group of 4 lanes, each lane handles one column
+    uint local_row = simd_lane / 8;           // 0-3 (which row within tile)
+    uint local_col = simd_lane % 4;           // 0-3 (which col within tile)
+    uint local_k_offset = (simd_lane / 4) % 2; // For K-dimension parallelism
+
+    // Actual output position
+    uint out_row = tile_row + local_row;
+    uint out_col = tile_col + local_col;
+
+    // Skip if this thread's output is out of bounds
+    bool valid = (out_row < M) && (out_col < N);
+
+    float sum = 0.0f;
+
+    if (valid) {
+        // Process all K blocks for this (row, col) pair
+        // Each pair of lanes processes alternating blocks for better parallelism
+        for (uint kb = local_k_offset; kb < num_blocks_k; kb += 2) {
+            const device block_q4_K* block = &weights[out_col * num_blocks_k + kb];
+
+            float d = float(block->d);
+            float dmin = float(block->dmin);
+            const device uint8_t* scales = block->scales;
+            const device uint8_t* qs = block->qs;
+
+            uint base_k = kb * QK_K;
+
+            // Process 256 elements in this block
+            int is = 0;
+            for (int j = 0; j < 256; j += 64) {
+                uint8_t sc1, m1, sc2, m2;
+                get_scale_min_k4(is, scales, sc1, m1);
+                get_scale_min_k4(is + 1, scales, sc2, m2);
+
+                float d1 = d * float(sc1);
+                float dm1 = dmin * float(m1);
+                float d2 = d * float(sc2);
+                float dm2 = dmin * float(m2);
+
+                uint x_base = out_row * K + base_k + j;
+
+                // Vectorized accumulation using float4
+                for (int l = 0; l < 32; l += 4) {
+                    float4 x_vec = float4(X[x_base + l], X[x_base + l + 1],
+                                          X[x_base + l + 2], X[x_base + l + 3]);
+                    float4 w_vec = float4(
+                        d1 * float(qs[l] & 0xF) - dm1,
+                        d1 * float(qs[l + 1] & 0xF) - dm1,
+                        d1 * float(qs[l + 2] & 0xF) - dm1,
+                        d1 * float(qs[l + 3] & 0xF) - dm1
+                    );
+                    sum += dot(x_vec, w_vec);
+                }
+
+                for (int l = 0; l < 32; l += 4) {
+                    float4 x_vec = float4(X[x_base + 32 + l], X[x_base + 32 + l + 1],
+                                          X[x_base + 32 + l + 2], X[x_base + 32 + l + 3]);
+                    float4 w_vec = float4(
+                        d2 * float(qs[l] >> 4) - dm2,
+                        d2 * float(qs[l + 1] >> 4) - dm2,
+                        d2 * float(qs[l + 2] >> 4) - dm2,
+                        d2 * float(qs[l + 3] >> 4) - dm2
+                    );
+                    sum += dot(x_vec, w_vec);
+                }
+
+                qs += 32;
+                is += 2;
+            }
+        }
+
+        // Reduce partial sums from lanes processing same (row, col) with different K blocks
+        // Lanes are paired: 0&4, 1&5, 2&6, 3&7 for row 0, etc.
+        float partner_sum = simd_shuffle_xor(sum, 4);
+        sum += partner_sum;
+    }
+
+    // Write output (only lanes 0-3, 8-11, 16-19, 24-27 write)
+    if (valid && (local_k_offset == 0)) {
+        Y[out_row * N + out_col] = sum;
+    }
+}
+
+// =============================================================================
+// Highly Optimized Q4_K Matmul with Cooperative Loading
+// =============================================================================
+// Each SIMD group cooperatively loads input tiles into registers
+// Uses wave-level parallelism for maximum throughput
+
+kernel void matmul_q4k_simd_v2(
+    device const float* X          [[buffer(0)]],  // Input [M, K]
+    device const void* W           [[buffer(1)]],  // Weights [N, K/QK_K] Q4_K blocks
+    device float* Y                [[buffer(2)]],  // Output [M, N]
+    constant uint& M               [[buffer(3)]],  // Batch size (num tokens)
+    constant uint& K               [[buffer(4)]],  // Input dimension
+    constant uint& N               [[buffer(5)]],  // Output dimension
+    uint2 tgid                     [[threadgroup_position_in_grid]],
+    uint2 tid                      [[thread_position_in_threadgroup]],
+    uint simd_lane                 [[thread_index_in_simdgroup]],
+    uint simd_gid                  [[simdgroup_index_in_threadgroup]]
+) {
+    // Configuration: 8 simdgroups per threadgroup
+    // Each simdgroup computes 2 rows x 8 cols of output
+    const uint ROWS_PER_SIMD = 2;
+    const uint COLS_PER_SIMD = 8;
+
+    const uint num_blocks_k = K / QK_K;
+    const device block_q4_K* weights = (const device block_q4_K*)W;
+
+    // This simdgroup's output tile position
+    uint base_row = tgid.y * 16 + (simd_gid / 4) * ROWS_PER_SIMD;  // 2 row groups
+    uint base_col = tgid.x * 32 + (simd_gid % 4) * COLS_PER_SIMD;  // 4 col groups
+
+    // Each lane computes one element
+    uint local_row = simd_lane / 16;     // 0 or 1
+    uint local_col = simd_lane % 8;      // 0-7 (lanes 8-15 also map to cols 0-7)
+    uint k_parallel = (simd_lane / 8) % 2; // For K parallelism within same output
+
+    uint out_row = base_row + local_row;
+    uint out_col = base_col + local_col;
+
+    bool valid = (out_row < M) && (out_col < N);
+
+    float sum = 0.0f;
+
+    if (valid) {
+        // Each pair of threads (lane and lane+8) processes different K blocks
+        for (uint kb = k_parallel; kb < num_blocks_k; kb += 2) {
+            const device block_q4_K* block = &weights[out_col * num_blocks_k + kb];
+
+            float d = float(block->d);
+            float dmin = float(block->dmin);
+            const device uint8_t* scales = block->scales;
+            const device uint8_t* qs = block->qs;
+
+            uint x_row_base = out_row * K + kb * QK_K;
+
+            // Process 256 elements with vectorized loads
+            int is = 0;
+            for (int j = 0; j < 256; j += 64) {
+                uint8_t sc1, m1, sc2, m2;
+                get_scale_min_k4(is, scales, sc1, m1);
+                get_scale_min_k4(is + 1, scales, sc2, m2);
+
+                float d1 = d * float(sc1);
+                float dm1 = dmin * float(m1);
+                float d2 = d * float(sc2);
+                float dm2 = dmin * float(m2);
+
+                // Process low nibble (32 elements) with float4 vectorization
+                #pragma unroll
+                for (int l = 0; l < 32; l += 4) {
+                    uint idx = x_row_base + j + l;
+                    float4 xv = float4(X[idx], X[idx+1], X[idx+2], X[idx+3]);
+                    float4 wv = float4(
+                        d1 * float(qs[l] & 0xF) - dm1,
+                        d1 * float(qs[l+1] & 0xF) - dm1,
+                        d1 * float(qs[l+2] & 0xF) - dm1,
+                        d1 * float(qs[l+3] & 0xF) - dm1
+                    );
+                    sum += dot(xv, wv);
+                }
+
+                // Process high nibble (32 elements)
+                #pragma unroll
+                for (int l = 0; l < 32; l += 4) {
+                    uint idx = x_row_base + j + 32 + l;
+                    float4 xv = float4(X[idx], X[idx+1], X[idx+2], X[idx+3]);
+                    float4 wv = float4(
+                        d2 * float(qs[l] >> 4) - dm2,
+                        d2 * float(qs[l+1] >> 4) - dm2,
+                        d2 * float(qs[l+2] >> 4) - dm2,
+                        d2 * float(qs[l+3] >> 4) - dm2
+                    );
+                    sum += dot(xv, wv);
+                }
+
+                qs += 32;
+                is += 2;
+            }
+        }
+
+        // Reduce across K-parallel lanes (lane XOR 8)
+        float partner = simd_shuffle_xor(sum, 8);
+        sum += partner;
+    }
+
+    // Only first set of lanes write (k_parallel == 0)
+    if (valid && k_parallel == 0) {
+        Y[out_row * N + out_col] = sum;
+    }
+}
+
+// =============================================================================
 // Q8_0 Matrix-Vector Multiplication
 // =============================================================================
 // Q8_0: 32 elements per block, simpler format

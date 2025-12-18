@@ -231,9 +231,9 @@ public:
         return {};
     }
 
-    // SIMD-optimized matmul dispatch for prefill
-    // Uses dispatchThreadgroups with specialized SIMD config
-    Result<void> dispatch_matmul_simd(
+    // Register-tiled matmul dispatch for prefill
+    // Each thread handles 2 rows, so grid Y dimension is halved
+    Result<void> dispatch_matmul_tiled(
         const char* kernel_name,
         MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
         uint32_t M, uint32_t K, uint32_t N)
@@ -252,13 +252,11 @@ public:
         encoder->setBytes(&K, sizeof(K), 4);
         encoder->setBytes(&N, sizeof(N), 5);
 
-        // SIMD-optimized: 8 SIMD groups, each handles 2 output columns
-        constexpr uint32_t simd_groups = 8;
-        constexpr uint32_t cols_per_tg = 2 * simd_groups;  // 16 columns per TG
-        uint32_t tg_x = (N + cols_per_tg - 1) / cols_per_tg;
-        MTL::Size grid_size = MTL::Size::Make(tg_x, M, 1);
-        MTL::Size threadgroup_size = MTL::Size::Make(32 * simd_groups, 1, 1);
-        encoder->dispatchThreadgroups(grid_size, threadgroup_size);
+        // Grid Y is halved since each thread handles 2 rows
+        uint32_t grid_M = (M + 1) / 2;
+        MTL::Size grid_size = MTL::Size::Make(N, grid_M, 1);
+        MTL::Size threadgroup_size = MTL::Size::Make(16, 16, 1);
+        encoder->dispatchThreads(grid_size, threadgroup_size);
 
         return {};
     }
@@ -344,7 +342,8 @@ private:
         // All kernel names to compile
         std::vector<std::string> kernels = {
             // Core quantized kernels
-            "matvec_q4k", "matmul_q4k", "matvec_f16", "matvec_f32",
+            "matvec_q4k", "matmul_q4k", "matmul_q4k_vec", "matmul_q4k_tiled",
+            "matvec_f16", "matvec_f32",
             "matvec_q8_0", "matmul_q8_0",
             "matvec_q4_0", "matmul_q4_0",
             "matvec_iq4_nl", "matmul_iq4_nl",
@@ -466,7 +465,13 @@ Result<void> MetalCompute::matmul_q4k(
     MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
     uint32_t M, uint32_t K, uint32_t N)
 {
-    return impl_->dispatch_matmul_simd("matmul_q4k", X, W, Y, M, K, N);
+    // Use register-tiled kernel for prefill (M > 2), vectorized for small M
+    if (M > 2) {
+        return impl_->dispatch_matmul_tiled("matmul_q4k_tiled", X, W, Y, M, K, N);
+    } else if (M > 1) {
+        return impl_->dispatch_matmul("matmul_q4k_vec", X, W, Y, M, K, N);
+    }
+    return impl_->dispatch_matmul("matmul_q4k", X, W, Y, M, K, N);
 }
 
 // -----------------------------------------------------------------------------
@@ -538,7 +543,7 @@ Result<void> MetalCompute::matmul_iq4_xs(
     MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
     uint32_t M, uint32_t K, uint32_t N)
 {
-    return impl_->dispatch_matmul_simd("matmul_iq4_xs", X, W, Y, M, K, N);
+    return impl_->dispatch_matmul("matmul_iq4_xs", X, W, Y, M, K, N);
 }
 
 // -----------------------------------------------------------------------------
@@ -556,7 +561,7 @@ Result<void> MetalCompute::matmul_iq3_s(
     MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
     uint32_t M, uint32_t K, uint32_t N)
 {
-    return impl_->dispatch_matmul_simd("matmul_iq3_s", X, W, Y, M, K, N);
+    return impl_->dispatch_matmul("matmul_iq3_s", X, W, Y, M, K, N);
 }
 
 // -----------------------------------------------------------------------------

@@ -580,6 +580,169 @@ kernel void matmul_q4k(
 }
 
 // =============================================================================
+// Vectorized Q4_K Matrix Multiplication (Prefill)
+// =============================================================================
+// Same 1-thread-per-output model as original, but with float4 vectorized X access
+// This is a safe optimization that doesn't change parallelization
+
+kernel void matmul_q4k_vec(
+    device const float* X          [[buffer(0)]],
+    device const void* W           [[buffer(1)]],
+    device float* Y                [[buffer(2)]],
+    constant uint& M               [[buffer(3)]],
+    constant uint& K               [[buffer(4)]],
+    constant uint& N               [[buffer(5)]],
+    uint2 gid                      [[thread_position_in_grid]]
+) {
+    uint row = gid.y;
+    uint col = gid.x;
+
+    if (row >= M || col >= N) return;
+
+    const uint num_blocks_k = K / QK_K;
+    const device block_q4_K* weights = (const device block_q4_K*)W;
+
+    float sum = 0.0f;
+
+    for (uint kb = 0; kb < num_blocks_k; kb++) {
+        const device block_q4_K* block = &weights[col * num_blocks_k + kb];
+        float d = float(block->d);
+        float dmin = float(block->dmin);
+        const device uint8_t* scales = block->scales;
+        const device uint8_t* qs = block->qs;
+        uint base_idx = row * K + kb * QK_K;
+
+        int is = 0;
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc1, m1, sc2, m2;
+            get_scale_min_k4(is, scales, sc1, m1);
+            get_scale_min_k4(is + 1, scales, sc2, m2);
+
+            float d1 = d * float(sc1);
+            float dm1 = dmin * float(m1);
+            float d2 = d * float(sc2);
+            float dm2 = dmin * float(m2);
+
+            uint x_off = base_idx + j;
+
+            // Vectorized low nibble (4 elements at a time)
+            for (int l = 0; l < 32; l += 4) {
+                float4 xv = float4(X[x_off+l], X[x_off+l+1], X[x_off+l+2], X[x_off+l+3]);
+                float4 wv = float4(d1*float(qs[l]&0xF)-dm1, d1*float(qs[l+1]&0xF)-dm1,
+                                   d1*float(qs[l+2]&0xF)-dm1, d1*float(qs[l+3]&0xF)-dm1);
+                sum += dot(xv, wv);
+            }
+
+            // Vectorized high nibble (4 elements at a time)
+            for (int l = 0; l < 32; l += 4) {
+                float4 xv = float4(X[x_off+32+l], X[x_off+32+l+1], X[x_off+32+l+2], X[x_off+32+l+3]);
+                float4 wv = float4(d2*float(qs[l]>>4)-dm2, d2*float(qs[l+1]>>4)-dm2,
+                                   d2*float(qs[l+2]>>4)-dm2, d2*float(qs[l+3]>>4)-dm2);
+                sum += dot(xv, wv);
+            }
+
+            qs += 32;
+            is += 2;
+        }
+    }
+
+    Y[row * N + col] = sum;
+}
+
+// =============================================================================
+// Register-Tiled Q4_K Matrix Multiplication (Prefill)
+// =============================================================================
+// Each thread computes 2 output rows, amortizing weight loading overhead
+// Also uses float4 vectorized X access
+
+kernel void matmul_q4k_tiled(
+    device const float* X          [[buffer(0)]],
+    device const void* W           [[buffer(1)]],
+    device float* Y                [[buffer(2)]],
+    constant uint& M               [[buffer(3)]],
+    constant uint& K               [[buffer(4)]],
+    constant uint& N               [[buffer(5)]],
+    uint2 gid                      [[thread_position_in_grid]]
+) {
+    // Each thread handles 2 consecutive rows
+    uint row0 = gid.y * 2;
+    uint row1 = row0 + 1;
+    uint col = gid.x;
+
+    if (row0 >= M || col >= N) return;
+
+    const uint num_blocks_k = K / QK_K;
+    const device block_q4_K* weights = (const device block_q4_K*)W;
+
+    // Register tiling: accumulate 2 rows at once
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    bool valid1 = (row1 < M);
+
+    for (uint kb = 0; kb < num_blocks_k; kb++) {
+        const device block_q4_K* block = &weights[col * num_blocks_k + kb];
+        float d = float(block->d);
+        float dmin = float(block->dmin);
+        const device uint8_t* scales = block->scales;
+        const device uint8_t* qs = block->qs;
+        uint k_base = kb * QK_K;
+
+        int is = 0;
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc1, m1, sc2, m2;
+            get_scale_min_k4(is, scales, sc1, m1);
+            get_scale_min_k4(is + 1, scales, sc2, m2);
+
+            float d1 = d * float(sc1);
+            float dm1 = dmin * float(m1);
+            float d2 = d * float(sc2);
+            float dm2 = dmin * float(m2);
+
+            uint x0_off = row0 * K + k_base + j;
+            uint x1_off = row1 * K + k_base + j;
+
+            // Low nibble - 4 at a time
+            for (int l = 0; l < 32; l += 4) {
+                uint8_t q0 = qs[l], q1 = qs[l+1], q2 = qs[l+2], q3 = qs[l+3];
+                float4 wv = float4(d1*float(q0&0xF)-dm1, d1*float(q1&0xF)-dm1,
+                                   d1*float(q2&0xF)-dm1, d1*float(q3&0xF)-dm1);
+
+                float4 xv0 = float4(X[x0_off+l], X[x0_off+l+1], X[x0_off+l+2], X[x0_off+l+3]);
+                sum0 += dot(xv0, wv);
+
+                if (valid1) {
+                    float4 xv1 = float4(X[x1_off+l], X[x1_off+l+1], X[x1_off+l+2], X[x1_off+l+3]);
+                    sum1 += dot(xv1, wv);
+                }
+            }
+
+            // High nibble - 4 at a time
+            for (int l = 0; l < 32; l += 4) {
+                uint8_t q0 = qs[l], q1 = qs[l+1], q2 = qs[l+2], q3 = qs[l+3];
+                float4 wv = float4(d2*float(q0>>4)-dm2, d2*float(q1>>4)-dm2,
+                                   d2*float(q2>>4)-dm2, d2*float(q3>>4)-dm2);
+
+                float4 xv0 = float4(X[x0_off+32+l], X[x0_off+32+l+1], X[x0_off+32+l+2], X[x0_off+32+l+3]);
+                sum0 += dot(xv0, wv);
+
+                if (valid1) {
+                    float4 xv1 = float4(X[x1_off+32+l], X[x1_off+32+l+1], X[x1_off+32+l+2], X[x1_off+32+l+3]);
+                    sum1 += dot(xv1, wv);
+                }
+            }
+
+            qs += 32;
+            is += 2;
+        }
+    }
+
+    Y[row0 * N + col] = sum0;
+    if (valid1) {
+        Y[row1 * N + col] = sum1;
+    }
+}
+
+// =============================================================================
 // Q8_0 Matrix-Vector Multiplication (Single Token Decode)
 // =============================================================================
 // Optimized using same techniques as Q4_K:
