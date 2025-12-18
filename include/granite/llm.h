@@ -430,6 +430,7 @@ private:
         Tensor post_attn;       // [1, 1, hidden_dim]
         Tensor ffn_input;       // [1, 1, hidden_dim]
         Tensor block_output;    // [1, 1, hidden_dim]
+        Tensor attn_layer_out;  // [1, 1, hidden_dim] - for attention layer output
         Tensor norm_out;        // [1, 1, hidden_dim]
         Tensor logits;          // [1, 1, vocab_size]
         // Attention-specific GPU buffers (raw Metal buffers)

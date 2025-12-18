@@ -880,18 +880,26 @@ Result<Tensor> TransformerModel::transformer_block(
                         up_buf = gpu->create_buffer(config_.intermediate_dim * sizeof(float));
                     }
 
-                    // Allocate output
-                    std::vector<int64_t> ffn_out_shape = {1, 1, static_cast<int64_t>(hidden_dim)};
-                    auto ffn_out_result = Tensor::allocate(ffn_out_shape, DataType::FP32, backend_);
-                    if (!ffn_out_result.ok()) {
-                        if (!use_ffn_pool) {
-                            if (gate_buf) gate_buf->release();
-                            if (up_buf) up_buf->release();
+                    // Check if residual will be fused (Q4_K/Q3_K/Q2_K use fused down+residual)
+                    bool will_fuse_residual = (fused_qtype == GGMLType::Q4_K ||
+                                               fused_qtype == GGMLType::Q3_K ||
+                                               fused_qtype == GGMLType::Q2_K);
+
+                    // Only allocate FFN output for non-fused residual paths
+                    MTL::Buffer* ffn_out_buf = nullptr;
+                    if (!will_fuse_residual) {
+                        std::vector<int64_t> ffn_out_shape = {1, 1, static_cast<int64_t>(hidden_dim)};
+                        auto ffn_out_result = Tensor::allocate(ffn_out_shape, DataType::FP32, backend_);
+                        if (!ffn_out_result.ok()) {
+                            if (!use_ffn_pool) {
+                                if (gate_buf) gate_buf->release();
+                                if (up_buf) up_buf->release();
+                            }
+                            return ffn_out_result.error();
                         }
-                        return ffn_out_result.error();
+                        ffn_output = std::move(ffn_out_result).take();
+                        ffn_out_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(ffn_output.buffer()));
                     }
-                    ffn_output = std::move(ffn_out_result).take();
-                    auto* ffn_out_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(ffn_output.buffer()));
 
                     // Fused RMSNorm + gate projection: eliminates intermediate norm buffer
                     if (fused_qtype == GGMLType::Q8_0) {
@@ -2387,11 +2395,12 @@ Result<void> TransformerModel::init_decode_pool() {
     auto post_attn = Tensor::allocate(hidden_shape, DataType::FP32, backend_);
     auto ffn_in = Tensor::allocate(hidden_shape, DataType::FP32, backend_);
     auto block_out = Tensor::allocate(hidden_shape, DataType::FP32, backend_);
+    auto attn_layer_out = Tensor::allocate(hidden_shape, DataType::FP32, backend_);
     auto norm_out = Tensor::allocate(hidden_shape, DataType::FP32, backend_);
     auto logits = Tensor::allocate(logits_shape, DataType::FP32, backend_);
 
     if (!attn_in.ok() || !post_attn.ok() || !ffn_in.ok() ||
-        !block_out.ok() || !norm_out.ok() || !logits.ok()) {
+        !block_out.ok() || !attn_layer_out.ok() || !norm_out.ok() || !logits.ok()) {
         return Error(ErrorCode::OutOfMemory, "Failed to allocate decode buffer pool");
     }
 
@@ -2399,6 +2408,7 @@ Result<void> TransformerModel::init_decode_pool() {
     decode_pool_->post_attn = std::move(post_attn).take();
     decode_pool_->ffn_input = std::move(ffn_in).take();
     decode_pool_->block_output = std::move(block_out).take();
+    decode_pool_->attn_layer_out = std::move(attn_layer_out).take();
     decode_pool_->norm_out = std::move(norm_out).take();
     decode_pool_->logits = std::move(logits).take();
 
@@ -2475,28 +2485,33 @@ Result<void> TransformerModel::sync_cpu_to_gpu_kv_cache(KVCache* kv_cache) {
         const auto* k_fp16 = static_cast<const uint16_t*>(map_k.value());
         const auto* v_fp16 = static_cast<const uint16_t*>(map_v.value());
 
-        // Map GPU buffers (FP32)
-        float* k_fp32 = static_cast<float*>(k_gpu->contents());
-        float* v_fp32 = static_cast<float*>(v_gpu->contents());
+        // Map GPU buffers (FP16 - same format as CPU cache)
+        auto* k_gpu_fp16 = static_cast<uint16_t*>(k_gpu->contents());
+        auto* v_gpu_fp16 = static_cast<uint16_t*>(v_gpu->contents());
 
-        // Convert FP16 to FP32 and copy
+        // Both CPU and GPU caches are FP16, just copy directly
         // CPU cache shape: [1, num_kv_heads, max_seq_len, head_dim]
         // GPU cache shape: [num_kv_heads, max_seq_len, head_dim]
         int max_seq_cpu = kv_cache->max_seq_len();
         int max_seq_gpu = gpu_kv_cache_->max_seq_len;
 
-        for (int h = 0; h < num_kv_heads; h++) {
-            for (int s = 0; s < cpu_len; s++) {
-                for (int d = 0; d < head_dim; d++) {
-                    size_t cpu_idx = h * max_seq_cpu * head_dim + s * head_dim + d;
-                    size_t gpu_idx = h * max_seq_gpu * head_dim + s * head_dim + d;
-
-                    // FP16 to FP32 conversion
-                    uint16_t k_bits = k_fp16[cpu_idx];
-                    uint16_t v_bits = v_fp16[cpu_idx];
-
-                    k_fp32[gpu_idx] = fp16_to_fp32(k_bits);
-                    v_fp32[gpu_idx] = fp16_to_fp32(v_bits);
+        // Optimized path: if max_seq matches, use contiguous memcpy per head
+        if (max_seq_cpu == max_seq_gpu) {
+            // Contiguous copy per head
+            size_t copy_size = cpu_len * head_dim * sizeof(uint16_t);
+            for (int h = 0; h < num_kv_heads; h++) {
+                size_t offset = h * max_seq_gpu * head_dim;
+                std::memcpy(&k_gpu_fp16[offset], &k_fp16[offset], copy_size);
+                std::memcpy(&v_gpu_fp16[offset], &v_fp16[offset], copy_size);
+            }
+        } else {
+            // Fallback: element-wise copy when max_seq differs
+            for (int h = 0; h < num_kv_heads; h++) {
+                for (int s = 0; s < cpu_len; s++) {
+                    size_t cpu_base = h * max_seq_cpu * head_dim + s * head_dim;
+                    size_t gpu_base = h * max_seq_gpu * head_dim + s * head_dim;
+                    std::memcpy(&k_gpu_fp16[gpu_base], &k_fp16[cpu_base], head_dim * sizeof(uint16_t));
+                    std::memcpy(&v_gpu_fp16[gpu_base], &v_fp16[cpu_base], head_dim * sizeof(uint16_t));
                 }
             }
         }
@@ -2591,20 +2606,29 @@ Result<Tensor> TransformerModel::attention_full_gpu(
         GRANITE_FAIL(ErrorCode::OutOfMemory, "Failed to allocate attention buffers");
     }
 
-    // Allocate output tensor
-    std::vector<int64_t> output_shape = {1, 1, static_cast<int64_t>(hidden_dim)};
-    auto output_result = Tensor::allocate(output_shape, DataType::FP32, backend_);
-    if (!output_result.ok()) {
-        if (!use_pool) {
-            q_buf->release();
-            k_buf->release();
-            v_buf->release();
-            attn_out_buf->release();
+    // Use pooled output tensor if available, otherwise allocate
+    Tensor output;
+    MTL::Buffer* o_buf = nullptr;
+    bool use_output_pool = use_pool && decode_pool_->attn_layer_out.buffer().valid();
+
+    if (use_output_pool) {
+        output = decode_pool_->attn_layer_out;
+        o_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(output.buffer()));
+    } else {
+        std::vector<int64_t> output_shape = {1, 1, static_cast<int64_t>(hidden_dim)};
+        auto output_result = Tensor::allocate(output_shape, DataType::FP32, backend_);
+        if (!output_result.ok()) {
+            if (!use_pool) {
+                q_buf->release();
+                k_buf->release();
+                v_buf->release();
+                attn_out_buf->release();
+            }
+            return output_result.error();
         }
-        return output_result.error();
+        output = std::move(output_result).take();
+        o_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(output.buffer()));
     }
-    auto output = std::move(output_result).take();
-    auto* o_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(output.buffer()));
 
     // === ALL GPU OPERATIONS - NO SYNC UNTIL END ===
 
