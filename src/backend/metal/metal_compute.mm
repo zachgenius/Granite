@@ -377,6 +377,8 @@ private:
             "flash_attention_v2_f16kv", "flash_attention_v2_simd_f16kv",
             // Flash attention V3 (simdgroup-optimized)
             "flash_attention_v3_f16kv", "flash_attention_v3_f16kv_d64", "flash_attention_v3_f16kv_d128",
+            // Simdgroup Flash Attention (simdgroup_matrix-based, highest performance)
+            "simdgroup_flash_attention_decode_f16kv_d64", "simdgroup_flash_attention_decode_f16kv_d128",
             // Prefill attention
             "attention_prefill", "attention_prefill_f16kv",
             // Tree attention (speculative decoding)
@@ -1208,23 +1210,23 @@ Result<void> MetalCompute::multihead_attention(
         const char* kernel_name = nullptr;
         MTL::ComputePipelineState* pipeline = nullptr;
 
-        // Try V3 simdgroup-optimized kernels (disabled for now - same perf as legacy)
-        // TODO: Investigate GPU utilization issue
-        // if (head_dim == 64) {
-        //     kernel_name = "flash_attention_v3_f16kv_d64";
-        //     pipeline = impl_->get_pipeline(kernel_name);
-        // }
+        // Try simdgroup_matrix-based flash attention kernels (highest performance)
+        // These use hardware simdgroup_matrix ops like llama.cpp
+        if (head_dim == 64) {
+            kernel_name = "simdgroup_flash_attention_decode_f16kv_d64";
+            pipeline = impl_->get_pipeline(kernel_name);
+        } else if (head_dim == 128) {
+            kernel_name = "simdgroup_flash_attention_decode_f16kv_d128";
+            pipeline = impl_->get_pipeline(kernel_name);
+        }
 
-        // Use legacy kernel for now
-        kernel_name = "multihead_attention_decode_f16kv";
-        pipeline = impl_->get_pipeline(kernel_name);
-
-        // Fall back to legacy kernel
+        // Fall back to legacy kernel if simdgroup version not available
         if (!pipeline) {
             kernel_name = "multihead_attention_decode_f16kv";
             pipeline = impl_->get_pipeline(kernel_name);
         }
 
+        // Last resort: try non-f16kv version
         if (!pipeline) {
             kernel_name = "multihead_attention_decode";
             pipeline = impl_->get_pipeline(kernel_name);

@@ -7242,4 +7242,413 @@ kernel void flash_attention_v3_f16kv(
         out_head[d] = out_shared[d] * inv_sum;
     }
 }
+
+// =============================================================================
+// SIMDGROUP FLASH ATTENTION - Using hardware 8x8 matrix operations
+// =============================================================================
+//
+// This kernel uses Metal simdgroup_matrix operations for hardware-accelerated
+// 8x8 matrix multiplies, following the approach from llama.cpp.
+//
+// Key differences from legacy attention:
+// - Uses simdgroup_matrix<half, 8, 8> for Q@K^T and S@V
+// - Tiled KV processing with online softmax
+// - Better memory access patterns via simdgroup loads
+//
+// Configuration:
+// - 128 threads per threadgroup (4 simdgroups x 32 threads)
+// - KV tile size: 32 positions (fits well in shared memory)
+// - One threadgroup per attention head
+//
+// =============================================================================
+
+// Tile size for KV positions processed per iteration
+constant constexpr uint FLASH_KV_TILE = 32;
+
+// =============================================================================
+// Vectorized Flash Attention Decode - head_dim=64 specialization
+// Tiled approach with vectorized loads using float4/half4
+// =============================================================================
+kernel void simdgroup_flash_attention_decode_f16kv_d64(
+    device const float* Q          [[buffer(0)]],   // [num_heads, 64] FP32
+    device const half* K           [[buffer(1)]],   // [num_kv_heads, seq_kv, 64] FP16
+    device const half* V           [[buffer(2)]],   // [num_kv_heads, seq_kv, 64] FP16
+    device float* output           [[buffer(3)]],   // [num_heads, 64] FP32
+    constant uint& num_heads       [[buffer(4)]],
+    constant uint& num_kv_heads    [[buffer(5)]],
+    constant uint& seq_kv          [[buffer(6)]],
+    constant uint& head_dim        [[buffer(7)]],   // Must be 64
+    constant float& scale          [[buffer(8)]],
+    uint head_idx                  [[threadgroup_position_in_grid]],
+    ushort tiisg                   [[thread_index_in_simdgroup]],
+    ushort sgitg                   [[simdgroup_index_in_threadgroup]]
+) {
+    if (head_idx >= num_heads) return;
+
+    // Constants for head_dim=64
+    constexpr uint HD = 64;
+    constexpr uint HD4 = HD / 4;  // 16 float4s
+    constexpr uint TILE = FLASH_KV_TILE;  // 32 positions per tile
+    constexpr uint NSG = 4;  // Number of simdgroups
+    constexpr uint NW = 32;  // Threads per simdgroup
+
+    // GQA: map query head to KV head
+    uint heads_per_kv = num_heads / num_kv_heads;
+    uint kv_head = head_idx / heads_per_kv;
+
+    // Pointers (vectorized)
+    device const float4* q4 = (device const float4*)(Q + head_idx * HD);
+    device const half4* k4_base = (device const half4*)(K + kv_head * seq_kv * HD);
+    device const half4* v4_base = (device const half4*)(V + kv_head * seq_kv * HD);
+    device float* out_head = output + head_idx * HD;
+
+    // Shared memory
+    threadgroup float4 sq4[HD4];      // Q vector
+    threadgroup half4 skv4[TILE * HD4]; // K/V tile buffer
+    threadgroup float ss[TILE];       // Attention scores
+    threadgroup float4 so4[HD4];      // Output accumulator
+    threadgroup float sg_scratch[NSG]; // For cross-simdgroup reductions
+
+    // Load Q into shared memory (vectorized)
+    uint tid = tiisg + sgitg * NW;
+    if (tid < HD4) {
+        sq4[tid] = q4[tid];
+    }
+
+    // Initialize output accumulator
+    if (tid < HD4) {
+        so4[tid] = float4(0.0f);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Online softmax state
+    float running_max = -FLT_MAX / 2;
+    float running_sum = 0.0f;
+
+    // Process KV cache in tiles
+    uint num_tiles = (seq_kv + TILE - 1) / TILE;
+
+    for (uint tile_idx = 0; tile_idx < num_tiles; tile_idx++) {
+        uint tile_start = tile_idx * TILE;
+        uint tile_len = min(TILE, seq_kv - tile_start);
+
+        // =====================================================================
+        // Step 1: Load K tile into shared memory (vectorized, coalesced)
+        // =====================================================================
+        device const half4* k4_tile = k4_base + tile_start * HD4;
+
+        // 128 threads, tile_len * HD4 = 32 * 16 = 512 half4s to load
+        // Each thread loads 4 half4s
+        for (uint i = tid; i < tile_len * HD4; i += 128) {
+            skv4[i] = k4_tile[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // =====================================================================
+        // Step 2: Compute Q @ K^T for all K positions in tile
+        // =====================================================================
+        // Each simdgroup handles a subset of K positions
+        uint k_per_sg = (tile_len + NSG - 1) / NSG;
+        uint k_start_sg = sgitg * k_per_sg;
+        uint k_end_sg = min(k_start_sg + k_per_sg, tile_len);
+
+        for (uint k = k_start_sg; k < k_end_sg; k++) {
+            threadgroup half4* k4_vec = skv4 + k * HD4;
+
+            // Vectorized dot product: threads 0-15 each handle one float4
+            float partial_dot = 0.0f;
+            if (tiisg < HD4) {
+                float4 q_vec = sq4[tiisg];
+                float4 k_vec = float4(k4_vec[tiisg]);
+                partial_dot = dot(q_vec, k_vec);
+            }
+
+            // Sum across SIMD group
+            float dot_sum = simd_sum(partial_dot);
+
+            // Thread 0 writes the score
+            if (tiisg == 0) {
+                ss[k] = dot_sum * scale;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // =====================================================================
+        // Step 3: Online softmax update
+        // =====================================================================
+        // Find max in this tile
+        float local_max = -FLT_MAX / 2;
+        for (uint k = tiisg; k < tile_len; k += NW) {
+            local_max = max(local_max, ss[k]);
+        }
+        float tile_max = simd_max(local_max);
+
+        // Cross-simdgroup max reduction
+        if (tiisg == 0) sg_scratch[sgitg] = tile_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sgitg == 0 && tiisg == 0) {
+            float m = sg_scratch[0];
+            for (uint i = 1; i < NSG; i++) m = max(m, sg_scratch[i]);
+            sg_scratch[0] = m;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        tile_max = sg_scratch[0];
+
+        // Update running max and correction factor
+        float new_max = max(running_max, tile_max);
+        float correction = (running_max > -FLT_MAX / 4) ? exp(running_max - new_max) : 0.0f;
+
+        // Scale previous output accumulator
+        if (tid < HD4) {
+            so4[tid] *= correction;
+        }
+
+        // Compute exp(score - new_max) and sum
+        float local_sum = 0.0f;
+        for (uint k = tiisg; k < tile_len; k += NW) {
+            float exp_score = exp(ss[k] - new_max);
+            ss[k] = exp_score;
+            local_sum += exp_score;
+        }
+        float tile_sum = simd_sum(local_sum);
+
+        // Cross-simdgroup sum reduction
+        if (tiisg == 0) sg_scratch[sgitg] = tile_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sgitg == 0 && tiisg == 0) {
+            float s = 0.0f;
+            for (uint i = 0; i < NSG; i++) s += sg_scratch[i];
+            sg_scratch[0] = s;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        tile_sum = sg_scratch[0];
+
+        running_sum = running_sum * correction + tile_sum;
+        running_max = new_max;
+
+        // =====================================================================
+        // Step 4: Load V tile and compute S @ V
+        // =====================================================================
+        device const half4* v4_tile = v4_base + tile_start * HD4;
+        for (uint i = tid; i < tile_len * HD4; i += 128) {
+            skv4[i] = v4_tile[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Accumulate: output += attention_weights @ V
+        if (tid < HD4) {
+            float4 accum = float4(0.0f);
+            for (uint k = 0; k < tile_len; k++) {
+                float weight = ss[k];
+                float4 v_vec = float4(skv4[k * HD4 + tid]);
+                accum += weight * v_vec;
+            }
+            so4[tid] += accum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // =====================================================================
+    // Step 5: Normalize and write output
+    // =====================================================================
+    float inv_sum = (running_sum > 0.0f) ? 1.0f / running_sum : 0.0f;
+    if (tid < HD4) {
+        float4 result = so4[tid] * inv_sum;
+        out_head[tid * 4 + 0] = result.x;
+        out_head[tid * 4 + 1] = result.y;
+        out_head[tid * 4 + 2] = result.z;
+        out_head[tid * 4 + 3] = result.w;
+    }
+}
+
+// =============================================================================
+// Vectorized Flash Attention Decode - head_dim=128 specialization
+// Tiled approach with vectorized loads using float4/half4
+// =============================================================================
+kernel void simdgroup_flash_attention_decode_f16kv_d128(
+    device const float* Q          [[buffer(0)]],   // [num_heads, 128] FP32
+    device const half* K           [[buffer(1)]],   // [num_kv_heads, seq_kv, 128] FP16
+    device const half* V           [[buffer(2)]],   // [num_kv_heads, seq_kv, 128] FP16
+    device float* output           [[buffer(3)]],   // [num_heads, 128] FP32
+    constant uint& num_heads       [[buffer(4)]],
+    constant uint& num_kv_heads    [[buffer(5)]],
+    constant uint& seq_kv          [[buffer(6)]],
+    constant uint& head_dim        [[buffer(7)]],   // Must be 128
+    constant float& scale          [[buffer(8)]],
+    uint head_idx                  [[threadgroup_position_in_grid]],
+    ushort tiisg                   [[thread_index_in_simdgroup]],
+    ushort sgitg                   [[simdgroup_index_in_threadgroup]]
+) {
+    if (head_idx >= num_heads) return;
+
+    // Constants for head_dim=128
+    constexpr uint HD = 128;
+    constexpr uint HD4 = HD / 4;  // 32 float4s
+    constexpr uint TILE = FLASH_KV_TILE;  // 32 positions per tile
+    constexpr uint NSG = 4;
+    constexpr uint NW = 32;
+
+    // GQA: map query head to KV head
+    uint heads_per_kv = num_heads / num_kv_heads;
+    uint kv_head = head_idx / heads_per_kv;
+
+    // Pointers (vectorized)
+    device const float4* q4 = (device const float4*)(Q + head_idx * HD);
+    device const half4* k4_base = (device const half4*)(K + kv_head * seq_kv * HD);
+    device const half4* v4_base = (device const half4*)(V + kv_head * seq_kv * HD);
+    device float* out_head = output + head_idx * HD;
+
+    // Shared memory
+    threadgroup float4 sq4[HD4];      // Q vector
+    threadgroup half4 skv4[TILE * HD4]; // K/V tile buffer
+    threadgroup float ss[TILE];       // Attention scores
+    threadgroup float4 so4[HD4];      // Output accumulator
+    threadgroup float sg_scratch[NSG]; // For cross-simdgroup reductions
+
+    // Load Q into shared memory (vectorized)
+    uint tid = tiisg + sgitg * NW;
+    if (tid < HD4) {
+        sq4[tid] = q4[tid];
+    }
+
+    // Initialize output accumulator
+    if (tid < HD4) {
+        so4[tid] = float4(0.0f);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Online softmax state
+    float running_max = -FLT_MAX / 2;
+    float running_sum = 0.0f;
+
+    // Process KV cache in tiles
+    uint num_tiles = (seq_kv + TILE - 1) / TILE;
+
+    for (uint tile_idx = 0; tile_idx < num_tiles; tile_idx++) {
+        uint tile_start = tile_idx * TILE;
+        uint tile_len = min(TILE, seq_kv - tile_start);
+
+        // =====================================================================
+        // Step 1: Load K tile into shared memory (vectorized, coalesced)
+        // =====================================================================
+        device const half4* k4_tile = k4_base + tile_start * HD4;
+
+        // 128 threads, tile_len * HD4 = 32 * 32 = 1024 half4s to load
+        for (uint i = tid; i < tile_len * HD4; i += 128) {
+            skv4[i] = k4_tile[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // =====================================================================
+        // Step 2: Compute Q @ K^T for all K positions in tile
+        // =====================================================================
+        uint k_per_sg = (tile_len + NSG - 1) / NSG;
+        uint k_start_sg = sgitg * k_per_sg;
+        uint k_end_sg = min(k_start_sg + k_per_sg, tile_len);
+
+        for (uint k = k_start_sg; k < k_end_sg; k++) {
+            threadgroup half4* k4_vec = skv4 + k * HD4;
+
+            // Vectorized dot product: 32 threads, 32 float4s -> 1 per thread
+            float partial_dot = 0.0f;
+            if (tiisg < HD4) {
+                float4 q_vec = sq4[tiisg];
+                float4 k_vec = float4(k4_vec[tiisg]);
+                partial_dot = dot(q_vec, k_vec);
+            }
+
+            float dot_sum = simd_sum(partial_dot);
+
+            if (tiisg == 0) {
+                ss[k] = dot_sum * scale;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // =====================================================================
+        // Step 3: Online softmax update
+        // =====================================================================
+        float local_max = -FLT_MAX / 2;
+        for (uint k = tiisg; k < tile_len; k += NW) {
+            local_max = max(local_max, ss[k]);
+        }
+        float tile_max = simd_max(local_max);
+
+        if (tiisg == 0) sg_scratch[sgitg] = tile_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sgitg == 0 && tiisg == 0) {
+            float m = sg_scratch[0];
+            for (uint i = 1; i < NSG; i++) m = max(m, sg_scratch[i]);
+            sg_scratch[0] = m;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        tile_max = sg_scratch[0];
+
+        float new_max = max(running_max, tile_max);
+        float correction = (running_max > -FLT_MAX / 4) ? exp(running_max - new_max) : 0.0f;
+
+        if (tid < HD4) {
+            so4[tid] *= correction;
+        }
+
+        float local_sum = 0.0f;
+        for (uint k = tiisg; k < tile_len; k += NW) {
+            float exp_score = exp(ss[k] - new_max);
+            ss[k] = exp_score;
+            local_sum += exp_score;
+        }
+        float tile_sum = simd_sum(local_sum);
+
+        if (tiisg == 0) sg_scratch[sgitg] = tile_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sgitg == 0 && tiisg == 0) {
+            float s = 0.0f;
+            for (uint i = 0; i < NSG; i++) s += sg_scratch[i];
+            sg_scratch[0] = s;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        tile_sum = sg_scratch[0];
+
+        running_sum = running_sum * correction + tile_sum;
+        running_max = new_max;
+
+        // =====================================================================
+        // Step 4: Load V tile and compute S @ V
+        // =====================================================================
+        device const half4* v4_tile = v4_base + tile_start * HD4;
+        for (uint i = tid; i < tile_len * HD4; i += 128) {
+            skv4[i] = v4_tile[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid < HD4) {
+            float4 accum = float4(0.0f);
+            for (uint k = 0; k < tile_len; k++) {
+                float weight = ss[k];
+                float4 v_vec = float4(skv4[k * HD4 + tid]);
+                accum += weight * v_vec;
+            }
+            so4[tid] += accum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // =====================================================================
+    // Step 5: Normalize and write output
+    // =====================================================================
+    float inv_sum = (running_sum > 0.0f) ? 1.0f / running_sum : 0.0f;
+    if (tid < HD4) {
+        float4 result = so4[tid] * inv_sum;
+        out_head[tid * 4 + 0] = result.x;
+        out_head[tid * 4 + 1] = result.y;
+        out_head[tid * 4 + 2] = result.z;
+        out_head[tid * 4 + 3] = result.w;
+    }
+}
 )";
