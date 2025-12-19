@@ -5462,31 +5462,40 @@ kernel void flash_attention_prefill_v2(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Accumulate S * V
-        // Note: Can't use simdgroup matrix ops here because different queries
-        // have different causal masks - the weights are query-dependent.
-        // Using cached V from shared memory for better memory access.
-        for (uint jj = 0; jj < NQ; jj++) {
-            uint j = jj * FA_NSG + simd_id;
-            uint global_q_pos = q_base + j;
+        // Accumulate S * V using simdgroup matrix operations
+        // After softmax, masked positions have weight 0 (exp(-inf) = 0), so
+        // simdgroup matrix multiply gives correct results without explicit masking.
+        //
+        // Layout: ss_half[8×32], sv[32×64], so[8×64]
+        // Each simdgroup handles 2 output dim blocks (16 dims total):
+        //   simd_id 0: dims 0-15, simd_id 1: dims 16-31, etc.
+        {
+            const uint d_start = simd_id * 16;
 
-            if (global_q_pos >= seq_q) continue;
+            // Load current output blocks (already rescaled)
+            simdgroup_half8x8 mo0, mo1;
+            simdgroup_load(mo0, so + d_start, FA_DK);
+            simdgroup_load(mo1, so + d_start + 8, FA_DK);
 
-            uint max_kv = min(start_pos + global_q_pos + 1, seq_kv);
+            // Accumulate S @ V: iterate over K blocks
+            for (uint kb = 0; kb < FA_K_TILE / 8; kb++) {  // 4 K blocks
+                // Load score block: 8 queries × 8 K positions
+                simdgroup_half8x8 ms;
+                simdgroup_load(ms, ss_half + kb * 8, FA_K_TILE);
 
-            // Accumulate V weighted by attention scores
-            // Each thread handles part of head_dim, V is cached in sv
-            for (uint d = simd_lane; d < FA_DK; d += FA_NW) {
-                float acc = 0.0f;
-                for (uint k = 0; k < FA_K_TILE; k++) {
-                    uint global_k_pos = k_base + k;
-                    if (global_k_pos < max_kv) {
-                        float weight = ss[j * FA_K_TILE + k];
-                        acc += weight * float(sv[k * FA_DK + d]);
-                    }
-                }
-                so[j * FA_DK + d] = half(float(so[j * FA_DK + d]) + acc);
+                // Load V blocks: 8 K positions × 8 dims (two blocks)
+                simdgroup_half8x8 mv0, mv1;
+                simdgroup_load(mv0, sv + kb * 8 * FA_DK + d_start, FA_DK);
+                simdgroup_load(mv1, sv + kb * 8 * FA_DK + d_start + 8, FA_DK);
+
+                // Accumulate: output[q,d] += sum_k score[q,k] * V[k,d]
+                simdgroup_multiply_accumulate(mo0, ms, mv0, mo0);
+                simdgroup_multiply_accumulate(mo1, ms, mv1, mo1);
             }
+
+            // Store output blocks
+            simdgroup_store(mo0, so + d_start, FA_DK);
+            simdgroup_store(mo1, so + d_start + 8, FA_DK);
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
