@@ -941,14 +941,16 @@ kernel void matmul_q4k_simdgroup(
         mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
     }
 
-    short il = il0;
     const short iy = 8 * (tiitg % NL1);  // K offset for input loading
 
     // Process K dimension in chunks
     for (uint loop_k = 0; loop_k < K; loop_k += SGMM_NK) {
-        // Determine Q4_K block index
-        uint block_idx = (loop_k + 16 * il) / QK_K;
-        uint within_block = ((loop_k + 16 * il) % QK_K) / 16;
+        // Each weight-loading thread loads 16 elements at K position: loop_k + 16*il0
+        // Thread il0=0 loads first 16 elements, il0=1 loads second 16 elements
+        // This covers all SGMM_NK=32 elements per iteration
+        uint k_position = loop_k + 16 * il0;
+        uint block_idx = k_position / QK_K;
+        uint within_block = (k_position % QK_K) / 16;
 
         // Load and dequantize weights into sa
         // Weight W[n, k] for output dimension n = r0 + lr0
@@ -990,9 +992,6 @@ kernel void matmul_q4k_simdgroup(
                 *(sb + 64 * ib + 8 * ly + lx) = val;
             }
         }
-
-        // Advance Q4_K block position
-        il = (il + 2 < 16) ? il + 2 : il % 2;
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
