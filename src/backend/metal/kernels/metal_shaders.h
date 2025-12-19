@@ -5332,7 +5332,7 @@ constant constexpr uint FA_K_TILE = 32;  // KV positions per iteration
 constant constexpr uint FA_NSG = 4;      // simdgroups per threadgroup
 constant constexpr uint FA_NW = 32;      // SIMD width
 
-kernel void flash_attention_prefill_v2(
+kernel void flash_attention_prefill(
     device const float* Q          [[buffer(0)]],
     device const half* K           [[buffer(1)]],
     device const half* V           [[buffer(2)]],
@@ -5359,17 +5359,13 @@ kernel void flash_attention_prefill_v2(
     const uint heads_per_kv = num_heads / num_kv_heads;
     const uint kv_head = head_idx / heads_per_kv;
 
-    // Threadgroup memory layout:
-    // sq[Q_TILE * DK] - Q data (half for simdgroup ops)
+    // Reduced threadgroup memory - no V buffer needed!
+    // sq[Q_TILE * DK] - Q data (half)
     // so[Q_TILE * DK] - output accumulator (half)
-    // ss_half[Q_TILE * K_TILE] - attention scores (half for simdgroup store)
-    // ss[Q_TILE * K_TILE] - attention scores scratch (float for softmax precision)
-    // sv[K_TILE * DK] - V data (half, cached from global memory)
+    // ss[Q_TILE * K_TILE] - attention scores (half for simdgroup ops)
     threadgroup half* sq = shmem;                                    // 8 * 64 = 512 halfs
     threadgroup half* so = shmem + FA_Q_TILE * FA_DK;                // 8 * 64 = 512 halfs
-    threadgroup half* ss_half = shmem + 2 * FA_Q_TILE * FA_DK;       // 8 * 32 = 256 halfs
-    threadgroup float* ss = (threadgroup float*)(shmem + 2 * FA_Q_TILE * FA_DK + FA_Q_TILE * FA_K_TILE);  // 8 * 32 = 256 floats
-    threadgroup half* sv = shmem + 2 * FA_Q_TILE * FA_DK + FA_Q_TILE * FA_K_TILE + FA_Q_TILE * FA_K_TILE * 2;  // 32 * 64 = 2048 halfs
+    threadgroup half* ss = shmem + 2 * FA_Q_TILE * FA_DK;            // 8 * 32 = 256 halfs
 
     // Pointers to global memory
     device const float* q_ptr = Q + head_idx * seq_q * head_dim;
@@ -5378,20 +5374,18 @@ kernel void flash_attention_prefill_v2(
     device float* out_ptr = output + head_idx * seq_q * head_dim;
 
     // Load Q into shared memory (convert float to half)
-    // Each thread loads multiple elements
+    #pragma clang loop unroll(full)
     for (uint i = tid; i < FA_Q_TILE * FA_DK; i += FA_NSG * FA_NW) {
         uint q_row = i / FA_DK;
         uint q_col = i % FA_DK;
         uint global_q_pos = q_base + q_row;
 
-        if (global_q_pos < seq_q && q_col < head_dim) {
-            sq[q_row * FA_DK + q_col] = half(q_ptr[global_q_pos * head_dim + q_col]);
-        } else {
-            sq[q_row * FA_DK + q_col] = half(0.0f);
-        }
+        sq[q_row * FA_DK + q_col] = (global_q_pos < seq_q && q_col < head_dim) ?
+            half(q_ptr[global_q_pos * head_dim + q_col]) : half(0.0f);
     }
 
     // Zero output accumulator
+    #pragma clang loop unroll(full)
     for (uint i = tid; i < FA_Q_TILE * FA_DK; i += FA_NSG * FA_NW) {
         so[i] = half(0.0f);
     }
@@ -5399,10 +5393,10 @@ kernel void flash_attention_prefill_v2(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Per-query running statistics for online softmax
-    // Each simdgroup handles Q_TILE/NSG = 2 queries
     constexpr uint NQ = FA_Q_TILE / FA_NSG;  // 2 queries per simdgroup
     float M[NQ];  // running max
     float S[NQ];  // running sum
+    #pragma clang loop unroll(full)
     for (uint i = 0; i < NQ; i++) {
         M[i] = -INFINITY;
         S[i] = 0.0f;
@@ -5411,69 +5405,40 @@ kernel void flash_attention_prefill_v2(
     // Loop over K/V positions in blocks of K_TILE
     for (uint k_base = 0; k_base < seq_kv; k_base += FA_K_TILE) {
         // Compute Q * K^T using simdgroup matrix operations
-        // Each simdgroup computes a portion of the attention scores
-        //
-        // For Q_TILE=8, K_TILE=32, NSG=4:
-        // - Full score matrix is 8x32
-        // - Each simdgroup handles 8 x (32/4) = 8 x 8 scores
-
-        constexpr uint NC = FA_K_TILE / 8 / FA_NSG;  // K blocks per simdgroup = 32/8/4 = 1
-
-        // Each simdgroup processes 8 K positions
         device const half* pk = k_ptr + (k_base + simd_id * 8) * head_dim;
 
         // Compute 8x8 Q*K^T block using simdgroup matrix multiply
         simdgroup_half8x8 mqk = simdgroup_half8x8(0);
 
-        // Iterate over head_dim in chunks of 8
+        // Iterate over head_dim in chunks of 8 - UNROLLED
+        #pragma clang loop unroll(full)
         for (uint d = 0; d < FA_DK; d += 8) {
             simdgroup_half8x8 mq;
             simdgroup_half8x8 mk;
 
-            // Load Q block (8 rows, 8 cols of head_dim)
             simdgroup_load(mq, sq + d, FA_DK);
-
-            // Load K block (8 rows, 8 cols of head_dim) - need transpose
-            // K layout: [seq_kv, head_dim] - we want K^T
             simdgroup_load(mk, pk + d, head_dim, 0, true);  // transpose
 
-            // Accumulate Q * K^T
             simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
         }
 
-        // Store scores to shared memory (half)
-        simdgroup_store(mqk, ss_half + simd_id * 8, FA_K_TILE, 0, false);
-
-        // Load V into shared memory in parallel with score storage
-        // V layout: [K_TILE, DK] = [32, 64]
-        for (uint i = tid; i < FA_K_TILE * FA_DK; i += FA_NSG * FA_NW) {
-            uint k = i / FA_DK;
-            uint d = i % FA_DK;
-            uint global_k_pos = k_base + k;
-            sv[k * FA_DK + d] = (global_k_pos < seq_kv) ? v_ptr[global_k_pos * head_dim + d] : half(0.0f);
-        }
+        // Store Q*K^T scores to shared memory (half)
+        simdgroup_store(mqk, ss + simd_id * 8, FA_K_TILE, 0, false);
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Convert half scores to float for precision in softmax
-        for (uint i = tid; i < FA_Q_TILE * FA_K_TILE; i += FA_NSG * FA_NW) {
-            ss[i] = float(ss_half[i]);
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Apply causal mask and scale, then online softmax
-        // Each thread handles its assigned queries
+        // Online softmax for each query - compute in float, store as half
+        #pragma clang loop unroll(full)
         for (uint jj = 0; jj < NQ; jj++) {
-            uint j = jj * FA_NSG + simd_id;  // query index within tile
+            uint j = jj * FA_NSG + simd_id;
             uint global_q_pos = q_base + j;
 
             if (global_q_pos >= seq_q) continue;
 
-            // Causal mask: can only attend to positions <= start_pos + global_q_pos
+            // Causal mask
             uint max_kv = min(start_pos + global_q_pos + 1, seq_kv);
 
-            // Find max for this query across current K block
+            // Find max for this query (read half, compute float)
             float m_prev = M[jj];
             float m_new = m_prev;
 
@@ -5489,23 +5454,21 @@ kernel void flash_attention_prefill_v2(
             float rescale = exp(m_prev - m_new);
             S[jj] *= rescale;
 
-            // Compute exp(score - m_new) and accumulate sum
+            // Compute exp(score - m_new) and store DIRECTLY as half
             float s_local = 0.0f;
             for (uint k = simd_lane; k < FA_K_TILE; k += FA_NW) {
                 uint global_k_pos = k_base + k;
                 float score = (global_k_pos < max_kv) ?
                     float(ss[j * FA_K_TILE + k]) * scale : -INFINITY;
                 float exp_score = exp(score - m_new);
-                ss[j * FA_K_TILE + k] = exp_score;  // store for V multiply
-                ss_half[j * FA_K_TILE + k] = half(exp_score);  // also store as half for simdgroup ops
+                ss[j * FA_K_TILE + k] = half(exp_score);  // Store directly as half!
                 s_local += exp_score;
             }
             s_local = simd_sum(s_local);
             S[jj] += s_local;
             M[jj] = m_new;
 
-            // Rescale output: so[j,:] *= rescale
-            // Each thread handles part of head_dim
+            // Rescale output
             for (uint d = simd_lane; d < FA_DK; d += FA_NW) {
                 so[j * FA_DK + d] = half(float(so[j * FA_DK + d]) * rescale);
             }
@@ -5513,38 +5476,34 @@ kernel void flash_attention_prefill_v2(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Accumulate S * V using simdgroup matrix operations
-        // After softmax, masked positions have weight 0 (exp(-inf) = 0), so
-        // simdgroup matrix multiply gives correct results without explicit masking.
-        //
-        // Layout: ss_half[8×32], sv[32×64], so[8×64]
-        // Each simdgroup handles 2 output dim blocks (16 dims total):
-        //   simd_id 0: dims 0-15, simd_id 1: dims 16-31, etc.
+        // S * V using simdgroup ops - load V DIRECTLY from global memory!
+        // No extra conversion needed - scores already stored as half
         {
             const uint d_start = simd_id * 16;
 
-            // Load current output blocks (already rescaled)
+            // Load current output blocks
             simdgroup_half8x8 mo0, mo1;
             simdgroup_load(mo0, so + d_start, FA_DK);
             simdgroup_load(mo1, so + d_start + 8, FA_DK);
 
-            // Accumulate S @ V: iterate over K blocks
-            for (uint kb = 0; kb < FA_K_TILE / 8; kb++) {  // 4 K blocks
-                // Load score block: 8 queries × 8 K positions
+            // Load V directly from global and accumulate
+            device const half* pv = v_ptr + k_base * head_dim;
+
+            #pragma clang loop unroll(full)
+            for (uint kb = 0; kb < FA_K_TILE / 8; kb++) {
                 simdgroup_half8x8 ms;
-                simdgroup_load(ms, ss_half + kb * 8, FA_K_TILE);
+                simdgroup_load(ms, ss + kb * 8, FA_K_TILE);
 
-                // Load V blocks: 8 K positions × 8 dims (two blocks)
+                // Load V blocks directly from global memory
                 simdgroup_half8x8 mv0, mv1;
-                simdgroup_load(mv0, sv + kb * 8 * FA_DK + d_start, FA_DK);
-                simdgroup_load(mv1, sv + kb * 8 * FA_DK + d_start + 8, FA_DK);
+                device const half* pv_row = pv + kb * 8 * head_dim + d_start;
+                simdgroup_load(mv0, pv_row, head_dim);
+                simdgroup_load(mv1, pv_row + 8, head_dim);
 
-                // Accumulate: output[q,d] += sum_k score[q,k] * V[k,d]
                 simdgroup_multiply_accumulate(mo0, ms, mv0, mo0);
                 simdgroup_multiply_accumulate(mo1, ms, mv1, mo1);
             }
 
-            // Store output blocks
             simdgroup_store(mo0, so + d_start, FA_DK);
             simdgroup_store(mo1, so + d_start + 8, FA_DK);
         }
@@ -5553,6 +5512,7 @@ kernel void flash_attention_prefill_v2(
     }
 
     // Final normalization and write to global memory
+    #pragma clang loop unroll(full)
     for (uint jj = 0; jj < NQ; jj++) {
         uint j = jj * FA_NSG + simd_id;
         uint global_q_pos = q_base + j;

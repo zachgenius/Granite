@@ -455,8 +455,8 @@ private:
             "simdgroup_flash_attention_decode_f16kv_d64", "simdgroup_flash_attention_decode_f16kv_d128",
             // llama.cpp-style Flash Attention (highest performance)
             "flash_attention_decode_d64", "flash_attention_decode_d128",
-            // Prefill attention (V2 with threadgroup K/V caching)
-            "flash_attention_prefill_v2",
+            // Prefill attention (direct global V loads, half scores)
+            "flash_attention_prefill",
             // Tree attention (speculative decoding)
             "attention_tree_f16kv", "attention_tree_nocontext_f16kv",
             // Paged attention (continuous batching)
@@ -1479,10 +1479,10 @@ Result<void> MetalCompute::multihead_attention(
         MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
         encoder->dispatchThreadgroups(grid_size, threadgroup_size);
     } else {
-        // Prefill path: use simdgroup matrix flash attention (llama.cpp style)
-        auto* pipeline = impl_->get_pipeline("flash_attention_prefill_v2");
+        // Prefill path: use optimized flash attention (direct global V loads)
+        auto* pipeline = impl_->get_pipeline("flash_attention_prefill");
         if (!pipeline) {
-            return Error(ErrorCode::InternalError, "flash_attention_prefill_v2 kernel not found");
+            return Error(ErrorCode::InternalError, "flash_attention_prefill kernel not found");
         }
 
         encoder->setComputePipelineState(pipeline);
@@ -1499,17 +1499,15 @@ Result<void> MetalCompute::multihead_attention(
         uint32_t start_pos = 0;  // For prefill, start_pos is 0
         encoder->setBytes(&start_pos, sizeof(start_pos), 10);
 
-        // Threadgroup memory layout:
+        // Threadgroup memory layout (no V buffer, half scores):
         // sq[Q_TILE * DK] = 8 * 64 = 512 halfs = 1024 bytes
         // so[Q_TILE * DK] = 8 * 64 = 512 halfs = 1024 bytes
-        // ss_half[Q_TILE * K_TILE] = 8 * 32 = 256 halfs = 512 bytes
-        // ss[Q_TILE * K_TILE] = 8 * 32 = 256 floats = 1024 bytes
-        // sv[K_TILE * DK] = 32 * 64 = 2048 halfs = 4096 bytes
-        // Total: 7680 bytes
+        // ss[Q_TILE * K_TILE] = 8 * 32 = 256 halfs = 512 bytes
+        // Total: 2560 bytes
         constexpr uint32_t Q_TILE = 8;
         constexpr uint32_t K_TILE = 32;
         constexpr uint32_t DK = 64;
-        constexpr uint32_t threadgroup_mem_size = (Q_TILE * DK * 2 + Q_TILE * DK * 2 + Q_TILE * K_TILE * 2 + Q_TILE * K_TILE * 4 + K_TILE * DK * 2);
+        constexpr uint32_t threadgroup_mem_size = (Q_TILE * DK * 2 + Q_TILE * DK * 2 + Q_TILE * K_TILE * 2);
         encoder->setThreadgroupMemoryLength(threadgroup_mem_size, 0);
 
         // One threadgroup per (head, query_block) pair
