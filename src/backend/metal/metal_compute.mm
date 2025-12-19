@@ -433,7 +433,7 @@ private:
             "matvec_q3_k", "matmul_q3_k",
             "matvec_q2_k", "matmul_q2_k",
             // Normalization and element-wise
-            "rms_norm", "rms_norm_f16", "silu", "elementwise_mul", "rope",
+            "rms_norm", "rms_norm_f16", "rms_norm_batch", "rms_norm_batch_f16", "silu", "elementwise_mul", "rope",
             "elementwise_add", "rope_multihead", "softmax_row",
             // Basic attention
             "attention_decode", "kv_cache_append", "kv_cache_append_f16",
@@ -546,19 +546,14 @@ Result<void> MetalCompute::matmul_q4k(
     MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
     uint32_t M, uint32_t K, uint32_t N)
 {
-    // Simdgroup matrix kernel for large batches (M >= 256)
+    // Simdgroup matrix kernel for prefill batches (M >= 32)
     // Uses simdgroup_half8x8 matrices and simdgroup_multiply_accumulate.
-    // This is the fastest kernel for large prefill batches, leveraging
+    // This is the fastest kernel for prefill batches, leveraging
     // hardware SIMD matrix units for 8x8 tiled multiply-accumulate.
     // FP16 intermediate precision gives ~0.5 max absolute error vs FP32 reference.
-    if (M >= 256) {
-        return impl_->dispatch_matmul_simdgroup("matmul_q4k_simdgroup", X, W, Y, M, K, N);
-    }
-
-    // Use SIMD K-parallel kernel for medium batches (32 <= M < 256)
-    // Uses 8-way K parallelism with simd_shuffle reduction for good throughput.
+    // Note: The kernel processes 32 rows (NR1) at a time, so M >= 32 is ideal.
     if (M >= 32) {
-        return impl_->dispatch_matmul_simd("matmul_q4k_simd", X, W, Y, M, K, N);
+        return impl_->dispatch_matmul_simdgroup("matmul_q4k_simdgroup", X, W, Y, M, K, N);
     }
     // Use tiled kernel for medium batches
     if (M > 2) {
@@ -794,6 +789,58 @@ Result<void> MetalCompute::rms_norm_f16(
     MTL::Size grid_size = MTL::Size::Make(size, 1, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
     encoder->dispatchThreads(grid_size, threadgroup_size);
+
+    return {};
+}
+
+Result<void> MetalCompute::rms_norm_batch(
+    MTL::Buffer* x, MTL::Buffer* weight, MTL::Buffer* out,
+    uint32_t batch_size, uint32_t hidden_dim, float eps)
+{
+    auto* encoder = impl_->get_encoder();
+    auto* pipeline = impl_->get_pipeline("rms_norm_batch");
+    if (!pipeline) {
+        return Error(ErrorCode::InternalError, "rms_norm_batch pipeline not found");
+    }
+
+    encoder->setComputePipelineState(pipeline);
+    encoder->setBuffer(x, 0, 0);
+    encoder->setBuffer(weight, 0, 1);
+    encoder->setBuffer(out, 0, 2);
+    encoder->setBytes(&batch_size, sizeof(batch_size), 3);
+    encoder->setBytes(&hidden_dim, sizeof(hidden_dim), 4);
+    encoder->setBytes(&eps, sizeof(eps), 5);
+
+    // One threadgroup per token
+    MTL::Size grid_size = MTL::Size::Make(batch_size, 1, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
+
+    return {};
+}
+
+Result<void> MetalCompute::rms_norm_batch_f16(
+    MTL::Buffer* x, MTL::Buffer* weight, MTL::Buffer* out,
+    uint32_t batch_size, uint32_t hidden_dim, float eps)
+{
+    auto* encoder = impl_->get_encoder();
+    auto* pipeline = impl_->get_pipeline("rms_norm_batch_f16");
+    if (!pipeline) {
+        return Error(ErrorCode::InternalError, "rms_norm_batch_f16 pipeline not found");
+    }
+
+    encoder->setComputePipelineState(pipeline);
+    encoder->setBuffer(x, 0, 0);
+    encoder->setBuffer(weight, 0, 1);
+    encoder->setBuffer(out, 0, 2);
+    encoder->setBytes(&batch_size, sizeof(batch_size), 3);
+    encoder->setBytes(&hidden_dim, sizeof(hidden_dim), 4);
+    encoder->setBytes(&eps, sizeof(eps), 5);
+
+    // One threadgroup per token
+    MTL::Size grid_size = MTL::Size::Make(batch_size, 1, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
 
     return {};
 }

@@ -229,8 +229,8 @@ Result<Tensor> TransformerModel::embed(const Tensor& token_ids) {
     auto output = std::move(output_result).take();
 
 #ifdef GRANITE_HAS_METAL
-    // GPU path for single-token decode
-    if (use_gpu_ && total_tokens == 1) {
+    // GPU path for both decode and prefill
+    if (use_gpu_) {
         auto* gpu = get_metal_compute();
         if (gpu && gpu->is_initialized()) {
             auto* ids_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(token_ids.buffer()));
@@ -1176,6 +1176,97 @@ Result<Tensor> TransformerModel::transformer_block(
             }
         }
     }
+
+    // GPU PREFILL PATH: For multi-token prefill (seq_len > 1)
+    if (layer == 0) {
+        GRANITE_LOG_INFO("PREFILL_CHECK layer={} is_decode={} use_gpu_={} total_tokens={}",
+            layer, is_decode, use_gpu_, total_tokens);
+    }
+    if (!is_decode && use_gpu_) {
+        auto* gpu = get_metal_compute();
+        if (gpu && gpu->is_initialized() && attn_norm_weight && ffn_norm_weight) {
+            // Check if weights are FP16 (most common for GGUF models)
+            bool attn_norm_f16 = (attn_norm_weight->dtype() == DataType::FP16);
+            bool ffn_norm_f16 = (ffn_norm_weight->dtype() == DataType::FP16);
+
+            if (layer == 0) {
+                GRANITE_LOG_INFO("GPU_PREFILL layer={} total_tokens={} attn_f16={} ffn_f16={}",
+                    layer, total_tokens, attn_norm_f16, ffn_norm_f16);
+            }
+
+            // GPU prefill supports both FP16 and FP32 norm weights
+            // Get Metal buffers for hidden and norm weights
+            auto* h_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(hidden.buffer()));
+            auto* attn_norm_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(attn_norm_weight->buffer()));
+            auto* ffn_norm_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(ffn_norm_weight->buffer()));
+
+            if (h_buf && attn_norm_buf && ffn_norm_buf) {
+                // Allocate output tensors
+                std::vector<int64_t> output_shape = {batch, seq_len, static_cast<int64_t>(hidden_dim)};
+                auto attn_in_result = Tensor::allocate(output_shape, DataType::FP32, backend_);
+                auto post_attn_result = Tensor::allocate(output_shape, DataType::FP32, backend_);
+                auto ffn_in_result = Tensor::allocate(output_shape, DataType::FP32, backend_);
+                auto output_result = Tensor::allocate(output_shape, DataType::FP32, backend_);
+
+                if (attn_in_result.ok() && post_attn_result.ok() &&
+                    ffn_in_result.ok() && output_result.ok()) {
+
+                    auto attn_input = std::move(attn_in_result).take();
+                    auto post_attn = std::move(post_attn_result).take();
+                    auto ffn_input = std::move(ffn_in_result).take();
+                    auto output = std::move(output_result).take();
+
+                    auto* attn_in_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(attn_input.buffer()));
+                    auto* post_attn_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(post_attn.buffer()));
+                    auto* ffn_in_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(ffn_input.buffer()));
+                    auto* out_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(output.buffer()));
+
+                    // 1. GPU Batched RMSNorm for attention (FP16 or FP32 weights)
+                    if (attn_norm_f16) {
+                        gpu->rms_norm_batch_f16(h_buf, attn_norm_buf, attn_in_buf,
+                                                total_tokens, hidden_dim, model_config_.rms_norm_eps);
+                    } else {
+                        gpu->rms_norm_batch(h_buf, attn_norm_buf, attn_in_buf,
+                                           total_tokens, hidden_dim, model_config_.rms_norm_eps);
+                    }
+
+                    // 2. GPU Attention (attention_gpu already handles prefill)
+                    auto attn_result = attention_gpu(attn_input, layer, kv_cache, start_pos);
+                    if (!attn_result.ok()) {
+                        return attn_result.error();
+                    }
+                    auto attn_output = std::move(attn_result).take();
+                    auto* attn_out_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(attn_output.buffer()));
+
+                    // 3. GPU Residual add: post_attn = hidden + attn_output
+                    gpu->elementwise_add(h_buf, attn_out_buf, post_attn_buf, total_tokens * hidden_dim);
+
+                    // 4. GPU Batched RMSNorm for FFN (FP16 or FP32 weights)
+                    if (ffn_norm_f16) {
+                        gpu->rms_norm_batch_f16(post_attn_buf, ffn_norm_buf, ffn_in_buf,
+                                                total_tokens, hidden_dim, model_config_.rms_norm_eps);
+                    } else {
+                        gpu->rms_norm_batch(post_attn_buf, ffn_norm_buf, ffn_in_buf,
+                                           total_tokens, hidden_dim, model_config_.rms_norm_eps);
+                    }
+
+                    // 5. GPU FFN (feed_forward_gpu already handles prefill)
+                    auto ffn_result = feed_forward_gpu(ffn_input, layer);
+                    if (!ffn_result.ok()) {
+                        return ffn_result.error();
+                    }
+                    auto ffn_output = std::move(ffn_result).take();
+                    auto* ffn_out_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(ffn_output.buffer()));
+
+                    // 6. GPU Residual add: output = post_attn + ffn_output
+                    gpu->elementwise_add(post_attn_buf, ffn_out_buf, out_buf, total_tokens * hidden_dim);
+
+                    return output;
+                }
+            }
+        }
+    }
+
 cpu_path:
 #endif
 

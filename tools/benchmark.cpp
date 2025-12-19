@@ -4,6 +4,7 @@
 #include <vector>
 #include <numeric>
 #include <iomanip>
+#include <cstdlib>
 
 using namespace granite;
 using Clock = std::chrono::high_resolution_clock;
@@ -162,7 +163,7 @@ void benchmark_inference(const std::string& model_path, IComputeBackend* backend
     std::cout << std::string(45, '-') << "\n";
     std::cout << std::flush;
 
-    for (int64_t seq_len : {1, 2, 4}) {  // Skip longer sequences for now
+    for (int64_t seq_len : {32, 128, 256, 512}) {  // Match llama.cpp benchmark sizes
         std::cerr << "[DEBUG] Testing prefill seq_len=" << seq_len << "...\n" << std::flush;
         // Create token tensor
         std::vector<int64_t> shape = {1, seq_len};
@@ -341,7 +342,18 @@ void benchmark_memory(IComputeBackend* backend) {
 }
 
 int main(int argc, char* argv[]) {
-    granite::init_logging(spdlog::level::warn);
+    // Respect SPDLOG_LEVEL environment variable, default to warn
+    const char* log_level = std::getenv("SPDLOG_LEVEL");
+    if (log_level) {
+        std::string level_str(log_level);
+        if (level_str == "debug") granite::init_logging(spdlog::level::debug);
+        else if (level_str == "info") granite::init_logging(spdlog::level::info);
+        else if (level_str == "warn") granite::init_logging(spdlog::level::warn);
+        else if (level_str == "error") granite::init_logging(spdlog::level::err);
+        else granite::init_logging(spdlog::level::warn);
+    } else {
+        granite::init_logging(spdlog::level::warn);
+    }
 
     std::cout << "Granite Performance Benchmark\n";
     std::cout << "==============================\n";

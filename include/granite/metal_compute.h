@@ -311,6 +311,32 @@ public:
         float eps
     );
 
+    // Batched RMS Normalization with FP16 weights
+    // x: [batch_size, hidden_dim] input
+    // out: [batch_size, hidden_dim] output
+    // weight: [hidden_dim] broadcast across batch
+    Result<void> rms_norm_batch_f16(
+        MTL::Buffer* x,
+        MTL::Buffer* weight,  // FP16 weights [hidden_dim]
+        MTL::Buffer* out,
+        uint32_t batch_size,
+        uint32_t hidden_dim,
+        float eps
+    );
+
+    // Batched RMS Normalization with FP32 weights
+    // x: [batch_size, hidden_dim] input
+    // out: [batch_size, hidden_dim] output
+    // weight: [hidden_dim] broadcast across batch
+    Result<void> rms_norm_batch(
+        MTL::Buffer* x,
+        MTL::Buffer* weight,  // FP32 weights [hidden_dim]
+        MTL::Buffer* out,
+        uint32_t batch_size,
+        uint32_t hidden_dim,
+        float eps
+    );
+
     // SiLU activation (in-place)
     Result<void> silu(MTL::Buffer* x, uint32_t size);
 

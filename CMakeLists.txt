@@ -331,6 +331,10 @@ endif()
 add_executable(granite_benchmark tools/benchmark.cpp)
 target_link_libraries(granite_benchmark PRIVATE granite)
 
+add_executable(granite_detailed_bench tools/detailed_benchmark.mm)
+set_source_files_properties(tools/detailed_benchmark.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+target_link_libraries(granite_detailed_bench PRIVATE granite metal-cpp "-framework Metal" "-framework Foundation")
+
 add_executable(granite_tree_bench tools/benchmark_tree_batching.cpp)
 target_link_libraries(granite_tree_bench PRIVATE granite)
 

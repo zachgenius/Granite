@@ -3533,6 +3533,110 @@ kernel void rms_norm_f16(
     }
 }
 
+// Batched RMS norm with FP32 weights - processes M tokens of size N each
+// x: [M, N] input, out: [M, N] output, weight: [N] (broadcast)
+// One threadgroup per token (row)
+kernel void rms_norm_batch(
+    device const float* x          [[buffer(0)]],
+    device const float* weight     [[buffer(1)]],
+    device float* out              [[buffer(2)]],
+    constant uint& M               [[buffer(3)]],  // Batch size (num tokens)
+    constant uint& N               [[buffer(4)]],  // Hidden dim
+    constant float& eps            [[buffer(5)]],
+    uint tg_idx                    [[threadgroup_position_in_grid]],
+    uint tid                       [[thread_position_in_threadgroup]],
+    uint tg_size                   [[threads_per_threadgroup]]
+) {
+    if (tg_idx >= M) return;
+
+    // Pointer to this token's data
+    device const float* x_row = x + tg_idx * N;
+    device float* out_row = out + tg_idx * N;
+
+    threadgroup float shared_sum[256];
+
+    // Each thread sums multiple elements
+    float local_sum = 0.0f;
+    for (uint i = tid; i < N; i += tg_size) {
+        float val = x_row[i];
+        local_sum += val * val;
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Tree reduction
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Thread 0 computes inv_rms
+    threadgroup float inv_rms;
+    if (tid == 0) {
+        inv_rms = rsqrt(shared_sum[0] / float(N) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Each thread normalizes and scales its elements
+    for (uint i = tid; i < N; i += tg_size) {
+        out_row[i] = x_row[i] * inv_rms * weight[i];
+    }
+}
+
+// Batched RMS norm with FP16 weights - processes M tokens of size N each
+// x: [M, N] input, out: [M, N] output, weight: [N] (broadcast)
+// One threadgroup per token (row)
+kernel void rms_norm_batch_f16(
+    device const float* x          [[buffer(0)]],
+    device const half* weight      [[buffer(1)]],
+    device float* out              [[buffer(2)]],
+    constant uint& M               [[buffer(3)]],  // Batch size (num tokens)
+    constant uint& N               [[buffer(4)]],  // Hidden dim
+    constant float& eps            [[buffer(5)]],
+    uint tg_idx                    [[threadgroup_position_in_grid]],
+    uint tid                       [[thread_position_in_threadgroup]],
+    uint tg_size                   [[threads_per_threadgroup]]
+) {
+    if (tg_idx >= M) return;
+
+    // Pointer to this token's data
+    device const float* x_row = x + tg_idx * N;
+    device float* out_row = out + tg_idx * N;
+
+    threadgroup float shared_sum[256];
+
+    // Each thread sums multiple elements
+    float local_sum = 0.0f;
+    for (uint i = tid; i < N; i += tg_size) {
+        float val = x_row[i];
+        local_sum += val * val;
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Tree reduction
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Thread 0 computes inv_rms
+    threadgroup float inv_rms;
+    if (tid == 0) {
+        inv_rms = rsqrt(shared_sum[0] / float(N) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Each thread normalizes and scales its elements
+    for (uint i = tid; i < N; i += tg_size) {
+        out_row[i] = x_row[i] * inv_rms * float(weight[i]);
+    }
+}
+
 kernel void silu(
     device float* x                [[buffer(0)]],
     constant uint& size            [[buffer(1)]],
