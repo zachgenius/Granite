@@ -104,6 +104,9 @@ using namespace metal;
 // Super-block size for K-quants (Q4_K, Q6_K, Q5_K, Q3_K, Q2_K)
 constant constexpr uint QK_K = 256;
 
+// Metal doesn't have _Pragma in the same way, use [[ ]] attribute hints instead
+// Note: Metal uses unroll hints via [[unroll]] or just relies on compiler optimization
+
 // Simple quant block sizes
 constant constexpr uint QK8_0 = 32;  // Q8_0 block size
 
@@ -965,32 +968,64 @@ kernel void matmul_q4k_simdgroup(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Store weight tile with layout matching simdgroup_load expectations
-        // Layout: sa[512*sx + 64*sy + 8*ly + lx] where:
-        //   sx: K chunk (0..3), sy: N block (0..7), ly: K within chunk (0..7), lx: N within block (0..7)
-        for (short i = 0; i < 16; i++) {
-            const short sx = 2 * il0 + i / 8;       // K block index (0..3 for NK=32)
-            const short sy = lr0 / 8;               // N block index (0..7 for NR0=64)
-            const short lx = lr0 % 8;               // Within N block
-            const short ly = i % 8;                 // Within K block
-            const short ib = 8 * sx + sy;           // Combined block index
+        // Pre-compute loop-invariant values
+        const short sy_w = lr0 / 8;               // N block index (0..7 for NR0=64)
+        const short lx_w = lr0 % 8;               // Within N block
 
-            *(sa + 64 * ib + 8 * ly + lx) = temp_a[i / 4][i % 4];
+        // Unrolled stores with pre-computed indices
+        // First 8 elements (i=0..7): sx = 2*il0, varying ly = i%8
+        {
+            const short ib0 = 8 * (2 * il0) + sy_w;
+            threadgroup half* sa_dst = sa + 64 * ib0 + lx_w;
+            sa_dst[0]  = temp_a[0][0];  // i=0, ly=0
+            sa_dst[8]  = temp_a[0][1];  // i=1, ly=1
+            sa_dst[16] = temp_a[0][2];  // i=2, ly=2
+            sa_dst[24] = temp_a[0][3];  // i=3, ly=3
+            sa_dst[32] = temp_a[1][0];  // i=4, ly=4
+            sa_dst[40] = temp_a[1][1];  // i=5, ly=5
+            sa_dst[48] = temp_a[1][2];  // i=6, ly=6
+            sa_dst[56] = temp_a[1][3];  // i=7, ly=7
+        }
+        // Second 8 elements (i=8..15): sx = 2*il0+1, varying ly = i%8
+        {
+            const short ib1 = 8 * (2 * il0 + 1) + sy_w;
+            threadgroup half* sa_dst = sa + 64 * ib1 + lx_w;
+            sa_dst[0]  = temp_a[2][0];  // i=8,  ly=0
+            sa_dst[8]  = temp_a[2][1];  // i=9,  ly=1
+            sa_dst[16] = temp_a[2][2];  // i=10, ly=2
+            sa_dst[24] = temp_a[2][3];  // i=11, ly=3
+            sa_dst[32] = temp_a[3][0];  // i=12, ly=4
+            sa_dst[40] = temp_a[3][1];  // i=13, ly=5
+            sa_dst[48] = temp_a[3][2];  // i=14, ly=6
+            sa_dst[56] = temp_a[3][3];  // i=15, ly=7
         }
 
-        // Load input into sb
+        // Load input into sb - optimized with vectorized loads
         // Input X[m, k] for batch index m = r1 + lr1
         if (lr1 < nr1) {
+            // Pre-compute loop-invariant values
+            const short sx = tiitg % NL1;       // K block index
+            const short sy = lr1 / 8;           // M block index
+            const short ly = lr1 % 8;           // Within M block
+            const short ib = 4 * sx + sy;
+            threadgroup half* sb_dst = sb + 64 * ib + 8 * ly;
+
             device const float* x_ptr = X + (r1 + lr1) * K + loop_k + iy;
 
-            for (short i = 0; i < 8; ++i) {
-                const short sx = tiitg % NL1;       // K block index
-                const short sy = lr1 / 8;           // M block index
-                const short lx = i;                 // Within K block
-                const short ly = lr1 % 8;           // Within M block
-                const short ib = 4 * sx + sy;
-
-                half val = (loop_k + iy + i < K) ? half(x_ptr[i]) : half(0);
-                *(sb + 64 * ib + 8 * ly + lx) = val;
+            // Vectorized load and convert: read 8 floats as 2x float4, convert to half
+            if (loop_k + iy + 8 <= K) {
+                // Full vector load - no bounds checking needed
+                float4 v0 = *((device const float4*)(x_ptr));
+                float4 v1 = *((device const float4*)(x_ptr + 4));
+                half4 h0 = half4(v0);
+                half4 h1 = half4(v1);
+                *((threadgroup half4*)(sb_dst)) = h0;
+                *((threadgroup half4*)(sb_dst + 4)) = h1;
+            } else {
+                // Partial load with bounds checking
+                for (short i = 0; i < 8; ++i) {
+                    sb_dst[i] = (loop_k + iy + i < K) ? half(x_ptr[i]) : half(0);
+                }
             }
         }
 
@@ -1001,28 +1036,34 @@ kernel void matmul_q4k_simdgroup(
         threadgroup const half* lsma = sa + 4 * 64 * (sgitg % 2);  // Weight tiles
         threadgroup const half* lsmb = sb + 2 * 64 * (sgitg / 2);  // Input tiles
 
+        #pragma clang loop unroll(full)
         for (short ik = 0; ik < SGMM_NK / 8; ik++) {
             simdgroup_barrier(mem_flags::mem_none);
 
             // Load 4 weight 8x8 tiles (32 N rows)
-            for (short i = 0; i < 4; i++) {
-                simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
-            }
+            simdgroup_load(ma[0], lsma + 64 * 0, 8, 0, false);
+            simdgroup_load(ma[1], lsma + 64 * 1, 8, 0, false);
+            simdgroup_load(ma[2], lsma + 64 * 2, 8, 0, false);
+            simdgroup_load(ma[3], lsma + 64 * 3, 8, 0, false);
 
             simdgroup_barrier(mem_flags::mem_none);
 
             // Load 2 input 8x8 tiles (16 M rows)
-            for (short i = 0; i < 2; i++) {
-                simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
-            }
+            simdgroup_load(mb[0], lsmb + 64 * 0, 8, 0, false);
+            simdgroup_load(mb[1], lsmb + 64 * 1, 8, 0, false);
 
             simdgroup_barrier(mem_flags::mem_none);
 
             // Compute: mc[i] = mb[i/4] @ ma[i%4]
             // Result: 8 matrices of 8x8 covering 16x32 output
-            for (short i = 0; i < 8; i++) {
-                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
-            }
+            simdgroup_multiply_accumulate(mc[0], mb[0], ma[0], mc[0]);
+            simdgroup_multiply_accumulate(mc[1], mb[0], ma[1], mc[1]);
+            simdgroup_multiply_accumulate(mc[2], mb[0], ma[2], mc[2]);
+            simdgroup_multiply_accumulate(mc[3], mb[0], ma[3], mc[3]);
+            simdgroup_multiply_accumulate(mc[4], mb[1], ma[0], mc[4]);
+            simdgroup_multiply_accumulate(mc[5], mb[1], ma[1], mc[5]);
+            simdgroup_multiply_accumulate(mc[6], mb[1], ma[2], mc[6]);
+            simdgroup_multiply_accumulate(mc[7], mb[1], ma[3], mc[7]);
 
             lsma += 8 * 64;
             lsmb += 4 * 64;
@@ -1049,19 +1090,28 @@ kernel void matmul_q4k_simdgroup(
         // Y[sg_m + m_off, sg_n + n_off] = mc[...][m_local][n_local]
         device float* C = Y + sg_m * N + sg_n;
 
-        for (short i = 0; i < 8; i++) {
-            // i/4 gives M block (0 or 1 -> rows 0-7 or 8-15)
-            // i%4 gives N block (0-3 -> cols 0-7, 8-15, 16-23, 24-31)
-            simdgroup_store(mc[i], C + 8 * (i / 4) * N + 8 * (i % 4), N, 0, false);
-        }
+        // Unrolled stores: i/4 gives M block, i%4 gives N block
+        simdgroup_store(mc[0], C + 0 * N + 0,  N, 0, false);
+        simdgroup_store(mc[1], C + 0 * N + 8,  N, 0, false);
+        simdgroup_store(mc[2], C + 0 * N + 16, N, 0, false);
+        simdgroup_store(mc[3], C + 0 * N + 24, N, 0, false);
+        simdgroup_store(mc[4], C + 8 * N + 0,  N, 0, false);
+        simdgroup_store(mc[5], C + 8 * N + 8,  N, 0, false);
+        simdgroup_store(mc[6], C + 8 * N + 16, N, 0, false);
+        simdgroup_store(mc[7], C + 8 * N + 24, N, 0, false);
     } else {
         // Partial tile - use threadgroup memory as intermediate
         threadgroup float* sc = (threadgroup float*)(shmem);
 
         // Store all mc matrices to threadgroup memory with stride 8
-        for (short i = 0; i < 8; i++) {
-            simdgroup_store(mc[i], sc + 64 * i, 8, 0, false);
-        }
+        simdgroup_store(mc[0], sc + 64 * 0, 8, 0, false);
+        simdgroup_store(mc[1], sc + 64 * 1, 8, 0, false);
+        simdgroup_store(mc[2], sc + 64 * 2, 8, 0, false);
+        simdgroup_store(mc[3], sc + 64 * 3, 8, 0, false);
+        simdgroup_store(mc[4], sc + 64 * 4, 8, 0, false);
+        simdgroup_store(mc[5], sc + 64 * 5, 8, 0, false);
+        simdgroup_store(mc[6], sc + 64 * 6, 8, 0, false);
+        simdgroup_store(mc[7], sc + 64 * 7, 8, 0, false);
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 

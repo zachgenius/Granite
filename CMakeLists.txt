@@ -389,3 +389,8 @@ install(TARGETS granite
 install(DIRECTORY include/granite
     DESTINATION include
 )
+
+add_executable(benchmark_matmul_gpu tools/benchmark_matmul_gpu.mm)
+target_link_libraries(benchmark_matmul_gpu granite)
+target_include_directories(benchmark_matmul_gpu PRIVATE ${CMAKE_SOURCE_DIR}/src)
+

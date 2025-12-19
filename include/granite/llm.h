@@ -463,6 +463,24 @@ private:
 
     // Initialize decode buffer pool
     Result<void> init_decode_pool();
+
+    // Prefill buffer pool - preallocated buffers for batched prefill
+    struct PrefillBufferPool {
+        bool initialized = false;
+        int max_tokens = 0;  // Current capacity
+        // Attention-specific GPU buffers
+        void* q_buf = nullptr;       // [max_tokens * num_heads * head_dim]
+        void* k_buf = nullptr;       // [max_tokens * num_kv_heads * head_dim]
+        void* v_buf = nullptr;       // [max_tokens * num_kv_heads * head_dim]
+        void* attn_out_buf = nullptr; // [max_tokens * num_heads * head_dim]
+        // FFN-specific GPU buffers
+        void* ffn_gate_buf = nullptr; // [max_tokens * intermediate_dim]
+        void* ffn_up_buf = nullptr;   // [max_tokens * intermediate_dim]
+    };
+    std::unique_ptr<PrefillBufferPool> prefill_pool_;
+
+    // Initialize or resize prefill buffer pool
+    Result<void> ensure_prefill_pool(int num_tokens);
 #endif
 
     // Layer forward pass

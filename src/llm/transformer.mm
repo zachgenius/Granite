@@ -2382,23 +2382,31 @@ Result<Tensor> TransformerModel::feed_forward_gpu(const Tensor& hidden, int laye
         return feed_forward(hidden, layer);
     }
 
-    // Use pooled buffers for single-token decode, allocate for batched
-    bool use_ffn_pool = (total_tokens == 1) && decode_pool_ && decode_pool_->initialized &&
-                        decode_pool_->ffn_gate_buf && decode_pool_->ffn_up_buf;
+    // Use pooled buffers - decode pool for M=1, prefill pool for M>1
+    bool use_decode_pool = (total_tokens == 1) && decode_pool_ && decode_pool_->initialized &&
+                           decode_pool_->ffn_gate_buf && decode_pool_->ffn_up_buf;
+    bool use_prefill_pool = (total_tokens > 1) && prefill_pool_ && prefill_pool_->initialized &&
+                            prefill_pool_->max_tokens >= total_tokens;
 
     MTL::Buffer* gate_buf;
     MTL::Buffer* up_buf;
 
-    if (use_ffn_pool) {
+    if (use_decode_pool) {
         gate_buf = static_cast<MTL::Buffer*>(decode_pool_->ffn_gate_buf);
         up_buf = static_cast<MTL::Buffer*>(decode_pool_->ffn_up_buf);
+    } else if (use_prefill_pool) {
+        gate_buf = static_cast<MTL::Buffer*>(prefill_pool_->ffn_gate_buf);
+        up_buf = static_cast<MTL::Buffer*>(prefill_pool_->ffn_up_buf);
     } else {
+        // Fallback: allocate (should rarely happen if pools are initialized)
         gate_buf = gpu->create_buffer(total_tokens * intermediate_dim * sizeof(float));
         up_buf = gpu->create_buffer(total_tokens * intermediate_dim * sizeof(float));
     }
 
+    bool use_pool = use_decode_pool || use_prefill_pool;
+
     if (!gate_buf || !up_buf) {
-        if (!use_ffn_pool) {
+        if (!use_pool) {
             if (gate_buf) gate_buf->release();
             if (up_buf) up_buf->release();
         }
@@ -2466,7 +2474,7 @@ Result<Tensor> TransformerModel::feed_forward_gpu(const Tensor& hidden, int laye
     // The sync happens at the end of forward() or when results are needed
 
     // Clean up intermediate buffers (only if not using pool)
-    if (!use_ffn_pool) {
+    if (!use_pool) {
         gate_buf->release();
         up_buf->release();
     }
@@ -2569,6 +2577,57 @@ Result<void> TransformerModel::init_decode_pool() {
     decode_pool_->initialized = true;
 
     GRANITE_LOG_DEBUG("Decode buffer pool initialized");
+    return {};
+}
+
+// Initialize or resize prefill buffer pool
+Result<void> TransformerModel::ensure_prefill_pool(int num_tokens) {
+    auto* gpu = get_metal_compute();
+    if (!gpu || !gpu->is_initialized()) {
+        return {};  // No GPU, no pool needed
+    }
+
+    // Check if existing pool is sufficient
+    if (prefill_pool_ && prefill_pool_->initialized && prefill_pool_->max_tokens >= num_tokens) {
+        return {};  // Pool is large enough
+    }
+
+    // Release old pool if exists
+    if (prefill_pool_) {
+        if (prefill_pool_->q_buf) static_cast<MTL::Buffer*>(prefill_pool_->q_buf)->release();
+        if (prefill_pool_->k_buf) static_cast<MTL::Buffer*>(prefill_pool_->k_buf)->release();
+        if (prefill_pool_->v_buf) static_cast<MTL::Buffer*>(prefill_pool_->v_buf)->release();
+        if (prefill_pool_->attn_out_buf) static_cast<MTL::Buffer*>(prefill_pool_->attn_out_buf)->release();
+        if (prefill_pool_->ffn_gate_buf) static_cast<MTL::Buffer*>(prefill_pool_->ffn_gate_buf)->release();
+        if (prefill_pool_->ffn_up_buf) static_cast<MTL::Buffer*>(prefill_pool_->ffn_up_buf)->release();
+    } else {
+        prefill_pool_ = std::make_unique<PrefillBufferPool>();
+    }
+
+    // Allocate new buffers with extra headroom (round up to power of 2 for reuse)
+    int alloc_tokens = 64;
+    while (alloc_tokens < num_tokens) alloc_tokens *= 2;
+
+    int q_dim = model_config_.num_heads * model_config_.head_dim;
+    int kv_dim = model_config_.num_kv_heads * model_config_.head_dim;
+    int intermediate_dim = model_config_.intermediate_dim;
+
+    prefill_pool_->q_buf = gpu->create_buffer(alloc_tokens * q_dim * sizeof(float));
+    prefill_pool_->k_buf = gpu->create_buffer(alloc_tokens * kv_dim * sizeof(float));
+    prefill_pool_->v_buf = gpu->create_buffer(alloc_tokens * kv_dim * sizeof(float));
+    prefill_pool_->attn_out_buf = gpu->create_buffer(alloc_tokens * q_dim * sizeof(float));
+    prefill_pool_->ffn_gate_buf = gpu->create_buffer(alloc_tokens * intermediate_dim * sizeof(float));
+    prefill_pool_->ffn_up_buf = gpu->create_buffer(alloc_tokens * intermediate_dim * sizeof(float));
+
+    if (!prefill_pool_->q_buf || !prefill_pool_->k_buf || !prefill_pool_->v_buf ||
+        !prefill_pool_->attn_out_buf || !prefill_pool_->ffn_gate_buf || !prefill_pool_->ffn_up_buf) {
+        GRANITE_FAIL(ErrorCode::OutOfMemory, "Failed to allocate prefill buffer pool");
+    }
+
+    prefill_pool_->max_tokens = alloc_tokens;
+    prefill_pool_->initialized = true;
+
+    GRANITE_LOG_DEBUG("Prefill buffer pool initialized with {} token capacity", alloc_tokens);
     return {};
 }
 
@@ -2989,11 +3048,16 @@ Result<Tensor> TransformerModel::attention_gpu(
                 auto* k_cache_buf = static_cast<MTL::Buffer*>(layer_cache.k_cache);
                 auto* v_cache_buf = static_cast<MTL::Buffer*>(layer_cache.v_cache);
 
-                // Allocate temporary buffers for Q, K, V
-                MTL::Buffer* q_buf = gpu->create_buffer(total_tokens * q_dim * sizeof(float));
-                MTL::Buffer* k_buf = gpu->create_buffer(total_tokens * kv_dim * sizeof(float));
-                MTL::Buffer* v_buf = gpu->create_buffer(total_tokens * kv_dim * sizeof(float));
-                MTL::Buffer* attn_out_buf = gpu->create_buffer(total_tokens * q_dim * sizeof(float));
+                // Use prefill buffer pool (allocated once, reused across layers)
+                auto pool_result = ensure_prefill_pool(total_tokens);
+                if (!pool_result.ok()) {
+                    return pool_result.error();
+                }
+
+                MTL::Buffer* q_buf = static_cast<MTL::Buffer*>(prefill_pool_->q_buf);
+                MTL::Buffer* k_buf = static_cast<MTL::Buffer*>(prefill_pool_->k_buf);
+                MTL::Buffer* v_buf = static_cast<MTL::Buffer*>(prefill_pool_->v_buf);
+                MTL::Buffer* attn_out_buf = static_cast<MTL::Buffer*>(prefill_pool_->attn_out_buf);
 
                 if (q_buf && k_buf && v_buf && attn_out_buf) {
                     // Helper lambda to dispatch matmul based on weight's quantization type
@@ -3067,21 +3131,13 @@ Result<Tensor> TransformerModel::attention_gpu(
                         // NOTE: Don't sync here - let operations batch across layers
                         // Sync happens in forward() at the end of all layers
 
-                        // Cleanup temp buffers
-                        q_buf->release();
-                        k_buf->release();
-                        v_buf->release();
-                        attn_out_buf->release();
+                        // Buffers are from pool - don't release
 
                         return output;
                     }
                 }
 
-                // Cleanup on failure
-                if (q_buf) q_buf->release();
-                if (k_buf) k_buf->release();
-                if (v_buf) v_buf->release();
-                if (attn_out_buf) attn_out_buf->release();
+                // Buffers are from pool - don't release on failure either
             }
         }
     }
