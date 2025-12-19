@@ -326,21 +326,6 @@ Result<Tensor> TransformerModel::forward(
     }
     auto hidden = std::move(hidden_result).take();
 
-    // DEBUG: Check embedding
-    {
-        auto* gpu = get_metal_compute();
-        if (gpu) gpu->sync();
-        auto map_h = backend_->map_buffer(hidden.buffer());
-        if (map_h.ok()) {
-            auto* h = static_cast<const float*>(map_h.value());
-            if (start_pos >= 2) {
-                GRANITE_LOG_INFO("EMBED sp={} first4=[{:.6f},{:.6f},{:.6f},{:.6f}]",
-                    start_pos, h[0], h[1], h[2], h[3]);
-            }
-            backend_->unmap_buffer(hidden.buffer());
-        }
-    }
-
     // Process through transformer layers
     for (int layer = 0; layer < model_config_.num_layers; layer++) {
         auto block_result = transformer_block(hidden, layer, kv_cache, start_pos);
@@ -348,25 +333,6 @@ Result<Tensor> TransformerModel::forward(
             return block_result.error();
         }
         hidden = std::move(block_result).take();
-
-        // DEBUG: Check for NaN after each layer
-        if (start_pos >= 2 && layer == 0) {
-            auto* gpu = get_metal_compute();
-            if (gpu) gpu->sync();
-            auto map_h = backend_->map_buffer(hidden.buffer());
-            if (map_h.ok()) {
-                auto* h = static_cast<const float*>(map_h.value());
-                bool has_nan = std::isnan(h[0]) || std::isnan(h[1]);
-                if (has_nan) {
-                    GRANITE_LOG_ERROR("NaN after L0! sp={} vals=[{},{},{},{}]",
-                        start_pos, h[0], h[1], h[2], h[3]);
-                } else {
-                    GRANITE_LOG_INFO("L0 OK sp={} vals=[{:.4f},{:.4f},{:.4f},{:.4f}]",
-                        start_pos, h[0], h[1], h[2], h[3]);
-                }
-                backend_->unmap_buffer(hidden.buffer());
-            }
-        }
     }
 
     // Final RMSNorm and output projection
@@ -915,41 +881,16 @@ Result<Tensor> TransformerModel::transformer_block(
                                  hidden_dim, model_config_.rms_norm_eps);
                 }
 
-                // DEBUG: Check after RMSNorm
-                if (layer == 0 && start_pos >= 2) {
-                    gpu->sync();
-                    auto* norm_out = static_cast<float*>(attn_in_buf->contents());
-                    GRANITE_LOG_INFO("TB_NORM sp={} vals=[{:.4f},{:.4f},{:.4f},{:.4f}]",
-                        start_pos, norm_out[0], norm_out[1], norm_out[2], norm_out[3]);
-                }
-
                 // 2. GPU Attention
                 auto attn_result = attention_gpu(attn_input, layer, kv_cache, start_pos);
                 if (!attn_result.ok()) {
                     return attn_result.error();
                 }
                 auto attn_output = std::move(attn_result).take();
-
-                // DEBUG: Check after attention
-                if (layer == 0 && start_pos >= 2) {
-                    gpu->sync();
-                    auto* attn_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(attn_output.buffer()));
-                    auto* attn_out_ptr = static_cast<float*>(attn_buf->contents());
-                    GRANITE_LOG_INFO("TB_ATTN sp={} vals=[{:.4f},{:.4f},{:.4f},{:.4f}]",
-                        start_pos, attn_out_ptr[0], attn_out_ptr[1], attn_out_ptr[2], attn_out_ptr[3]);
-                }
                 auto* attn_out_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(attn_output.buffer()));
 
                 // 3. GPU Residual add: post_attn = hidden + attn_output
                 gpu->elementwise_add(h_buf, attn_out_buf, post_attn_buf, hidden_dim);
-
-                // DEBUG: Check after residual add
-                if (layer == 0 && start_pos >= 2) {
-                    gpu->sync();
-                    auto* post_attn_ptr = static_cast<float*>(post_attn_buf->contents());
-                    GRANITE_LOG_INFO("TB_RES sp={} vals=[{:.4f},{:.4f},{:.4f},{:.4f}]",
-                        start_pos, post_attn_ptr[0], post_attn_ptr[1], post_attn_ptr[2], post_attn_ptr[3]);
-                }
 
                 // 4+5. FUSED GPU Feed Forward using rms_norm_matvec_q4k
                 // This eliminates the intermediate normalized buffer by fusing
@@ -957,15 +898,6 @@ Result<Tensor> TransformerModel::transformer_block(
                 const RawWeight* w_gate = get_raw_weight(prefix + "ffn_gate.weight");
                 const RawWeight* w_up = get_raw_weight(prefix + "ffn_up.weight");
                 const RawWeight* w_down = get_raw_weight(prefix + "ffn_down.weight");
-
-                // DEBUG: Check FFN weight types and can_fuse
-                if (layer == 0 && start_pos >= 2) {
-                    GRANITE_LOG_INFO("FFN_WEIGHTS layer={} sp={} gate_type={} up_type={} down_type={}",
-                        layer, start_pos,
-                        w_gate ? static_cast<int>(w_gate->quant_type) : -1,
-                        w_up ? static_cast<int>(w_up->quant_type) : -1,
-                        w_down ? static_cast<int>(w_down->quant_type) : -1);
-                }
 
                 // Check if we can use fused kernels (need Q4_K/Q6_K/Q5_K/Q3_K/Q2_K/Q8_0/Q4_0/IQ4_NL/IQ4_XS/IQ3_S weights and FP16 norm)
                 bool can_fuse = w_gate && w_up && w_down &&
@@ -981,12 +913,6 @@ Result<Tensor> TransformerModel::transformer_block(
                                 w_gate->quant_type == GGMLType::IQ3_S) &&
                                ffn_norm_weight->dtype() == DataType::FP16;
                 GGMLType fused_qtype = can_fuse ? w_gate->quant_type : GGMLType::F32;
-
-                // DEBUG: Check can_fuse and fused_qtype
-                if (layer == 0 && start_pos >= 2) {
-                    GRANITE_LOG_INFO("FFN_FUSE sp={} can_fuse={} fused_qtype={}",
-                        start_pos, can_fuse, static_cast<int>(fused_qtype));
-                }
 
                 Tensor ffn_output;
                 bool residual_fused = false;  // Track if residual was fused into down projection
@@ -1016,11 +942,6 @@ Result<Tensor> TransformerModel::transformer_block(
                     bool will_fuse_residual = (down_qtype == GGMLType::Q4_K ||
                                                down_qtype == GGMLType::Q3_K ||
                                                down_qtype == GGMLType::Q2_K);
-                    // DEBUG
-                    if (layer == 0 && start_pos >= 2) {
-                        GRANITE_LOG_INFO("FFN_PATH sp={} down_qtype={} will_fuse_residual={}",
-                            start_pos, static_cast<int>(down_qtype), will_fuse_residual);
-                    }
 
                     // Only allocate FFN output for non-fused residual paths
                     MTL::Buffer* ffn_out_buf = nullptr;
@@ -1106,21 +1027,7 @@ Result<Tensor> TransformerModel::transformer_block(
                     } else if (down_qtype == GGMLType::IQ3_S) {
                         gpu->matvec_iq3_s(gate_buf, wd_buf, ffn_out_buf, model_config_.intermediate_dim, hidden_dim);
                     } else if (down_qtype == GGMLType::Q6_K) {
-                        // DEBUG: trace Q6_K down projection
-                        if (layer == 0 && start_pos >= 2) {
-                            gpu->sync();
-                            auto* gate_ptr = static_cast<float*>(gate_buf->contents());
-                            GRANITE_LOG_INFO("FFN_DOWN Q6_K sp={} gate[0..3]=[{:.4f},{:.4f},{:.4f},{:.4f}]",
-                                start_pos, gate_ptr[0], gate_ptr[1], gate_ptr[2], gate_ptr[3]);
-                        }
                         gpu->matvec_q6_k(gate_buf, wd_buf, ffn_out_buf, model_config_.intermediate_dim, hidden_dim);
-                        // DEBUG: trace output
-                        if (layer == 0 && start_pos >= 2) {
-                            gpu->sync();
-                            auto* ffn_ptr = static_cast<float*>(ffn_out_buf->contents());
-                            GRANITE_LOG_INFO("FFN_OUT Q6_K sp={} out[0..3]=[{:.4f},{:.4f},{:.4f},{:.4f}]",
-                                start_pos, ffn_ptr[0], ffn_ptr[1], ffn_ptr[2], ffn_ptr[3]);
-                        }
                     } else if (down_qtype == GGMLType::Q5_K) {
                         gpu->matvec_q5_k(gate_buf, wd_buf, ffn_out_buf, model_config_.intermediate_dim, hidden_dim);
                     } else if (down_qtype == GGMLType::Q3_K) {
@@ -1178,21 +1085,12 @@ Result<Tensor> TransformerModel::transformer_block(
     }
 
     // GPU PREFILL PATH: For multi-token prefill (seq_len > 1)
-    if (layer == 0) {
-        GRANITE_LOG_INFO("PREFILL_CHECK layer={} is_decode={} use_gpu_={} total_tokens={}",
-            layer, is_decode, use_gpu_, total_tokens);
-    }
     if (!is_decode && use_gpu_) {
         auto* gpu = get_metal_compute();
         if (gpu && gpu->is_initialized() && attn_norm_weight && ffn_norm_weight) {
             // Check if weights are FP16 (most common for GGUF models)
             bool attn_norm_f16 = (attn_norm_weight->dtype() == DataType::FP16);
             bool ffn_norm_f16 = (ffn_norm_weight->dtype() == DataType::FP16);
-
-            if (layer == 0) {
-                GRANITE_LOG_INFO("GPU_PREFILL layer={} total_tokens={} attn_f16={} ffn_f16={}",
-                    layer, total_tokens, attn_norm_f16, ffn_norm_f16);
-            }
 
             // GPU prefill supports both FP16 and FP32 norm weights
             // Get Metal buffers for hidden and norm weights
@@ -2843,26 +2741,9 @@ Result<Tensor> TransformerModel::attention_full_gpu(
     dispatch_matvec(h_buf, wk_buf, k_buf, raw_wk->quant_type, hidden_dim, kv_dim);
     dispatch_matvec(h_buf, wv_buf, v_buf, raw_wv->quant_type, hidden_dim, kv_dim);
 
-    // DEBUG: Check Q,K,V after projection
-    if (layer == 0) {
-        gpu->sync();
-        auto* q_ptr = static_cast<float*>(q_buf->contents());
-        auto* k_ptr = static_cast<float*>(k_buf->contents());
-        GRANITE_LOG_INFO("ATTN_QKV sp={} Q=[{:.4f},{:.4f}] K=[{:.4f},{:.4f}]",
-            start_pos, q_ptr[0], q_ptr[1], k_ptr[0], k_ptr[1]);
-    }
-
     // 2. Apply RoPE to Q and K
     gpu->rope_multihead(q_buf, k_buf, num_heads, num_kv_heads, 1, head_dim,
                         start_pos, model_config_.rope_theta);
-
-    // DEBUG: Check Q after RoPE
-    if (layer == 0) {
-        gpu->sync();
-        auto* q_ptr = static_cast<float*>(q_buf->contents());
-        GRANITE_LOG_INFO("ATTN_ROPE sp={} Q=[{:.4f},{:.4f}]",
-            start_pos, q_ptr[0], q_ptr[1]);
-    }
 
     // 3. Append new K/V to cache
     gpu->kv_cache_append(
@@ -2911,18 +2792,6 @@ Result<Tensor> TransformerModel::attention_full_gpu(
     } else
 #endif
     {
-        // DEBUG: Before multihead_attention - now KV cache is shared, can read from CPU
-        if (layer == 0) {
-            gpu->sync();
-            auto* q_ptr = static_cast<float*>(q_buf->contents());
-            auto* k_ptr = static_cast<__fp16*>(k_cache_buf->contents());
-            auto* v_ptr = static_cast<__fp16*>(v_cache_buf->contents());
-            GRANITE_LOG_INFO("BEFORE_MHA layer={} sp={} total_seq={} Q[0..3]=[{:.4f},{:.4f},{:.4f},{:.4f}]",
-                layer, start_pos, total_seq, q_ptr[0], q_ptr[1], q_ptr[2], q_ptr[3]);
-            GRANITE_LOG_INFO("  K_cache[0..3]=[{:.4f},{:.4f},{:.4f},{:.4f}] V_cache[0..3]=[{:.4f},{:.4f},{:.4f},{:.4f}]",
-                (float)k_ptr[0], (float)k_ptr[1], (float)k_ptr[2], (float)k_ptr[3],
-                (float)v_ptr[0], (float)v_ptr[1], (float)v_ptr[2], (float)v_ptr[3]);
-        }
         // Standard Metal GPU attention
         gpu->multihead_attention(
             q_buf,
@@ -2938,39 +2807,8 @@ Result<Tensor> TransformerModel::attention_full_gpu(
         );
     }
 
-    // DEBUG: Check attn_out after multihead_attention (simplified)
-    if (layer == 0) {
-        GRANITE_LOG_INFO("AFTER_MHA layer={} sp={}", layer, start_pos);
-        gpu->sync();
-        auto* attn_ptr = static_cast<float*>(attn_out_buf->contents());
-        GRANITE_LOG_INFO("ATTN_OUT sp={} vals=[{:.4f},{:.4f},{:.4f},{:.4f}]",
-            start_pos, attn_ptr[0], attn_ptr[1], attn_ptr[2], attn_ptr[3]);
-    }
-
     // 5. Output projection - use Wo's actual quantization type
-    if (layer == 0) {
-        gpu->sync();
-        GRANITE_LOG_INFO("WO_PROJ sp={} wo_type={} q_dim={} hidden_dim={} use_pool={}",
-            start_pos, static_cast<int>(raw_wo->quant_type), q_dim, hidden_dim, use_pool);
-        // Print first few bytes of wo_buf to check if weight is corrupted
-        auto* wo_ptr = static_cast<uint8_t*>(wo_buf->contents());
-        GRANITE_LOG_INFO("  WO_BYTES[0..7]=[{},{},{},{},{},{},{},{}]",
-            wo_ptr[0], wo_ptr[1], wo_ptr[2], wo_ptr[3],
-            wo_ptr[4], wo_ptr[5], wo_ptr[6], wo_ptr[7]);
-        // Print attn_out_buf input to matvec
-        auto* attn_ptr2 = static_cast<float*>(attn_out_buf->contents());
-        GRANITE_LOG_INFO("  ATTN_IN[0..3]=[{:.6f},{:.6f},{:.6f},{:.6f}]",
-            attn_ptr2[0], attn_ptr2[1], attn_ptr2[2], attn_ptr2[3]);
-    }
     dispatch_matvec(attn_out_buf, wo_buf, o_buf, raw_wo->quant_type, q_dim, hidden_dim);
-
-    // DEBUG: Check output right after Wo projection
-    if (layer == 0) {
-        gpu->sync();
-        auto* o_ptr = static_cast<float*>(o_buf->contents());
-        GRANITE_LOG_INFO("WO_OUT sp={} vals=[{:.4f},{:.4f},{:.4f},{:.4f}]",
-            start_pos, o_ptr[0], o_ptr[1], o_ptr[2], o_ptr[3]);
-    }
 
     // Only sync at the end - NOT here, let caller sync
     // gpu->sync();  // Removed - caller will sync
@@ -3132,30 +2970,9 @@ Result<Tensor> TransformerModel::attention_gpu(
                     dispatch_matmul(h_buf, wk_buf, k_buf, raw_wk->quant_type, total_tokens, hidden_dim, kv_dim);
                     dispatch_matmul(h_buf, wv_buf, v_buf, raw_wv->quant_type, total_tokens, hidden_dim, kv_dim);
 
-                    // DEBUG: Check V right after projection (before RoPE)
-                    if (layer == 0) {
-                        gpu->sync();
-                        GRANITE_LOG_INFO("BUFFERS: q_buf={} k_buf={} v_buf={}", (void*)q_buf, (void*)k_buf, (void*)v_buf);
-                        auto* k_ptr = static_cast<float*>(k_buf->contents());
-                        auto* v_ptr = static_cast<float*>(v_buf->contents());
-                        GRANITE_LOG_INFO("K_PROJ layer=0 K[0..3]=[{:.4f},{:.4f},{:.4f},{:.4f}]",
-                            k_ptr[0], k_ptr[1], k_ptr[2], k_ptr[3]);
-                        GRANITE_LOG_INFO("V_PROJ layer=0 V[0..3]=[{:.4f},{:.4f},{:.4f},{:.4f}]",
-                            v_ptr[0], v_ptr[1], v_ptr[2], v_ptr[3]);
-                    }
-
                     // 2. Apply RoPE to Q and K (batched)
                     gpu->rope_multihead(q_buf, k_buf, num_heads, num_kv_heads, total_tokens, head_dim,
                                         start_pos, model_config_.rope_theta);
-
-                    // DEBUG: Check K and V before append
-                    if (layer == 0) {
-                        gpu->sync();
-                        auto* k_ptr = static_cast<float*>(k_buf->contents());
-                        auto* v_ptr = static_cast<float*>(v_buf->contents());
-                        GRANITE_LOG_INFO("PREFILL_KV layer=0 K[0..3]=[{:.4f},{:.4f},{:.4f},{:.4f}] V[0..3]=[{:.4f},{:.4f},{:.4f},{:.4f}]",
-                            k_ptr[0], k_ptr[1], k_ptr[2], k_ptr[3], v_ptr[0], v_ptr[1], v_ptr[2], v_ptr[3]);
-                    }
 
                     // 3. Append K/V to FP16 cache (kv_cache_append uses FP16 by default)
                     gpu->kv_cache_append(
@@ -3196,14 +3013,6 @@ Result<Tensor> TransformerModel::attention_gpu(
                             if (kv_cache) {
                                 kv_cache->set_seq_len(total_tokens);
                             }
-                            // DEBUG: Verify KV cache content after prefill
-                            gpu->sync();
-                            auto* k_ptr = static_cast<__fp16*>(k_cache_buf->contents());
-                            auto* v_ptr = static_cast<__fp16*>(v_cache_buf->contents());
-                            GRANITE_LOG_INFO("PREFILL_DONE layer={} total_tokens={} K[0..3]=[{:.4f},{:.4f},{:.4f},{:.4f}]",
-                                layer, total_tokens, (float)k_ptr[0], (float)k_ptr[1], (float)k_ptr[2], (float)k_ptr[3]);
-                            GRANITE_LOG_INFO("  V[0..3]=[{:.4f},{:.4f},{:.4f},{:.4f}]",
-                                (float)v_ptr[0], (float)v_ptr[1], (float)v_ptr[2], (float)v_ptr[3]);
                         }
 
                         // NOTE: Don't sync here - let operations batch across layers
