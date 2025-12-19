@@ -468,6 +468,9 @@ private:
     struct PrefillBufferPool {
         bool initialized = false;
         int max_tokens = 0;  // Current capacity
+        // Input buffers
+        void* token_ids_buf = nullptr;   // [max_tokens] INT32 - token IDs
+        void* hidden_buf = nullptr;      // [max_tokens * hidden_dim] - embedding output / layer input
         // Transformer block intermediate buffers (reused across layers)
         void* attn_input_buf = nullptr;  // [max_tokens * hidden_dim] - RMSNorm output
         void* post_attn_buf = nullptr;   // [max_tokens * hidden_dim] - residual after attention
@@ -481,6 +484,9 @@ private:
         // FFN-specific GPU buffers
         void* ffn_gate_buf = nullptr; // [max_tokens * intermediate_dim]
         void* ffn_up_buf = nullptr;   // [max_tokens * intermediate_dim]
+        // Output buffers
+        void* norm_out_buf = nullptr;    // [max_tokens * hidden_dim] - final RMSNorm output
+        void* logits_buf = nullptr;      // [max_tokens * vocab_size] - output logits
     };
     std::unique_ptr<PrefillBufferPool> prefill_pool_;
 
@@ -520,6 +526,23 @@ private:
         const Tensor& hidden,
         int layer,
         int start_pos);
+
+    // =========================================================================
+    // Raw Buffer Prefill Path (bypasses Tensor abstraction for performance)
+    // =========================================================================
+
+    // Forward pass using raw buffers - returns logits buffer directly
+    // This is the fast path that avoids Tensor allocation overhead
+    Result<void*> forward_prefill_raw(
+        const std::vector<int>& tokens,
+        KVCache* kv_cache);
+
+    // Single layer forward with raw buffers
+    // hidden_buf is both input and output (in-place update)
+    Result<void> transformer_block_prefill_raw(
+        void* hidden_buf,      // [num_tokens * hidden_dim] FP32
+        int layer,
+        int num_tokens);
 
     // Tree attention for speculative decoding
     // tree_mask[i][j] = true if node i can attend to node j

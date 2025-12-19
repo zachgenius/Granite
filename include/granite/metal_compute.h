@@ -831,6 +831,23 @@ public:
     // Create a Metal buffer
     MTL::Buffer* create_buffer(size_t size, bool shared = true);
 
+    // =============================================================================
+    // Batched Encoding API (for prefill optimization)
+    // =============================================================================
+    // These methods expose raw Metal encoder access for tight-loop encoding
+    // that minimizes CPU overhead. Use begin_batch/end_batch to wrap encoding.
+
+    // Begin batched encoding - returns raw encoder for direct use
+    // The encoder is valid until end_batch() is called
+    void* begin_batch();
+
+    // End batched encoding and sync
+    void end_batch();
+
+    // Get pre-cached pipeline state by name (for tight-loop encoding)
+    // Returns MTL::ComputePipelineState* or nullptr if not found
+    void* get_pipeline(const char* name);
+
 private:
     class Impl;
     Impl* impl_ = nullptr;

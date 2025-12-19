@@ -1823,7 +1823,25 @@ Result<void> MetalCompute::batched_paged_attention_decode(
 
 
 // =============================================================================
-// SECTION 8: Global Singleton
+// SECTION 8: Batched Encoding API
+// =============================================================================
+
+void* MetalCompute::begin_batch() {
+    // Return raw encoder for tight-loop encoding
+    return static_cast<void*>(impl_->get_encoder());
+}
+
+void MetalCompute::end_batch() {
+    sync();
+}
+
+void* MetalCompute::get_pipeline(const char* name) {
+    return static_cast<void*>(impl_->get_pipeline(name));
+}
+
+
+// =============================================================================
+// SECTION 9: Global Singleton
 // =============================================================================
 
 static std::unique_ptr<MetalCompute> g_metal_compute;
