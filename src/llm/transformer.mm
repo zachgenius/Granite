@@ -3026,36 +3026,31 @@ Result<void*> TransformerModel::forward_prefill_raw(
     // =========================================================================
     // TRANSFORMER LAYERS (all encoded in one tight loop)
     // =========================================================================
+    // Initialize layer weight cache if not already done (eliminates hash lookups)
+    if (!layer_cache_initialized_) {
+        init_layer_weight_cache();
+    }
+
     for (int layer = 0; layer < model_config_.num_layers; layer++) {
-        std::string prefix = "blk." + std::to_string(layer) + ".";
+        // Use pre-cached layer weights (zero hash lookups, zero string formatting)
+        const auto& wc = layer_weight_cache_[layer];
 
-        // Get layer weights
-        const Tensor* attn_norm_w = get_weight(prefix + "attn_norm.weight");
-        const Tensor* ffn_norm_w = get_weight(prefix + "ffn_norm.weight");
-        const RawWeight* raw_wq = get_raw_weight(prefix + "attn_q.weight");
-        const RawWeight* raw_wk = get_raw_weight(prefix + "attn_k.weight");
-        const RawWeight* raw_wv = get_raw_weight(prefix + "attn_v.weight");
-        const RawWeight* raw_wo = get_raw_weight(prefix + "attn_output.weight");
-        const RawWeight* raw_wgate = get_raw_weight(prefix + "ffn_gate.weight");
-        const RawWeight* raw_wup = get_raw_weight(prefix + "ffn_up.weight");
-        const RawWeight* raw_wdown = get_raw_weight(prefix + "ffn_down.weight");
-
-        auto* attn_norm_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(attn_norm_w->buffer()));
-        auto* ffn_norm_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(ffn_norm_w->buffer()));
-        auto* wq_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_wq->buffer));
-        auto* wk_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_wk->buffer));
-        auto* wv_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_wv->buffer));
-        auto* wo_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_wo->buffer));
-        auto* wgate_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_wgate->buffer));
-        auto* wup_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_wup->buffer));
-        auto* wdown_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_wdown->buffer));
+        auto* attn_norm_buf = static_cast<MTL::Buffer*>(wc.attn_norm_buf);
+        auto* ffn_norm_buf = static_cast<MTL::Buffer*>(wc.ffn_norm_buf);
+        auto* wq_buf = static_cast<MTL::Buffer*>(wc.wq_buf);
+        auto* wk_buf = static_cast<MTL::Buffer*>(wc.wk_buf);
+        auto* wv_buf = static_cast<MTL::Buffer*>(wc.wv_buf);
+        auto* wo_buf = static_cast<MTL::Buffer*>(wc.wo_buf);
+        auto* wgate_buf = static_cast<MTL::Buffer*>(wc.wgate_buf);
+        auto* wup_buf = static_cast<MTL::Buffer*>(wc.wup_buf);
+        auto* wdown_buf = static_cast<MTL::Buffer*>(wc.wdown_buf);
 
         auto& lc = gpu_kv_cache_->layers[layer];
         auto* k_cache_buf = static_cast<MTL::Buffer*>(lc.k_cache);
         auto* v_cache_buf = static_cast<MTL::Buffer*>(lc.v_cache);
 
-        bool attn_f16 = (attn_norm_w->dtype() == DataType::FP16);
-        bool ffn_f16 = (ffn_norm_w->dtype() == DataType::FP16);
+        bool attn_f16 = wc.attn_norm_f16;
+        bool ffn_f16 = wc.ffn_norm_f16;
 
         // ---------------------------------------------------------------------
         // 1. Attention RMSNorm
@@ -3823,6 +3818,50 @@ Result<Tensor> TransformerModel::attention_gpu(
     return attention(hidden, layer, kv_cache, start_pos);
 }
 
+void TransformerModel::init_layer_weight_cache() {
+    if (layer_cache_initialized_) return;
+
+    int num_layers = model_config_.num_layers;
+    layer_weight_cache_.resize(num_layers);
+
+    for (int layer = 0; layer < num_layers; layer++) {
+        std::string prefix = "blk." + std::to_string(layer) + ".";
+        auto& cache = layer_weight_cache_[layer];
+
+        // Get norm weights
+        const Tensor* attn_norm_w = get_weight(prefix + "attn_norm.weight");
+        const Tensor* ffn_norm_w = get_weight(prefix + "ffn_norm.weight");
+
+        if (attn_norm_w) {
+            cache.attn_norm_buf = backend_->get_native_buffer(attn_norm_w->buffer());
+            cache.attn_norm_f16 = (attn_norm_w->dtype() == DataType::FP16);
+        }
+        if (ffn_norm_w) {
+            cache.ffn_norm_buf = backend_->get_native_buffer(ffn_norm_w->buffer());
+            cache.ffn_norm_f16 = (ffn_norm_w->dtype() == DataType::FP16);
+        }
+
+        // Get raw quantized weights
+        const RawWeight* raw_wq = get_raw_weight(prefix + "attn_q.weight");
+        const RawWeight* raw_wk = get_raw_weight(prefix + "attn_k.weight");
+        const RawWeight* raw_wv = get_raw_weight(prefix + "attn_v.weight");
+        const RawWeight* raw_wo = get_raw_weight(prefix + "attn_output.weight");
+        const RawWeight* raw_wgate = get_raw_weight(prefix + "ffn_gate.weight");
+        const RawWeight* raw_wup = get_raw_weight(prefix + "ffn_up.weight");
+        const RawWeight* raw_wdown = get_raw_weight(prefix + "ffn_down.weight");
+
+        if (raw_wq) cache.wq_buf = backend_->get_native_buffer(raw_wq->buffer);
+        if (raw_wk) cache.wk_buf = backend_->get_native_buffer(raw_wk->buffer);
+        if (raw_wv) cache.wv_buf = backend_->get_native_buffer(raw_wv->buffer);
+        if (raw_wo) cache.wo_buf = backend_->get_native_buffer(raw_wo->buffer);
+        if (raw_wgate) cache.wgate_buf = backend_->get_native_buffer(raw_wgate->buffer);
+        if (raw_wup) cache.wup_buf = backend_->get_native_buffer(raw_wup->buffer);
+        if (raw_wdown) cache.wdown_buf = backend_->get_native_buffer(raw_wdown->buffer);
+    }
+
+    layer_cache_initialized_ = true;
+}
+
 #else
 // Non-Metal stubs
 Result<Tensor> TransformerModel::feed_forward_gpu(const Tensor& hidden, int layer) {
@@ -3844,6 +3883,10 @@ Result<Tensor> TransformerModel::attention_gpu(
 {
     return attention(hidden, layer, kv_cache, start_pos);
 }
-#endif
+
+void TransformerModel::init_layer_weight_cache() {
+    // Non-Metal: no-op since raw prefill path is Metal-only
+}
+#endif  // GRANITE_HAS_METAL
 
 }  // namespace granite

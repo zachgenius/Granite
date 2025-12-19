@@ -492,6 +492,29 @@ private:
 
     // Initialize or resize prefill buffer pool
     Result<void> ensure_prefill_pool(int num_tokens);
+
+    // Pre-cached layer weight buffers for zero-overhead prefill
+    // Eliminates hash table lookups and string formatting during layer loop
+    struct LayerWeightCache {
+        // Norm weights (as MTL::Buffer*)
+        void* attn_norm_buf = nullptr;
+        void* ffn_norm_buf = nullptr;
+        bool attn_norm_f16 = false;
+        bool ffn_norm_f16 = false;
+        // Projection weights (as MTL::Buffer* to raw quantized data)
+        void* wq_buf = nullptr;
+        void* wk_buf = nullptr;
+        void* wv_buf = nullptr;
+        void* wo_buf = nullptr;
+        void* wgate_buf = nullptr;
+        void* wup_buf = nullptr;
+        void* wdown_buf = nullptr;
+    };
+    std::vector<LayerWeightCache> layer_weight_cache_;
+    bool layer_cache_initialized_ = false;
+
+    // Initialize layer weight cache (call once after model load)
+    void init_layer_weight_cache();
 #endif
 
     // Layer forward pass
