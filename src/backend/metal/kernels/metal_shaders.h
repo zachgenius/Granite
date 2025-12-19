@@ -3433,6 +3433,78 @@ kernel void matvec_f16(
     }
 }
 
+// Batched FP16 matmul: Y = X @ W^T where X is [M,K] float, W is [N,K] half
+// Each thread computes one output element
+kernel void matmul_f16(
+    device const float* X          [[buffer(0)]],
+    device const half* W           [[buffer(1)]],
+    device float* Y                [[buffer(2)]],
+    constant uint& M               [[buffer(3)]],
+    constant uint& K               [[buffer(4)]],
+    constant uint& N               [[buffer(5)]],
+    uint2 gid                      [[thread_position_in_grid]]
+) {
+    uint row = gid.y;  // token index
+    uint col = gid.x;  // output dimension index
+
+    if (row >= M || col >= N) return;
+
+    device const float* x_row = X + row * K;
+    device const half* w_row = W + col * K;
+
+    // Vectorized accumulation using float4
+    float sum = 0.0f;
+    uint k = 0;
+
+    // Process 4 elements at a time
+    for (; k + 3 < K; k += 4) {
+        float4 x_vec = float4(x_row[k], x_row[k+1], x_row[k+2], x_row[k+3]);
+        float4 w_vec = float4(w_row[k], w_row[k+1], w_row[k+2], w_row[k+3]);
+        sum += dot(x_vec, w_vec);
+    }
+
+    // Handle remaining elements
+    for (; k < K; k++) {
+        sum += x_row[k] * float(w_row[k]);
+    }
+
+    Y[row * N + col] = sum;
+}
+
+// SIMD-optimized batched FP16 matmul for large K dimension
+// Each simdgroup handles one output row of one token
+kernel void matmul_f16_simd(
+    device const float* X          [[buffer(0)]],
+    device const half* W           [[buffer(1)]],
+    device float* Y                [[buffer(2)]],
+    constant uint& M               [[buffer(3)]],
+    constant uint& K               [[buffer(4)]],
+    constant uint& N               [[buffer(5)]],
+    uint2 tgid                     [[threadgroup_position_in_grid]],
+    uint simd_lane                 [[thread_index_in_simdgroup]]
+) {
+    uint row = tgid.y;  // token index
+    uint col = tgid.x;  // output dimension index
+
+    if (row >= M || col >= N) return;
+
+    device const float* x_row = X + row * K;
+    device const half* w_row = W + col * K;
+
+    // Each thread in simdgroup processes K/32 elements
+    float local_sum = 0.0f;
+    for (uint i = simd_lane; i < K; i += 32) {
+        local_sum += x_row[i] * float(w_row[i]);
+    }
+
+    // SIMD reduction
+    float sum = simd_sum(local_sum);
+
+    if (simd_lane == 0) {
+        Y[row * N + col] = sum;
+    }
+}
+
 kernel void matvec_f32(
     device const float* x          [[buffer(0)]],
     device const float* W          [[buffer(1)]],
@@ -5414,6 +5486,125 @@ kernel void attention_prefill_f16kv(
             out_val += float(scores_h[k]) * float(v_head[k * head_dim + d]);
         }
         out_head[d] = out_val;
+    }
+}
+
+// =============================================================================
+// FlashAttention Prefill - Optimized with parallel Q@K^T using SIMD
+// =============================================================================
+// Each simdgroup (32 threads) computes one attention score via cooperative dot product
+// 4 simdgroups = 4 K positions per iteration
+// For each tile of 4 K positions, all threads participate in computation
+
+kernel void flash_attention_prefill_f16kv(
+    device const float* Q          [[buffer(0)]],
+    device const half* K           [[buffer(1)]],
+    device const half* V           [[buffer(2)]],
+    device float* output           [[buffer(3)]],
+    constant uint& num_heads       [[buffer(4)]],
+    constant uint& num_kv_heads    [[buffer(5)]],
+    constant uint& seq_q           [[buffer(6)]],
+    constant uint& seq_kv          [[buffer(7)]],
+    constant uint& head_dim        [[buffer(8)]],
+    constant float& scale          [[buffer(9)]],
+    constant uint& start_pos       [[buffer(10)]],
+    uint2 tgid                     [[threadgroup_position_in_grid]],
+    uint tid                       [[thread_index_in_threadgroup]],
+    uint simd_lane                 [[thread_index_in_simdgroup]],
+    uint simd_id                   [[simdgroup_index_in_threadgroup]]
+) {
+    uint head_idx = tgid.x;
+    uint q_pos = tgid.y;
+
+    if (head_idx >= num_heads || q_pos >= seq_q) return;
+
+    uint heads_per_kv = num_heads / num_kv_heads;
+    uint kv_head = head_idx / heads_per_kv;
+    uint max_kv_pos = min(start_pos + q_pos + 1, seq_kv);  // Causal mask
+
+    device const float* q_head = Q + head_idx * seq_q * head_dim + q_pos * head_dim;
+    device const half* k_head = K + kv_head * seq_kv * head_dim;
+    device const half* v_head = V + kv_head * seq_kv * head_dim;
+    device float* out_head = output + head_idx * seq_q * head_dim + q_pos * head_dim;
+
+    // Cache Q in registers - each thread loads head_dim/32 elements
+    float q_cache[4];  // Up to 4 elements per thread (for head_dim up to 128)
+    for (uint i = 0; i < 4 && (simd_lane * 4 + i) < head_dim; i++) {
+        q_cache[i] = q_head[simd_lane * 4 + i];
+    }
+
+    // Output accumulators - one per dimension
+    // Thread tid handles dimension tid for output
+    float out_acc = 0.0f;
+    float global_max = -INFINITY;
+    float global_sum = 0.0f;
+
+    // Shared memory
+    threadgroup float scores[4];  // One score per simdgroup
+    threadgroup float shared_max;
+    threadgroup float shared_sum;
+
+    // Process 4 K positions per iteration (one per simdgroup)
+    for (uint k_base = 0; k_base < max_kv_pos; k_base += 4) {
+        // Each simdgroup computes one Q@K dot product
+        uint k_idx = k_base + simd_id;
+        float score = -INFINITY;
+
+        if (k_idx < max_kv_pos) {
+            device const half* k_vec = k_head + k_idx * head_dim;
+
+            // Cooperative dot product: each thread handles 4 elements
+            float partial = 0.0f;
+            for (uint i = 0; i < 4 && (simd_lane * 4 + i) < head_dim; i++) {
+                partial += q_cache[i] * float(k_vec[simd_lane * 4 + i]);
+            }
+            // Reduce across simdgroup
+            score = simd_sum(partial) * scale;
+        }
+
+        // Store scores from each simdgroup
+        if (simd_lane == 0) {
+            scores[simd_id] = score;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Find max for this batch
+        float batch_max = scores[0];
+        for (uint i = 1; i < 4; i++) {
+            if (k_base + i < max_kv_pos) batch_max = max(batch_max, scores[i]);
+        }
+
+        float new_max = max(global_max, batch_max);
+
+        // Rescale previous accumulator
+        float rescale = exp(global_max - new_max);
+        out_acc *= rescale;
+        global_sum *= rescale;
+
+        // Compute exp scores and accumulate V
+        float batch_sum = 0.0f;
+        for (uint i = 0; i < 4; i++) {
+            uint k_idx2 = k_base + i;
+            if (k_idx2 < max_kv_pos) {
+                float exp_score = exp(scores[i] - new_max);
+                batch_sum += exp_score;
+
+                // Accumulate V - each thread handles one output dimension
+                if (tid < head_dim) {
+                    device const half* v_vec = v_head + k_idx2 * head_dim;
+                    out_acc += exp_score * float(v_vec[tid]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        global_max = new_max;
+        global_sum += batch_sum;
+    }
+
+    // Final normalization and write
+    if (tid < head_dim) {
+        out_head[tid] = out_acc / (global_sum + 1e-6f);
     }
 }
 

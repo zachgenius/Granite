@@ -289,6 +289,16 @@ public:
         uint32_t N
     );
 
+    // Y = X @ W^T where W is FP16 (batched)
+    Result<void> matmul_f16(
+        MTL::Buffer* X,      // Input [M, K] float
+        MTL::Buffer* W,      // Weights [N, K] half (row-major, transposed)
+        MTL::Buffer* Y,      // Output [M, N] float
+        uint32_t M,          // Batch size (number of tokens)
+        uint32_t K,          // Input dimension
+        uint32_t N           // Output dimension
+    );
+
     // =============================================================================
     // LLM Operations - Element-wise
     // =============================================================================

@@ -422,7 +422,7 @@ private:
             // Core quantized kernels
             "matvec_q4k", "matmul_q4k", "matmul_q4k_vec", "matmul_q4k_tiled", "matmul_q4k_simd",
             "matmul_q4k_simdgroup",  // simdgroup_half8x8 optimized matmul
-            "matvec_f16", "matvec_f32",
+            "matvec_f16", "matmul_f16", "matmul_f16_simd", "matvec_f32",
             "matvec_q8_0", "matmul_q8_0",
             "matvec_q4_0", "matmul_q4_0",
             "matvec_iq4_nl", "matmul_iq4_nl",
@@ -455,7 +455,7 @@ private:
             // llama.cpp-style Flash Attention (highest performance)
             "flash_attention_decode_d64", "flash_attention_decode_d128",
             // Prefill attention
-            "attention_prefill", "attention_prefill_f16kv",
+            "attention_prefill", "attention_prefill_f16kv", "flash_attention_prefill_f16kv",
             // Tree attention (speculative decoding)
             "attention_tree_f16kv", "attention_tree_nocontext_f16kv",
             // Paged attention (continuous batching)
@@ -738,6 +738,14 @@ Result<void> MetalCompute::matvec_f16(
     uint32_t K, uint32_t N)
 {
     return impl_->dispatch_matvec("matvec_f16", x, W, y, K, N);
+}
+
+Result<void> MetalCompute::matmul_f16(
+    MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
+    uint32_t M, uint32_t K, uint32_t N)
+{
+    // Use simple vectorized version with dispatchThreads - more efficient for large N
+    return impl_->dispatch_matmul("matmul_f16", X, W, Y, M, K, N);
 }
 
 
@@ -1420,10 +1428,13 @@ Result<void> MetalCompute::multihead_attention(
         MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
         encoder->dispatchThreadgroups(grid_size, threadgroup_size);
     } else {
-        // Prefill path: attention_prefill_f16kv
-        // Kernel signature includes seq_q, seq_kv, start_pos
-        const char* kernel_name = "attention_prefill_f16kv";
+        // Prefill path: try flash_attention_prefill first, fall back to legacy
+        const char* kernel_name = "flash_attention_prefill_f16kv";
         auto* pipeline = impl_->get_pipeline(kernel_name);
+        if (!pipeline) {
+            kernel_name = "attention_prefill_f16kv";
+            pipeline = impl_->get_pipeline(kernel_name);
+        }
         if (!pipeline) {
             kernel_name = "attention_prefill";
             pipeline = impl_->get_pipeline(kernel_name);
@@ -1431,6 +1442,8 @@ Result<void> MetalCompute::multihead_attention(
                 return Error(ErrorCode::InternalError, "attention_prefill kernel not found");
             }
         }
+        GRANITE_LOG_INFO("Attention prefill kernel selected: {} (seq_q={}, seq_kv={})",
+                         kernel_name, seq_q, seq_kv);
 
         encoder->setComputePipelineState(pipeline);
         encoder->setBuffer(Q, 0, 0);

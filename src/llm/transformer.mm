@@ -398,6 +398,54 @@ Result<Tensor> TransformerModel::forward(
             }
         }
     }
+
+    // GPU prefill path: complete GPU pipeline including final norm + output projection
+    if (use_gpu_ && !is_decode && norm_weight) {
+        auto* gpu = get_metal_compute();
+        if (gpu && gpu->is_initialized()) {
+            auto* h_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(hidden.buffer()));
+            auto* norm_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(norm_weight->buffer()));
+            auto* out_w_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(output_weight->buffer()));
+
+            if (h_buf && norm_buf && out_w_buf) {
+                // Allocate normalized hidden tensor
+                std::vector<int64_t> norm_shape = {batch, seq_len, static_cast<int64_t>(model_config_.hidden_dim)};
+                auto norm_out_result = Tensor::allocate(norm_shape, DataType::FP32, backend_);
+
+                // Allocate logits tensor
+                std::vector<int64_t> logits_shape = {batch, seq_len, static_cast<int64_t>(model_config_.vocab_size)};
+                auto logits_result = Tensor::allocate(logits_shape, DataType::FP32, backend_);
+
+                if (norm_out_result.ok() && logits_result.ok()) {
+                    auto norm_out = std::move(norm_out_result).take();
+                    auto logits = std::move(logits_result).take();
+
+                    auto* norm_out_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(norm_out.buffer()));
+                    auto* logits_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(logits.buffer()));
+
+                    // GPU Final Batched RMSNorm
+                    bool is_f16 = (norm_weight->dtype() == DataType::FP16);
+                    if (is_f16) {
+                        gpu->rms_norm_batch_f16(h_buf, norm_buf, norm_out_buf,
+                                               total_tokens, model_config_.hidden_dim, model_config_.rms_norm_eps);
+                    } else {
+                        gpu->rms_norm_batch(h_buf, norm_buf, norm_out_buf,
+                                           total_tokens, model_config_.hidden_dim, model_config_.rms_norm_eps);
+                    }
+
+                    // GPU Output projection using batched FP16 matmul
+                    // output_weight is [vocab_size, hidden_dim] in FP16
+                    gpu->matmul_f16(norm_out_buf, out_w_buf, logits_buf,
+                                   total_tokens, model_config_.hidden_dim, model_config_.vocab_size);
+
+                    // Sync before returning results
+                    gpu->sync();
+
+                    return logits;
+                }
+            }
+        }
+    }
 #endif
 
     // CPU path
