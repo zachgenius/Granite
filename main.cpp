@@ -350,10 +350,10 @@ int main(int argc, char* argv[]) {
 
     // Simple generation loop
     GRANITE_LOG_INFO("");
-    GRANITE_LOG_INFO("Generating text (greedy, max 20 tokens)...");
+    GRANITE_LOG_INFO("Generating text (greedy, max {} tokens)...", max_tokens);
     std::cout << prompt << std::flush;
 
-    int max_new_tokens = 20;
+    int max_new_tokens = max_tokens;
     for (int i = 0; i < max_new_tokens; i++) {
         // Get last token logits
         auto logits_map2 = backend->map_buffer(logits.buffer());

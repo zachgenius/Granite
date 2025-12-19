@@ -6466,7 +6466,7 @@ kernel void flash_attention_decode_d64(
 
     // Shared memory
     threadgroup float4 sq4[DK4];         // Query vector (16 float4s)
-    threadgroup float ss[C];             // Attention scores (32 floats)
+    threadgroup float ss[NSG][C];        // Attention scores per simdgroup (was shared bug!)
     threadgroup float4 so4[NSG * DK4];   // Output accumulators per simdgroup
     threadgroup float sm_s[NSG];         // Running sum per simdgroup
     threadgroup float sm_m[NSG];         // Running max per simdgroup
@@ -6526,7 +6526,7 @@ kernel void flash_attention_decode_d64(
 
             // Thread 0 and 16 (tx=0 for each ty) write their scores
             if (tx == 0 && k_idx < tile_len) {
-                ss[k_idx] = score;
+                ss[sgitg][k_idx] = score;
             }
         }
 
@@ -6540,7 +6540,7 @@ kernel void flash_attention_decode_d64(
         // Find max in this tile
         float local_max = -FLT_MAX / 2;
         for (uint k = tiisg; k < tile_len; k += NW) {
-            local_max = max(local_max, ss[k]);
+            local_max = max(local_max, ss[sgitg][k]);
         }
         float tile_max = simd_max(local_max);
         M = max(M, tile_max);
@@ -6550,8 +6550,8 @@ kernel void flash_attention_decode_d64(
         // Compute exp and sum
         float local_sum = 0.0f;
         for (uint k = tiisg; k < tile_len; k += NW) {
-            float vs = exp(ss[k] - M);
-            ss[k] = vs;
+            float vs = exp(ss[sgitg][k] - M);
+            ss[sgitg][k] = vs;
             local_sum += vs;
         }
         float tile_sum = simd_sum(local_sum);
@@ -6576,7 +6576,7 @@ kernel void flash_attention_decode_d64(
         for (uint kk = 0; kk < tile_len; kk += NE) {
             const uint k_idx = kk + ty;
             if (k_idx < tile_len) {
-                float weight = ss[k_idx];
+                float weight = ss[sgitg][k_idx];
                 float4 v_vec = float4(pv4[k_idx * DK4 + tx]);
                 accum += v_vec * weight;
             }
@@ -6674,7 +6674,7 @@ kernel void flash_attention_decode_d128(
 
     // Shared memory
     threadgroup float4 sq4[DK4];
-    threadgroup float ss[C];
+    threadgroup float ss[NSG][C];   // Per-simdgroup scores (was shared bug!)
     threadgroup float4 so4[NSG * DK4];
     threadgroup float sm_s[NSG];
     threadgroup float sm_m[NSG];
@@ -6731,7 +6731,7 @@ kernel void flash_attention_decode_d128(
             float score = simd_sum(partial) * scale;
 
             if (tiisg == 0) {
-                ss[k_idx] = score;
+                ss[sgitg][k_idx] = score;
             }
         }
 
@@ -6745,7 +6745,7 @@ kernel void flash_attention_decode_d128(
 
             float local_max = -FLT_MAX / 2;
             for (uint k = tiisg; k < tile_len; k += NW) {
-                local_max = max(local_max, ss[k]);
+                local_max = max(local_max, ss[sgitg][k]);
             }
             float tile_max = simd_max(local_max);
 
@@ -6754,8 +6754,8 @@ kernel void flash_attention_decode_d128(
 
             float local_sum = 0.0f;
             for (uint k = tiisg; k < tile_len; k += NW) {
-                float vs = exp(ss[k] - M);
-                ss[k] = vs;
+                float vs = exp(ss[sgitg][k] - M);
+                ss[sgitg][k] = vs;
                 local_sum += vs;
             }
             float tile_sum = simd_sum(local_sum);
@@ -6776,7 +6776,7 @@ kernel void flash_attention_decode_d128(
             device const half4* pv4 = v4_base + ic * DK4;
 
             for (uint k_idx = 0; k_idx < tile_len; ++k_idx) {
-                const float weight = ss[k_idx];
+                const float weight = ss[sgitg][k_idx];
                 device const half4* v_row = pv4 + k_idx * DK4;
 
                 // Each thread handles DK4/NW float4s
