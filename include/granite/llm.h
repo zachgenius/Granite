@@ -468,6 +468,11 @@ private:
     struct PrefillBufferPool {
         bool initialized = false;
         int max_tokens = 0;  // Current capacity
+        // Transformer block intermediate buffers (reused across layers)
+        void* attn_input_buf = nullptr;  // [max_tokens * hidden_dim] - RMSNorm output
+        void* post_attn_buf = nullptr;   // [max_tokens * hidden_dim] - residual after attention
+        void* ffn_input_buf = nullptr;   // [max_tokens * hidden_dim] - RMSNorm output
+        void* block_output_buf = nullptr; // [max_tokens * hidden_dim] - block output
         // Attention-specific GPU buffers
         void* q_buf = nullptr;       // [max_tokens * num_heads * head_dim]
         void* k_buf = nullptr;       // [max_tokens * num_kv_heads * head_dim]

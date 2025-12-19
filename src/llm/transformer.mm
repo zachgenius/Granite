@@ -2594,10 +2594,17 @@ Result<void> TransformerModel::ensure_prefill_pool(int num_tokens) {
 
     // Release old pool if exists
     if (prefill_pool_) {
+        // Transformer block intermediate buffers
+        if (prefill_pool_->attn_input_buf) static_cast<MTL::Buffer*>(prefill_pool_->attn_input_buf)->release();
+        if (prefill_pool_->post_attn_buf) static_cast<MTL::Buffer*>(prefill_pool_->post_attn_buf)->release();
+        if (prefill_pool_->ffn_input_buf) static_cast<MTL::Buffer*>(prefill_pool_->ffn_input_buf)->release();
+        if (prefill_pool_->block_output_buf) static_cast<MTL::Buffer*>(prefill_pool_->block_output_buf)->release();
+        // Attention-specific buffers
         if (prefill_pool_->q_buf) static_cast<MTL::Buffer*>(prefill_pool_->q_buf)->release();
         if (prefill_pool_->k_buf) static_cast<MTL::Buffer*>(prefill_pool_->k_buf)->release();
         if (prefill_pool_->v_buf) static_cast<MTL::Buffer*>(prefill_pool_->v_buf)->release();
         if (prefill_pool_->attn_out_buf) static_cast<MTL::Buffer*>(prefill_pool_->attn_out_buf)->release();
+        // FFN-specific buffers
         if (prefill_pool_->ffn_gate_buf) static_cast<MTL::Buffer*>(prefill_pool_->ffn_gate_buf)->release();
         if (prefill_pool_->ffn_up_buf) static_cast<MTL::Buffer*>(prefill_pool_->ffn_up_buf)->release();
     } else {
@@ -2608,18 +2615,30 @@ Result<void> TransformerModel::ensure_prefill_pool(int num_tokens) {
     int alloc_tokens = 64;
     while (alloc_tokens < num_tokens) alloc_tokens *= 2;
 
+    int hidden_dim = model_config_.hidden_dim;
     int q_dim = model_config_.num_heads * model_config_.head_dim;
     int kv_dim = model_config_.num_kv_heads * model_config_.head_dim;
     int intermediate_dim = model_config_.intermediate_dim;
 
+    // Transformer block intermediate buffers (reused across all layers)
+    prefill_pool_->attn_input_buf = gpu->create_buffer(alloc_tokens * hidden_dim * sizeof(float));
+    prefill_pool_->post_attn_buf = gpu->create_buffer(alloc_tokens * hidden_dim * sizeof(float));
+    prefill_pool_->ffn_input_buf = gpu->create_buffer(alloc_tokens * hidden_dim * sizeof(float));
+    prefill_pool_->block_output_buf = gpu->create_buffer(alloc_tokens * hidden_dim * sizeof(float));
+
+    // Attention-specific buffers
     prefill_pool_->q_buf = gpu->create_buffer(alloc_tokens * q_dim * sizeof(float));
     prefill_pool_->k_buf = gpu->create_buffer(alloc_tokens * kv_dim * sizeof(float));
     prefill_pool_->v_buf = gpu->create_buffer(alloc_tokens * kv_dim * sizeof(float));
     prefill_pool_->attn_out_buf = gpu->create_buffer(alloc_tokens * q_dim * sizeof(float));
+
+    // FFN-specific buffers
     prefill_pool_->ffn_gate_buf = gpu->create_buffer(alloc_tokens * intermediate_dim * sizeof(float));
     prefill_pool_->ffn_up_buf = gpu->create_buffer(alloc_tokens * intermediate_dim * sizeof(float));
 
-    if (!prefill_pool_->q_buf || !prefill_pool_->k_buf || !prefill_pool_->v_buf ||
+    if (!prefill_pool_->attn_input_buf || !prefill_pool_->post_attn_buf ||
+        !prefill_pool_->ffn_input_buf || !prefill_pool_->block_output_buf ||
+        !prefill_pool_->q_buf || !prefill_pool_->k_buf || !prefill_pool_->v_buf ||
         !prefill_pool_->attn_out_buf || !prefill_pool_->ffn_gate_buf || !prefill_pool_->ffn_up_buf) {
         GRANITE_FAIL(ErrorCode::OutOfMemory, "Failed to allocate prefill buffer pool");
     }
