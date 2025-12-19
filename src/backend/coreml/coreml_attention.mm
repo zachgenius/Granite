@@ -313,29 +313,22 @@ private:
                 V: V_data
             };
 
-            NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* targets = @{
-                output: output_data
-            };
-
-            // Execute the graph
+            // Execute the graph synchronously using command queue
             // Note: MPSGraph automatically selects ANE/GPU based on operation support
-            id<MTLCommandBuffer> cmdBuffer = [command_queue_ commandBuffer];
+            NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* results =
+                [graph runWithMTLCommandQueue:command_queue_
+                                        feeds:feeds
+                                targetTensors:@[output]
+                             targetOperations:nil];
 
-            [graph encodeToCommandBuffer:cmdBuffer
-                                   feeds:feeds
-                       targetOperations:nil
-                         resultsDictionary:targets
-                   executionDescriptor:nil];
-
-            [cmdBuffer commit];
-            [cmdBuffer waitUntilCompleted];
-
-            // Check for errors
-            if (cmdBuffer.status == MTLCommandBufferStatusError) {
-                NSError* error = cmdBuffer.error;
-                return Error(ErrorCode::InternalError,
-                    std::string("MPSGraph execution failed: ") +
-                    [error.localizedDescription UTF8String]);
+            // Copy results to output buffer
+            MPSGraphTensorData* result_data = results[output];
+            if (result_data && out_view) {
+                // Read data from MPSNDArray into output buffer
+                MPSNDArray* ndarray = result_data.mpsndarray;
+                if (ndarray) {
+                    [ndarray readBytes:[out_view contents] strideBytes:nil];
+                }
             }
         }
 

@@ -349,6 +349,14 @@ add_executable(test_simdgroup_matmul tools/test_simdgroup_matmul.mm)
 set_source_files_properties(tools/test_simdgroup_matmul.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 target_link_libraries(test_simdgroup_matmul PRIVATE granite metal-cpp "-framework Metal" "-framework Foundation")
 
+add_executable(test_paged_flash_attention tools/test_paged_flash_attention.mm)
+set_source_files_properties(tools/test_paged_flash_attention.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+target_link_libraries(test_paged_flash_attention PRIVATE granite metal-cpp "-framework Metal" "-framework Foundation")
+
+add_executable(test_coreml_ane tools/test_coreml_ane.mm)
+set_source_files_properties(tools/test_coreml_ane.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+target_link_libraries(test_coreml_ane PRIVATE granite metal-cpp "-framework Metal" "-framework Foundation" "-framework MetalPerformanceShadersGraph")
+
 # =============================================================================
 # Installation
 # =============================================================================

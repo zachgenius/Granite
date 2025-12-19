@@ -460,7 +460,9 @@ private:
             "attention_tree_f16kv", "attention_tree_nocontext_f16kv",
             // Paged attention (continuous batching)
             "paged_attention_decode", "paged_kv_cache_append",
-            "batched_paged_attention_decode"
+            "batched_paged_attention_decode",
+            // Paged flash attention (long context support)
+            "paged_flash_attention_decode_d64", "paged_flash_attention_decode_d128"
         };
 
         for (const auto& name : kernels) {
@@ -1561,11 +1563,59 @@ Result<void> MetalCompute::paged_attention_decode(
     uint32_t block_size, float scale)
 {
     auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("paged_attention_decode");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "paged_attention_decode pipeline not found");
+
+    // Use paged flash attention for longer sequences or by default for efficiency
+    // Flash attention uses online softmax - no O(seq_len) memory requirement
+    // Old kernel limited to 4096 tokens due to threadgroup memory
+    const char* kernel_name = nullptr;
+    if (head_dim == 64) {
+        kernel_name = "paged_flash_attention_decode_d64";
+    } else if (head_dim == 128) {
+        kernel_name = "paged_flash_attention_decode_d128";
+    } else {
+        // Fall back to old kernel for unsupported head dims (limited to 4096 tokens)
+        if (seq_len > 4096) {
+            return Error(ErrorCode::InvalidArgument,
+                "paged_attention_decode: seq_len > 4096 requires head_dim 64 or 128");
+        }
+        kernel_name = "paged_attention_decode";
     }
 
+    auto* pipeline = impl_->get_pipeline(kernel_name);
+    if (!pipeline) {
+        // Fall back to old kernel if flash kernel not available
+        pipeline = impl_->get_pipeline("paged_attention_decode");
+        if (!pipeline) {
+            return Error(ErrorCode::InternalError, "paged_attention_decode pipeline not found");
+        }
+        if (seq_len > 4096) {
+            return Error(ErrorCode::InvalidArgument,
+                "paged_attention_decode: seq_len > 4096 requires flash attention kernels");
+        }
+
+        // Use old kernel (limited to 4096)
+        encoder->setComputePipelineState(pipeline);
+        encoder->setBuffer(Q, 0, 0);
+        encoder->setBuffer(K_cache, 0, 1);
+        encoder->setBuffer(V_cache, 0, 2);
+        encoder->setBuffer(block_table, 0, 3);
+        encoder->setBuffer(output, 0, 4);
+        encoder->setBytes(&num_heads, sizeof(uint32_t), 5);
+        encoder->setBytes(&num_kv_heads, sizeof(uint32_t), 6);
+        encoder->setBytes(&seq_len, sizeof(uint32_t), 7);
+        encoder->setBytes(&head_dim, sizeof(uint32_t), 8);
+        encoder->setBytes(&block_size, sizeof(uint32_t), 9);
+        uint32_t kv_stride = 0;
+        encoder->setBytes(&kv_stride, sizeof(uint32_t), 10);
+        encoder->setBytes(&scale, sizeof(float), 11);
+
+        MTL::Size grid_size = MTL::Size::Make(num_heads, 1, 1);
+        MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
+        encoder->dispatchThreadgroups(grid_size, threadgroup_size);
+        return {};
+    }
+
+    // Use flash attention kernel (supports arbitrary seq_len)
     encoder->setComputePipelineState(pipeline);
     encoder->setBuffer(Q, 0, 0);
     encoder->setBuffer(K_cache, 0, 1);
@@ -1577,11 +1627,9 @@ Result<void> MetalCompute::paged_attention_decode(
     encoder->setBytes(&seq_len, sizeof(uint32_t), 7);
     encoder->setBytes(&head_dim, sizeof(uint32_t), 8);
     encoder->setBytes(&block_size, sizeof(uint32_t), 9);
-    uint32_t kv_stride = 0;  // Not used directly, computed in kernel
-    encoder->setBytes(&kv_stride, sizeof(uint32_t), 10);
-    encoder->setBytes(&scale, sizeof(float), 11);
+    encoder->setBytes(&scale, sizeof(float), 10);
 
-    // One threadgroup per head
+    // One threadgroup per head, 128 threads (4 simdgroups)
     MTL::Size grid_size = MTL::Size::Make(num_heads, 1, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
     encoder->dispatchThreadgroups(grid_size, threadgroup_size);
