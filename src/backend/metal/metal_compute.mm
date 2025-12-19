@@ -26,6 +26,7 @@
 #include <vector>
 #include <mutex>
 #include <chrono>
+#include <ctime>
 
 namespace granite {
 
@@ -454,8 +455,8 @@ private:
             "simdgroup_flash_attention_decode_f16kv_d64", "simdgroup_flash_attention_decode_f16kv_d128",
             // llama.cpp-style Flash Attention (highest performance)
             "flash_attention_decode_d64", "flash_attention_decode_d128",
-            // Prefill attention
-            "attention_prefill", "attention_prefill_f16kv", "flash_attention_prefill_f16kv",
+            // Prefill attention (V2 with threadgroup K/V caching)
+            "flash_attention_prefill_v2",
             // Tree attention (speculative decoding)
             "attention_tree_f16kv", "attention_tree_nocontext_f16kv",
             // Paged attention (continuous batching)
@@ -525,6 +526,56 @@ void MetalCompute::get_profiling_stats(uint64_t& dispatches, uint64_t& syncs, do
     syncs = stats.sync_count;
     sync_time_ms = stats.sync_time_ms;
     cmd_buffers = stats.command_buffer_count;
+}
+
+// GPU Capture API for Xcode profiler
+bool MetalCompute::begin_capture(const char* capture_path) {
+    auto* capture_manager = MTL::CaptureManager::sharedCaptureManager();
+    if (!capture_manager) {
+        GRANITE_LOG_ERROR("Failed to get MTLCaptureManager");
+        return false;
+    }
+
+    auto* descriptor = MTL::CaptureDescriptor::alloc()->init();
+    descriptor->setCaptureObject((__bridge id)impl_->device());
+
+    if (capture_path) {
+        // Save to file for later analysis
+        auto* url = NS::URL::fileURLWithPath(NS::String::string(capture_path, NS::UTF8StringEncoding));
+        descriptor->setOutputURL(url);
+        descriptor->setDestination(MTL::CaptureDestinationGPUTraceDocument);
+    } else {
+        // Default: generate timestamped filename
+        time_t now = time(nullptr);
+        char path[256];
+        strftime(path, sizeof(path), "/tmp/granite_gpu_%Y%m%d_%H%M%S.gputrace", localtime(&now));
+        auto* url = NS::URL::fileURLWithPath(NS::String::string(path, NS::UTF8StringEncoding));
+        descriptor->setOutputURL(url);
+        descriptor->setDestination(MTL::CaptureDestinationGPUTraceDocument);
+        GRANITE_LOG_INFO("GPU capture will be saved to: {}", path);
+    }
+
+    NS::Error* error = nullptr;
+    if (!capture_manager->startCapture(descriptor, &error)) {
+        if (error) {
+            GRANITE_LOG_ERROR("Failed to start GPU capture: {}",
+                error->localizedDescription()->utf8String());
+        }
+        descriptor->release();
+        return false;
+    }
+
+    descriptor->release();
+    GRANITE_LOG_INFO("GPU capture started");
+    return true;
+}
+
+void MetalCompute::end_capture() {
+    auto* capture_manager = MTL::CaptureManager::sharedCaptureManager();
+    if (capture_manager && capture_manager->isCapturing()) {
+        capture_manager->stopCapture();
+        GRANITE_LOG_INFO("GPU capture stopped - open .gputrace file in Xcode to analyze");
+    }
 }
 
 MTL::Buffer* MetalCompute::create_buffer(size_t size, bool shared) {
@@ -1428,22 +1479,11 @@ Result<void> MetalCompute::multihead_attention(
         MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
         encoder->dispatchThreadgroups(grid_size, threadgroup_size);
     } else {
-        // Prefill path: try flash_attention_prefill first, fall back to legacy
-        const char* kernel_name = "flash_attention_prefill_f16kv";
-        auto* pipeline = impl_->get_pipeline(kernel_name);
+        // Prefill path: use simdgroup matrix flash attention (llama.cpp style)
+        auto* pipeline = impl_->get_pipeline("flash_attention_prefill_v2");
         if (!pipeline) {
-            kernel_name = "attention_prefill_f16kv";
-            pipeline = impl_->get_pipeline(kernel_name);
+            return Error(ErrorCode::InternalError, "flash_attention_prefill_v2 kernel not found");
         }
-        if (!pipeline) {
-            kernel_name = "attention_prefill";
-            pipeline = impl_->get_pipeline(kernel_name);
-            if (!pipeline) {
-                return Error(ErrorCode::InternalError, "attention_prefill kernel not found");
-            }
-        }
-        GRANITE_LOG_INFO("Attention prefill kernel selected: {} (seq_q={}, seq_kv={})",
-                         kernel_name, seq_q, seq_kv);
 
         encoder->setComputePipelineState(pipeline);
         encoder->setBuffer(Q, 0, 0);
@@ -1459,8 +1499,23 @@ Result<void> MetalCompute::multihead_attention(
         uint32_t start_pos = 0;  // For prefill, start_pos is 0
         encoder->setBytes(&start_pos, sizeof(start_pos), 10);
 
-        // One threadgroup per (head, query_position) pair
-        MTL::Size grid_size = MTL::Size::Make(num_heads, seq_q, 1);
+        // Threadgroup memory layout:
+        // sq[Q_TILE * DK] = 8 * 64 = 512 halfs = 1024 bytes
+        // so[Q_TILE * DK] = 8 * 64 = 512 halfs = 1024 bytes
+        // ss_half[Q_TILE * K_TILE] = 8 * 32 = 256 halfs = 512 bytes
+        // ss[Q_TILE * K_TILE] = 8 * 32 = 256 floats = 1024 bytes
+        // sv[K_TILE * DK] = 32 * 64 = 2048 halfs = 4096 bytes
+        // Total: 7680 bytes
+        constexpr uint32_t Q_TILE = 8;
+        constexpr uint32_t K_TILE = 32;
+        constexpr uint32_t DK = 64;
+        constexpr uint32_t threadgroup_mem_size = (Q_TILE * DK * 2 + Q_TILE * DK * 2 + Q_TILE * K_TILE * 2 + Q_TILE * K_TILE * 4 + K_TILE * DK * 2);
+        encoder->setThreadgroupMemoryLength(threadgroup_mem_size, 0);
+
+        // One threadgroup per (head, query_block) pair
+        // Each threadgroup handles Q_TILE=8 query positions
+        uint32_t num_q_blocks = (seq_q + Q_TILE - 1) / Q_TILE;
+        MTL::Size grid_size = MTL::Size::Make(num_heads, num_q_blocks, 1);
         MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
         encoder->dispatchThreadgroups(grid_size, threadgroup_size);
     }

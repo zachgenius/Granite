@@ -341,6 +341,22 @@ target_link_libraries(granite_tree_bench PRIVATE granite)
 add_executable(granite_bench_vs_llamacpp tools/benchmark_vs_llamacpp.cpp)
 target_link_libraries(granite_bench_vs_llamacpp PRIVATE granite)
 
+add_executable(profile_q4k tools/profile_q4k.mm)
+set_source_files_properties(tools/profile_q4k.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+target_link_libraries(profile_q4k PRIVATE granite metal-cpp "-framework Metal" "-framework Foundation")
+
+add_executable(measure_alloc tools/measure_alloc.mm)
+set_source_files_properties(tools/measure_alloc.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+target_link_libraries(measure_alloc PRIVATE granite metal-cpp "-framework Metal" "-framework Foundation")
+
+add_executable(measure_overhead tools/measure_overhead.mm)
+set_source_files_properties(tools/measure_overhead.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+target_link_libraries(measure_overhead PRIVATE granite metal-cpp "-framework Metal" "-framework Foundation")
+
+add_executable(pipeline_test tools/pipeline_test.mm)
+set_source_files_properties(tools/pipeline_test.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+target_link_libraries(pipeline_test PRIVATE granite metal-cpp "-framework Metal" "-framework Foundation")
+
 add_executable(granite_matvec_bench tools/benchmark_matvec.mm)
 set_source_files_properties(tools/benchmark_matvec.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 target_link_libraries(granite_matvec_bench PRIVATE granite metal-cpp "-framework Metal" "-framework Foundation")

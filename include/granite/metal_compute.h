@@ -43,6 +43,11 @@ public:
     void reset_profiling_stats();
     void get_profiling_stats(uint64_t& dispatches, uint64_t& syncs, double& sync_time_ms, uint64_t& cmd_buffers) const;
 
+    // GPU Capture API (for Xcode GPU profiler)
+    // Captures a GPU trace that can be opened in Xcode for detailed analysis
+    bool begin_capture(const char* capture_path = nullptr);  // nullptr = default path
+    void end_capture();
+
     // =============================================================================
     // LLM Operations - Quantized Matrix Multiply
     // =============================================================================

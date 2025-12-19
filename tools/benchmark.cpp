@@ -1,4 +1,7 @@
 #include <granite/granite.h>
+#ifdef GRANITE_HAS_METAL
+#include <granite/metal_compute.h>
+#endif
 #include <iostream>
 #include <chrono>
 #include <vector>
@@ -188,6 +191,14 @@ void benchmark_inference(const std::string& model_path, IComputeBackend* backend
 #endif
 
         // Benchmark
+#ifdef GRANITE_HAS_METAL
+        auto* gpu = get_metal_compute();
+        if (gpu) {
+            gpu->enable_profiling(true);
+            gpu->reset_profiling_stats();
+        }
+#endif
+
         auto prefill = [&]() {
             kv_cache.clear();
 #ifdef GRANITE_HAS_METAL
@@ -204,7 +215,22 @@ void benchmark_inference(const std::string& model_path, IComputeBackend* backend
 
         std::cout << std::setw(15) << seq_len
                   << std::setw(15) << std::fixed << std::setprecision(2) << time_ms
-                  << std::setw(15) << std::fixed << std::setprecision(1) << tokens_per_sec << "\n";
+                  << std::setw(15) << std::fixed << std::setprecision(1) << tokens_per_sec;
+
+#ifdef GRANITE_HAS_METAL
+        // Print profiling stats (per single run, not averaged over benchmark iterations)
+        if (gpu) {
+            uint64_t dispatches, syncs, cmd_buffers;
+            double sync_time;
+            gpu->get_profiling_stats(dispatches, syncs, sync_time, cmd_buffers);
+            // Stats are cumulative over 3 iterations, divide by 3
+            std::cout << " [" << dispatches/3 << " dispatches, "
+                      << syncs/3 << " syncs, "
+                      << cmd_buffers/3 << " cmdbufs]";
+            gpu->enable_profiling(false);
+        }
+#endif
+        std::cout << "\n";
     }
 
     // Benchmark single-token generation (decode)
