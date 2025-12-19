@@ -2663,9 +2663,10 @@ Result<Tensor> TransformerModel::attention_full_gpu(
     int layer,
     int start_pos)
 {
-    if (layer == 0) {
-        GRANITE_LOG_INFO("ATTN_FULL_GPU enter layer={} sp={}", layer, start_pos);
-    }
+    // Debug logging disabled for performance - uncomment to trace attention calls
+    // if (layer == 0) {
+    //     GRANITE_LOG_DEBUG("ATTN_FULL_GPU enter layer={} sp={}", layer, start_pos);
+    // }
     std::string prefix = "blk." + std::to_string(layer) + ".";
 
     // Get raw quantized weights for GPU projection
@@ -2898,11 +2899,11 @@ Result<Tensor> TransformerModel::attention_gpu(
     if (is_decode && has_gpu_cache) {
         int gpu_len = gpu_kv_cache_->seq_len();
 
-        // DEBUG: Print cache state
-        if (layer == 0) {
-            GRANITE_LOG_INFO("DECODE: layer={} start_pos={} gpu_len={} cpu_len={}",
-                layer, start_pos, gpu_len, kv_cache ? kv_cache->seq_len() : -1);
-        }
+        // Debug logging disabled for performance
+        // if (layer == 0) {
+        //     GRANITE_LOG_DEBUG("DECODE: layer={} start_pos={} gpu_len={} cpu_len={}",
+        //         layer, start_pos, gpu_len, kv_cache ? kv_cache->seq_len() : -1);
+        // }
 
         // If GPU cache is already valid (gpu_len == start_pos), use GPU path
         if (gpu_len == start_pos) {
@@ -2952,12 +2953,12 @@ Result<Tensor> TransformerModel::attention_gpu(
             const RawWeight* raw_wv = get_raw_weight(prefix + "attn_v.weight");
             const RawWeight* raw_wo = get_raw_weight(prefix + "attn_output.weight");
 
-            // DEBUG: Check weight types
-            if (layer == 0 && raw_wk && raw_wv) {
-                GRANITE_LOG_INFO("WEIGHTS: wk_type={} wv_type={} wk_size={} wv_size={}",
-                    static_cast<int>(raw_wk->quant_type), static_cast<int>(raw_wv->quant_type),
-                    raw_wk->size_bytes, raw_wv->size_bytes);
-            }
+            // Debug logging disabled for performance
+            // if (layer == 0 && raw_wk && raw_wv) {
+            //     GRANITE_LOG_DEBUG("WEIGHTS: wk_type={} wv_type={} wk_size={} wv_size={}",
+            //         static_cast<int>(raw_wk->quant_type), static_cast<int>(raw_wv->quant_type),
+            //         raw_wk->size_bytes, raw_wv->size_bytes);
+            // }
 
             if (raw_wq && raw_wk && raw_wv && raw_wo &&
                 (raw_wq->quant_type == GGMLType::Q4_K || raw_wq->quant_type == GGMLType::Q5_K ||

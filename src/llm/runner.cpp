@@ -49,6 +49,17 @@ Result<std::unique_ptr<LLMRunner>> LLMRunner::load(const std::string& path) {
     }
     runner->kv_cache_ = std::move(kv_result).take();
 
+#ifdef GRANITE_HAS_METAL
+    // Allocate GPU KV cache for faster decode
+    auto gpu_cache_result = runner->model_.allocate_gpu_kv_cache(
+        runner->model_.config().max_seq_len);
+    if (!gpu_cache_result.ok()) {
+        GRANITE_LOG_WARN("Failed to allocate GPU KV cache: {}",
+                         gpu_cache_result.error().message());
+        // Continue without GPU KV cache - will use CPU path
+    }
+#endif
+
     return runner;
 }
 

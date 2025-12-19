@@ -965,7 +965,8 @@ kernel void matmul_q4k_simdgroup(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Store weight tile with layout matching simdgroup_load expectations
-        // sa layout: [NK/8 blocks][NR0/8 blocks][8][8]
+        // Layout: sa[512*sx + 64*sy + 8*ly + lx] where:
+        //   sx: K chunk (0..3), sy: N block (0..7), ly: K within chunk (0..7), lx: N within block (0..7)
         for (short i = 0; i < 16; i++) {
             const short sx = 2 * il0 + i / 8;       // K block index (0..3 for NK=32)
             const short sy = lr0 / 8;               // N block index (0..7 for NR0=64)
