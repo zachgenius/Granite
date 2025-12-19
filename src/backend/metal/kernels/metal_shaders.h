@@ -1000,33 +1000,18 @@ kernel void matmul_q4k_simdgroup(
             sa_dst[56] = temp_a[3][3];  // i=15, ly=7
         }
 
-        // Load input into sb - optimized with vectorized loads
+        // Load input into sb - llama.cpp style with half2x4 cast
         // Input X[m, k] for batch index m = r1 + lr1
         if (lr1 < nr1) {
-            // Pre-compute loop-invariant values
             const short sx = tiitg % NL1;       // K block index
             const short sy = lr1 / 8;           // M block index
             const short ly = lr1 % 8;           // Within M block
             const short ib = 4 * sx + sy;
-            threadgroup half* sb_dst = sb + 64 * ib + 8 * ly;
 
-            device const float* x_ptr = X + (r1 + lr1) * K + loop_k + iy;
-
-            // Vectorized load and convert: read 8 floats as 2x float4, convert to half
-            if (loop_k + iy + 8 <= K) {
-                // Full vector load - no bounds checking needed
-                float4 v0 = *((device const float4*)(x_ptr));
-                float4 v1 = *((device const float4*)(x_ptr + 4));
-                half4 h0 = half4(v0);
-                half4 h1 = half4(v1);
-                *((threadgroup half4*)(sb_dst)) = h0;
-                *((threadgroup half4*)(sb_dst + 4)) = h1;
-            } else {
-                // Partial load with bounds checking
-                for (short i = 0; i < 8; ++i) {
-                    sb_dst[i] = (loop_k + iy + i < K) ? half(x_ptr[i]) : half(0);
-                }
-            }
+            // Single vector load with type cast (matches llama.cpp pattern)
+            // Note: no bounds check needed since K is always a multiple of 32
+            device const float2x4* x_ptr = (device const float2x4*)(X + (r1 + lr1) * K + loop_k + iy);
+            *((threadgroup half2x4*)(sb + 64 * ib + 8 * ly)) = half2x4(*x_ptr);
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
