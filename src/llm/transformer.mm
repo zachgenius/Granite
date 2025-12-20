@@ -143,32 +143,10 @@ Result<TransformerModel> TransformerModel::load(
         model.use_coreml_ = false;
         GRANITE_LOG_INFO("GPU acceleration enabled (Metal)");
     }
-#ifdef GRANITE_HAS_COREML
-    else if (selected_backend == AttentionBackend::CoreML &&
-             backend->get_type() == BackendType::Metal) {
-        // Initialize CoreML attention backend using MetalCompute's device
-        auto* coreml = get_coreml_attention();
-        auto* gpu = get_metal_compute();
-        if (gpu && gpu->is_initialized() && coreml) {
-            auto init_result = coreml->initialize(gpu->device());
-            if (init_result.ok()) {
-                model.use_coreml_ = true;
-                model.use_gpu_ = true;  // Still need GPU for other ops
-                GRANITE_LOG_INFO("CoreML/ANE attention enabled (ANE available: {})",
-                                CoreMLAttention::is_ane_available());
-            } else {
-                GRANITE_LOG_WARN("CoreML init failed, falling back to Metal: {}",
-                                init_result.error().message());
-                model.use_gpu_ = true;
-                model.use_coreml_ = false;
-            }
-        } else {
-            GRANITE_LOG_WARN("CoreML not available, falling back to Metal");
-            model.use_gpu_ = true;
-            model.use_coreml_ = false;
-        }
-    }
-#endif
+// NOTE: CoreML/ANE attention was tested and found to be 10-50x slower than Metal
+// due to ~10ms fixed MPSGraph overhead per execution. CoreML is better suited
+// for FFN offload (fixed shapes, larger batches) rather than attention.
+// See roadmap.md Milestone 6.4 for investigation details.
     else if (selected_backend == AttentionBackend::CPU) {
         model.use_gpu_ = false;
         model.use_coreml_ = false;
@@ -3867,59 +3845,22 @@ Result<Tensor> TransformerModel::attention_full_gpu(
         current_len, 1, max_seq
     );
 
-    // 4. Multi-head attention (GPU kernel or CoreML/ANE)
+    // 4. Multi-head attention (Metal GPU)
+    // NOTE: CoreML/ANE attention was tested but found to be 10-50x slower due to
+    // ~10ms fixed MPSGraph overhead. Metal Flash Attention is the optimal path.
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-
-#ifdef GRANITE_HAS_COREML
-    if (use_coreml_) {
-        // Use CoreML/MPSGraph attention (can target ANE)
-        auto* coreml = get_coreml_attention();
-        if (coreml && coreml->is_initialized()) {
-            auto coreml_result = coreml->multihead_attention(
-                q_buf,
-                k_cache_buf,
-                v_cache_buf,
-                attn_out_buf,
-                num_heads,
-                num_kv_heads,
-                1,          // seq_q = 1 for decode
-                total_seq,  // seq_kv = all cached + new
-                head_dim,
-                scale
-            );
-            if (!coreml_result.ok()) {
-                GRANITE_LOG_WARN("CoreML attention failed, falling back to Metal: {}",
-                                coreml_result.error().message());
-                // Fall through to Metal path below
-                gpu->multihead_attention(
-                    q_buf, k_cache_buf, v_cache_buf, attn_out_buf,
-                    num_heads, num_kv_heads, 1, total_seq, head_dim, scale
-                );
-            }
-        } else {
-            // CoreML not available, use Metal
-            gpu->multihead_attention(
-                q_buf, k_cache_buf, v_cache_buf, attn_out_buf,
-                num_heads, num_kv_heads, 1, total_seq, head_dim, scale
-            );
-        }
-    } else
-#endif
-    {
-        // Standard Metal GPU attention
-        gpu->multihead_attention(
-            q_buf,
-            k_cache_buf,
-            v_cache_buf,
-            attn_out_buf,
-            num_heads,
-            num_kv_heads,
-            1,          // seq_q = 1 for decode
-            total_seq,  // seq_kv = all cached + new
-            head_dim,
-            scale
-        );
-    }
+    gpu->multihead_attention(
+        q_buf,
+        k_cache_buf,
+        v_cache_buf,
+        attn_out_buf,
+        num_heads,
+        num_kv_heads,
+        1,          // seq_q = 1 for decode
+        total_seq,  // seq_kv = all cached + new
+        head_dim,
+        scale
+    );
 
     // 5. Output projection - use Wo's actual quantization type
     dispatch_matvec(attn_out_buf, wo_buf, o_buf, raw_wo->quant_type, q_dim, hidden_dim);

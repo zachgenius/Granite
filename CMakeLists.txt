@@ -160,7 +160,7 @@ option(GRANITE_BUILD_COREML "Build CoreML backend for ANE (Apple only)" ON)
 
 if(APPLE AND GRANITE_BUILD_COREML AND GRANITE_BUILD_METAL)
     set(GRANITE_COREML_SOURCES
-        src/backend/coreml/coreml_attention.mm
+        src/backend/coreml/coreml_ffn.mm
     )
 
     target_sources(granite PRIVATE ${GRANITE_COREML_SOURCES})

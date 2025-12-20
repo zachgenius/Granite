@@ -35,7 +35,7 @@
 #endif
 
 #ifdef GRANITE_HAS_COREML
-#include "granite/coreml_attention.h"
+#include "granite/coreml_ffn.h"
 #endif
 
 namespace granite {
