@@ -3568,10 +3568,20 @@ Result<Tensor> TransformerModel::attention_full_gpu(
         }
     };
 
-    // 1. Q/K/V projections - use each weight's actual quantization type
-    dispatch_matvec(h_buf, wq_buf, q_buf, raw_wq->quant_type, hidden_dim, q_dim);
-    dispatch_matvec(h_buf, wk_buf, k_buf, raw_wk->quant_type, hidden_dim, kv_dim);
-    dispatch_matvec(h_buf, wv_buf, v_buf, raw_wv->quant_type, hidden_dim, kv_dim);
+    // 1. Q/K/V projections - use fused kernel when all weights are Q4_K
+    if (raw_wq->quant_type == GGMLType::Q4_K &&
+        raw_wk->quant_type == GGMLType::Q4_K &&
+        raw_wv->quant_type == GGMLType::Q4_K) {
+        // Fused QKV projection: 3 dispatches -> 1
+        gpu->fused_qkv_matvec_q4k(h_buf, wq_buf, wk_buf, wv_buf,
+                                  q_buf, k_buf, v_buf,
+                                  hidden_dim, q_dim, kv_dim);
+    } else {
+        // Fallback to separate dispatches for mixed quantization
+        dispatch_matvec(h_buf, wq_buf, q_buf, raw_wq->quant_type, hidden_dim, q_dim);
+        dispatch_matvec(h_buf, wk_buf, k_buf, raw_wk->quant_type, hidden_dim, kv_dim);
+        dispatch_matvec(h_buf, wv_buf, v_buf, raw_wv->quant_type, hidden_dim, kv_dim);
+    }
 
     // 2. Apply RoPE to Q and K
     gpu->rope_multihead(q_buf, k_buf, num_heads, num_kv_heads, 1, head_dim,

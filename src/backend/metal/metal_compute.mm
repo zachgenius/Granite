@@ -1715,8 +1715,8 @@ Result<void> MetalCompute::fused_qkv_matvec_q4k(
     encoder->setBytes(&Nq, sizeof(Nq), 8);
     encoder->setBytes(&Nkv, sizeof(Nkv), 9);
 
-    // Calculate threadgroups: 8 SIMD groups per TG, 2 rows per SIMD = 16 rows per TG
-    constexpr uint32_t rows_per_tg = 16;
+    // Calculate threadgroups: 2 SIMD groups per TG, 2 rows per SIMD = 4 rows per TG
+    constexpr uint32_t rows_per_tg = 4;
     uint32_t q_threadgroups = (Nq + rows_per_tg - 1) / rows_per_tg;
     uint32_t kv_threadgroups = (Nkv + rows_per_tg - 1) / rows_per_tg;
     uint32_t total_threadgroups = q_threadgroups + 2 * kv_threadgroups;  // Q + K + V
@@ -1725,7 +1725,7 @@ Result<void> MetalCompute::fused_qkv_matvec_q4k(
     encoder->setBytes(&kv_threadgroups, sizeof(kv_threadgroups), 11);
 
     MTL::Size grid_size = MTL::Size::Make(total_threadgroups, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);  // 8 SIMD groups * 32 threads
+    MTL::Size threadgroup_size = MTL::Size::Make(64, 1, 1);  // 2 SIMD groups * 32 threads
     encoder->dispatchThreadgroups(grid_size, threadgroup_size);
 
     return {};
