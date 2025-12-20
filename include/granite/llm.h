@@ -18,6 +18,10 @@
 
 namespace granite {
 
+// Forward declarations for paged attention
+class BlockManager;
+class PagedKVCache;
+
 // =============================================================================
 // Raw Quantized Weight (for GPU acceleration)
 // =============================================================================
@@ -424,6 +428,24 @@ public:
     /// Get GPU KV cache
     GPUKVCache* gpu_kv_cache() { return gpu_kv_cache_.get(); }
     const GPUKVCache* gpu_kv_cache() const { return gpu_kv_cache_.get(); }
+
+    /// Allocate paged KV cache for memory-efficient long contexts
+    Result<void> allocate_paged_kv_cache(int max_seq_len, int block_size = 16);
+
+    /// Check if paged attention is active
+    [[nodiscard]] bool is_paged_attention() const {
+        return use_paged_attention_ && block_manager_ && paged_cache_;
+    }
+
+    /// Get paged KV cache
+    PagedKVCache* paged_cache() { return paged_cache_.get(); }
+    const PagedKVCache* paged_cache() const { return paged_cache_.get(); }
+
+    /// Clear paged cache (release all blocks, reset state)
+    void clear_paged_cache();
+
+    /// Truncate paged cache to specific length
+    void truncate_paged_cache(int new_len);
 #endif
 
 private:
@@ -439,6 +461,16 @@ private:
 
 #ifdef GRANITE_HAS_METAL
     std::unique_ptr<GPUKVCache> gpu_kv_cache_;
+
+    // Paged attention support
+    std::unique_ptr<BlockManager> block_manager_;
+    std::unique_ptr<PagedKVCache> paged_cache_;
+    void* block_table_buf_ = nullptr;  // GPU buffer for block table
+    bool use_paged_attention_ = false;
+
+    // Helper methods for paged attention
+    Result<Tensor> attention_paged_gpu(const Tensor& hidden, int layer, int start_pos);
+    Result<void> sync_block_table_to_gpu();
 
     // Decode buffer pool - preallocated buffers for single-token decode
     struct DecodeBufferPool {

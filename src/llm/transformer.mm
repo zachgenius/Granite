@@ -2553,6 +2553,276 @@ Result<void> TransformerModel::allocate_gpu_kv_cache(int max_seq_len) {
     return {};
 }
 
+// =============================================================================
+// Paged Attention Support
+// =============================================================================
+
+Result<void> TransformerModel::allocate_paged_kv_cache(int max_seq_len, int block_size) {
+    auto* gpu = get_metal_compute();
+    if (!gpu || !gpu->is_initialized()) {
+        GRANITE_FAIL(ErrorCode::InternalError, "MetalCompute not initialized for paged attention");
+    }
+
+    // Calculate number of blocks needed
+    int num_blocks = (max_seq_len + block_size - 1) / block_size;
+    // Add 10% headroom for fragmentation
+    num_blocks = static_cast<int>(num_blocks * 1.1);
+
+    // Initialize block manager
+    PagedKVConfig config;
+    config.block_size = block_size;
+    config.num_blocks = num_blocks;
+    config.num_layers = model_config_.num_layers;
+    config.num_kv_heads = model_config_.num_kv_heads;
+    config.head_dim = model_config_.head_dim;
+
+    block_manager_ = std::make_unique<BlockManager>();
+    auto init_result = block_manager_->initialize(config, backend_);
+    if (!init_result.ok()) {
+        return init_result.error();
+    }
+
+    // Create per-sequence paged cache
+    paged_cache_ = std::make_unique<PagedKVCache>(block_manager_.get());
+
+    // Allocate GPU buffer for block table
+    int max_logical_blocks = (max_seq_len + block_size - 1) / block_size;
+    block_table_buf_ = gpu->create_buffer(max_logical_blocks * sizeof(int32_t));
+    if (!block_table_buf_) {
+        GRANITE_FAIL(ErrorCode::OutOfMemory, "Failed to allocate block table buffer");
+    }
+
+    use_paged_attention_ = true;
+
+    // Also initialize decode buffer pool
+    auto pool_result = init_decode_pool();
+    if (!pool_result.ok()) {
+        GRANITE_LOG_WARN("Failed to initialize decode buffer pool: {}",
+                         pool_result.error().message());
+    }
+
+    GRANITE_LOG_INFO("Paged KV cache allocated: {} blocks x {} tokens, {} layers",
+                     num_blocks, block_size, model_config_.num_layers);
+
+    return {};
+}
+
+Result<void> TransformerModel::sync_block_table_to_gpu() {
+    if (!block_table_buf_ || !paged_cache_) {
+        return {};
+    }
+
+    const auto& block_table = paged_cache_->block_table();
+    if (block_table.empty()) {
+        return {};
+    }
+
+    auto* gpu_buf = static_cast<MTL::Buffer*>(block_table_buf_);
+
+    // Copy block table to GPU buffer
+    int32_t* gpu_data = static_cast<int32_t*>(gpu_buf->contents());
+    std::memcpy(gpu_data, block_table.data(), block_table.size() * sizeof(int32_t));
+    gpu_buf->didModifyRange(NS::Range::Make(0, block_table.size() * sizeof(int32_t)));
+
+    return {};
+}
+
+void TransformerModel::clear_paged_cache() {
+    if (paged_cache_) {
+        paged_cache_->clear();
+    }
+}
+
+void TransformerModel::truncate_paged_cache(int new_len) {
+    if (paged_cache_) {
+        paged_cache_->truncate(new_len);
+    }
+}
+
+Result<Tensor> TransformerModel::attention_paged_gpu(
+    const Tensor& hidden,
+    int layer,
+    int start_pos)
+{
+    std::string prefix = "blk." + std::to_string(layer) + ".";
+
+    // Get raw quantized weights
+    const RawWeight* raw_wq = get_raw_weight(prefix + "attn_q.weight");
+    const RawWeight* raw_wk = get_raw_weight(prefix + "attn_k.weight");
+    const RawWeight* raw_wv = get_raw_weight(prefix + "attn_v.weight");
+    const RawWeight* raw_wo = get_raw_weight(prefix + "attn_output.weight");
+
+    if (!raw_wq || !raw_wk || !raw_wv || !raw_wo) {
+        GRANITE_FAIL(ErrorCode::InternalError, "Missing attention weights for layer " + std::to_string(layer));
+    }
+
+    auto* gpu = get_metal_compute();
+    if (!gpu || !block_manager_ || !paged_cache_) {
+        GRANITE_FAIL(ErrorCode::InternalError, "Paged attention not initialized");
+    }
+
+    int hidden_dim = model_config_.hidden_dim;
+    int num_heads = model_config_.num_heads;
+    int num_kv_heads = model_config_.num_kv_heads;
+    int head_dim = model_config_.head_dim;
+    int q_dim = num_heads * head_dim;
+    int kv_dim = num_kv_heads * head_dim;
+    int block_size = block_manager_->block_size();
+    int current_len = paged_cache_->seq_len();
+    int total_seq = current_len + 1;
+
+    // Allocate new blocks if needed (only on layer 0)
+    if (layer == 0) {
+        if (!paged_cache_->append_tokens(1)) {
+            GRANITE_FAIL(ErrorCode::OutOfMemory, "Failed to allocate blocks for new token");
+        }
+        GRANITE_TRY(sync_block_table_to_gpu());
+    }
+
+    // Get Metal buffers
+    auto* h_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(hidden.buffer()));
+    auto* wq_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_wq->buffer));
+    auto* wk_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_wk->buffer));
+    auto* wv_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_wv->buffer));
+    auto* wo_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_wo->buffer));
+
+    // Get K/V cache buffers from BlockManager
+    auto& k_cache_tensor = block_manager_->k_cache(layer);
+    auto& v_cache_tensor = block_manager_->v_cache(layer);
+    auto* k_cache_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(k_cache_tensor.buffer()));
+    auto* v_cache_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(v_cache_tensor.buffer()));
+    auto* block_table_gpu = static_cast<MTL::Buffer*>(block_table_buf_);
+
+    // Use pooled buffers if available
+    bool use_pool = decode_pool_ && decode_pool_->initialized &&
+                    decode_pool_->q_buf && decode_pool_->k_buf &&
+                    decode_pool_->v_buf && decode_pool_->attn_out_buf;
+
+    MTL::Buffer* q_buf;
+    MTL::Buffer* k_buf;
+    MTL::Buffer* v_buf;
+    MTL::Buffer* attn_out_buf;
+
+    if (use_pool) {
+        q_buf = static_cast<MTL::Buffer*>(decode_pool_->q_buf);
+        k_buf = static_cast<MTL::Buffer*>(decode_pool_->k_buf);
+        v_buf = static_cast<MTL::Buffer*>(decode_pool_->v_buf);
+        attn_out_buf = static_cast<MTL::Buffer*>(decode_pool_->attn_out_buf);
+    } else {
+        q_buf = gpu->create_buffer(q_dim * sizeof(float));
+        k_buf = gpu->create_buffer(kv_dim * sizeof(float));
+        v_buf = gpu->create_buffer(kv_dim * sizeof(float));
+        attn_out_buf = gpu->create_buffer(q_dim * sizeof(float));
+    }
+
+    if (!q_buf || !k_buf || !v_buf || !attn_out_buf) {
+        if (!use_pool) {
+            if (q_buf) q_buf->release();
+            if (k_buf) k_buf->release();
+            if (v_buf) v_buf->release();
+            if (attn_out_buf) attn_out_buf->release();
+        }
+        GRANITE_FAIL(ErrorCode::OutOfMemory, "Failed to allocate attention buffers");
+    }
+
+    // Use pooled output tensor if available
+    Tensor output;
+    MTL::Buffer* o_buf = nullptr;
+    bool use_output_pool = use_pool && decode_pool_->attn_layer_out.buffer().valid();
+
+    if (use_output_pool) {
+        output = decode_pool_->attn_layer_out;
+        o_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(output.buffer()));
+    } else {
+        std::vector<int64_t> output_shape = {1, 1, static_cast<int64_t>(hidden_dim)};
+        auto output_result = Tensor::allocate(output_shape, DataType::FP32, backend_);
+        if (!output_result.ok()) {
+            if (!use_pool) {
+                q_buf->release();
+                k_buf->release();
+                v_buf->release();
+                attn_out_buf->release();
+            }
+            return output_result.error();
+        }
+        output = std::move(output_result).take();
+        o_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(output.buffer()));
+    }
+
+    // === GPU OPERATIONS ===
+
+    // Helper lambda for matvec dispatch
+    auto dispatch_matvec = [&](MTL::Buffer* in, MTL::Buffer* weight, MTL::Buffer* out,
+                               GGMLType qtype, int K, int N) {
+        switch (qtype) {
+            case GGMLType::Q8_0:  gpu->matvec_q8_0(in, weight, out, K, N); break;
+            case GGMLType::Q4_0:  gpu->matvec_q4_0(in, weight, out, K, N); break;
+            case GGMLType::IQ4_NL: gpu->matvec_iq4_nl(in, weight, out, K, N); break;
+            case GGMLType::IQ4_XS: gpu->matvec_iq4_xs(in, weight, out, K, N); break;
+            case GGMLType::IQ3_S: gpu->matvec_iq3_s(in, weight, out, K, N); break;
+            case GGMLType::Q6_K:  gpu->matvec_q6_k(in, weight, out, K, N); break;
+            case GGMLType::Q5_K:  gpu->matvec_q5_k(in, weight, out, K, N); break;
+            case GGMLType::Q4_K:  gpu->matvec_q4k(in, weight, out, K, N); break;
+            case GGMLType::Q3_K:  gpu->matvec_q3_k(in, weight, out, K, N); break;
+            case GGMLType::Q2_K:  gpu->matvec_q2_k(in, weight, out, K, N); break;
+            default: gpu->matvec_q4k(in, weight, out, K, N); break;
+        }
+    };
+
+    // 1. Q/K/V projections
+    if (raw_wq->quant_type == GGMLType::Q4_K &&
+        raw_wk->quant_type == GGMLType::Q4_K &&
+        raw_wv->quant_type == GGMLType::Q4_K) {
+        gpu->fused_qkv_matvec_q4k(h_buf, wq_buf, wk_buf, wv_buf,
+                                  q_buf, k_buf, v_buf,
+                                  hidden_dim, q_dim, kv_dim);
+    } else {
+        dispatch_matvec(h_buf, wq_buf, q_buf, raw_wq->quant_type, hidden_dim, q_dim);
+        dispatch_matvec(h_buf, wk_buf, k_buf, raw_wk->quant_type, hidden_dim, kv_dim);
+        dispatch_matvec(h_buf, wv_buf, v_buf, raw_wv->quant_type, hidden_dim, kv_dim);
+    }
+
+    // 2. Apply RoPE
+    gpu->rope_multihead(q_buf, k_buf, num_heads, num_kv_heads, 1, head_dim,
+                        start_pos, model_config_.rope_theta);
+
+    // 3. Append K/V to PAGED cache
+    gpu->paged_kv_cache_append(
+        k_buf, v_buf,
+        k_cache_buf, v_cache_buf,
+        block_table_gpu,
+        num_kv_heads, head_dim,
+        current_len, 1, block_size
+    );
+
+    // 4. Paged attention decode
+    float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    gpu->paged_attention_decode(
+        q_buf,
+        k_cache_buf, v_cache_buf,
+        block_table_gpu,
+        attn_out_buf,
+        num_heads, num_kv_heads,
+        total_seq,
+        head_dim,
+        block_size,
+        scale
+    );
+
+    // 5. Output projection
+    dispatch_matvec(attn_out_buf, wo_buf, o_buf, raw_wo->quant_type, q_dim, hidden_dim);
+
+    // Clean up if not using pool
+    if (!use_pool) {
+        q_buf->release();
+        k_buf->release();
+        v_buf->release();
+        attn_out_buf->release();
+    }
+
+    return output;
+}
+
 // Initialize decode buffer pool for single-token decode
 Result<void> TransformerModel::init_decode_pool() {
     if (decode_pool_ && decode_pool_->initialized) {
@@ -3684,6 +3954,15 @@ Result<Tensor> TransformerModel::attention_gpu(
     int seq_len = static_cast<int>(hidden.size(1));
     int total_tokens = batch * seq_len;
     bool is_decode = (total_tokens == 1);
+
+    // Check for paged attention mode first (highest priority)
+    if (is_decode && is_paged_attention()) {
+        int paged_len = paged_cache_->seq_len();
+        // Use paged path when cache length matches expected position
+        if (paged_len == start_pos) {
+            return attention_paged_gpu(hidden, layer, start_pos);
+        }
+    }
 
     // Check if GPU cache exists and is allocated
     bool has_gpu_cache = gpu_kv_cache_ && gpu_kv_cache_->is_allocated();
