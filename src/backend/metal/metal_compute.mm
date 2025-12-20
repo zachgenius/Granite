@@ -422,9 +422,7 @@ private:
         std::vector<std::string> kernels = {
             // Core quantized kernels
             "matvec_q4k", "matmul_q4k", "matmul_q4k_vec", "matmul_q4k_tiled", "matmul_q4k_simd",
-            "matmul_q4k_simdgroup",  // simdgroup_half8x8 optimized matmul
-            "matmul_q4k_simdgroup_fast",  // No bounds checking - for aligned dimensions
-            "matmul_q4k_simdgroup_fast_f16",  // Half precision I/O - reduced bandwidth
+            // NOTE: matmul_q4k_simdgroup uses function constants and is compiled separately below
             "matvec_f16", "matmul_f16",
             "matvec_q8_0", "matmul_q8_0",
             "matvec_q4_0", "matmul_q4_0",
@@ -492,6 +490,49 @@ private:
 
             pipelines_[name] = pipeline;
             GRANITE_LOG_DEBUG("Created Metal pipeline: {}", name);
+        }
+
+        // Compile matmul_q4k_simdgroup with function constants (llama.cpp style)
+        // FC_MUL_MM + 0 = FC_mm_bc_inp (bounds check input)
+        // FC_MUL_MM + 1 = FC_mm_bc_out (bounds check output)
+        constexpr uint32_t FC_MUL_MM = 100;
+        struct SgmmVariant {
+            const char* name;
+            bool bc_inp;
+            bool bc_out;
+        };
+        SgmmVariant sgmm_variants[] = {
+            {"matmul_q4k_simdgroup_00", false, false},  // Inner tiles - no bounds check
+            {"matmul_q4k_simdgroup_01", false, true},   // Edge N only
+            {"matmul_q4k_simdgroup_10", true, false},   // Edge M only
+            {"matmul_q4k_simdgroup_11", true, true},    // Edge tile - full bounds check
+        };
+
+        NS::String* sgmm_func_name = NS::String::string("matmul_q4k_simdgroup", NS::UTF8StringEncoding);
+
+        for (const auto& v : sgmm_variants) {
+            MTL::FunctionConstantValues* fc_values = MTL::FunctionConstantValues::alloc()->init();
+            fc_values->setConstantValue(&v.bc_inp, MTL::DataTypeBool, FC_MUL_MM + 0);
+            fc_values->setConstantValue(&v.bc_out, MTL::DataTypeBool, FC_MUL_MM + 1);
+
+            MTL::Function* func = library->newFunction(sgmm_func_name, fc_values, &error);
+            fc_values->release();
+
+            if (!func) {
+                GRANITE_LOG_WARN("Function '{}' not found with constants", v.name);
+                continue;
+            }
+
+            MTL::ComputePipelineState* pipeline = device_->newComputePipelineState(func, &error);
+            func->release();
+
+            if (!pipeline) {
+                GRANITE_LOG_WARN("Failed to create pipeline for '{}'", v.name);
+                continue;
+            }
+
+            pipelines_[v.name] = pipeline;
+            GRANITE_LOG_DEBUG("Created Metal pipeline: {} (bc_inp={}, bc_out={})", v.name, v.bc_inp, v.bc_out);
         }
 
         library->release();
@@ -606,17 +647,16 @@ Result<void> MetalCompute::matmul_q4k(
 {
     // Simdgroup matrix kernel for prefill batches (M >= 32)
     // Uses simdgroup_half8x8 matrices and simdgroup_multiply_accumulate.
-    // This is the fastest kernel for prefill batches, leveraging
-    // hardware SIMD matrix units for 8x8 tiled multiply-accumulate.
-    // FP16 intermediate precision gives ~0.5 max absolute error vs FP32 reference.
-    // Note: The kernel processes 32 rows (NR1) at a time, so M >= 32 is ideal.
+    // Compiled with function constants for compile-time branch elimination:
+    //   - kernel_00: No bounds checking (aligned dimensions)
+    //   - kernel_11: Full bounds checking (edge tiles)
     if (M >= 32) {
         // Use fast kernel when dimensions are perfectly aligned (no bounds checking needed)
-        // NR1=32 (M rows), NR0=64 (N cols), SGMM_NK=32 (K blocks)
-        if (M % 32 == 0 && N % 64 == 0 && K % 32 == 0) {
-            return impl_->dispatch_matmul_simdgroup("matmul_q4k_simdgroup_fast", X, W, Y, M, K, N);
+        // NR1=32 (M rows), NR0=64 (N cols)
+        if (M % 32 == 0 && N % 64 == 0) {
+            return impl_->dispatch_matmul_simdgroup("matmul_q4k_simdgroup_00", X, W, Y, M, K, N);
         }
-        return impl_->dispatch_matmul_simdgroup("matmul_q4k_simdgroup", X, W, Y, M, K, N);
+        return impl_->dispatch_matmul_simdgroup("matmul_q4k_simdgroup_11", X, W, Y, M, K, N);
     }
     // Use tiled kernel for medium batches
     if (M > 2) {
@@ -634,12 +674,8 @@ Result<void> MetalCompute::matmul_q4k_f16(
     MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
     uint32_t M, uint32_t K, uint32_t N)
 {
-    // Half precision input kernel (llama.cpp style: half input, float output)
-    // Only works for aligned dimensions on the fast kernel path
-    if (M >= 32 && M % 32 == 0 && N % 64 == 0 && K % 32 == 0) {
-        return impl_->dispatch_matmul_simdgroup("matmul_q4k_simdgroup_fast_f16", X, W, Y, M, K, N);
-    }
-    // Fall back to f32 kernel for unaligned dimensions (would need conversion in caller)
+    // TODO: Add dedicated f16 input variant with function constants if needed
+    // For now, delegate to f32 kernel (caller needs to convert)
     return matmul_q4k(X, W, Y, M, K, N);
 }
 

@@ -1,4 +1,4 @@
-// GPU Q4_K Matmul Benchmark - compares f32 vs f16 I/O kernels
+// GPU Q4_K Matmul Benchmark - tests function constant kernel variants
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <chrono>
@@ -17,8 +17,8 @@ int main() {
             return 1;
         }
 
-        std::cout << "GPU Q4_K Matmul Benchmark - F32 vs F16 I/O\n";
-        std::cout << "==========================================\n";
+        std::cout << "GPU Q4_K Matmul Benchmark - Function Constants\n";
+        std::cout << "================================================\n";
         std::cout << "Device: " << [device.name UTF8String] << "\n\n";
 
         id<MTLCommandQueue> queue = [device newCommandQueue];
@@ -37,40 +37,58 @@ int main() {
             return 1;
         }
 
-        // Get kernels
-        id<MTLFunction> fast_f32_func = [library newFunctionWithName:@"matmul_q4k_simdgroup_fast"];
-        id<MTLFunction> fast_f16_func = [library newFunctionWithName:@"matmul_q4k_simdgroup_fast_f16"];
+        // Create specialized kernels with function constants
+        // FC_MUL_MM + 0 = FC_mm_bc_inp, FC_MUL_MM + 1 = FC_mm_bc_out
+        constexpr uint32_t FC_MUL_MM = 100;
 
-        if (!fast_f32_func) {
-            std::cerr << "matmul_q4k_simdgroup_fast not found\n";
+        auto create_pipeline = [&](bool bc_inp, bool bc_out) -> id<MTLComputePipelineState> {
+            MTLFunctionConstantValues* fc = [[MTLFunctionConstantValues alloc] init];
+            [fc setConstantValue:&bc_inp type:MTLDataTypeBool atIndex:FC_MUL_MM + 0];
+            [fc setConstantValue:&bc_out type:MTLDataTypeBool atIndex:FC_MUL_MM + 1];
+
+            NSError* err = nil;
+            id<MTLFunction> func = [library newFunctionWithName:@"matmul_q4k_simdgroup"
+                                                 constantValues:fc
+                                                          error:&err];
+            if (!func) {
+                std::cerr << "Function creation failed: " << [[err localizedDescription] UTF8String] << "\n";
+                return nil;
+            }
+
+            id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:func error:&err];
+            if (!pipeline) {
+                std::cerr << "Pipeline failed: " << [[err localizedDescription] UTF8String] << "\n";
+            }
+            return pipeline;
+        };
+
+        // Create all 4 variants
+        id<MTLComputePipelineState> pipe_00 = create_pipeline(false, false);  // No bounds check
+        id<MTLComputePipelineState> pipe_01 = create_pipeline(false, true);   // Output bounds only
+        id<MTLComputePipelineState> pipe_10 = create_pipeline(true, false);   // Input bounds only
+        id<MTLComputePipelineState> pipe_11 = create_pipeline(true, true);    // Full bounds check
+
+        if (!pipe_00 || !pipe_11) {
+            std::cerr << "Failed to create required pipelines\n";
             return 1;
         }
-        if (!fast_f16_func) {
-            std::cerr << "matmul_q4k_simdgroup_fast_f16 not found\n";
-            return 1;
-        }
 
-        id<MTLComputePipelineState> f32_pipeline = [device newComputePipelineStateWithFunction:fast_f32_func error:&error];
-        id<MTLComputePipelineState> f16_pipeline = [device newComputePipelineStateWithFunction:fast_f16_func error:&error];
-
-        if (!f32_pipeline || !f16_pipeline) {
-            std::cerr << "Pipeline failed: " << [[error localizedDescription] UTF8String] << "\n";
-            return 1;
-        }
-
-        // Test cases matching TinyLlama prefill (must be aligned for fast kernels)
-        struct TestCase { uint32_t M, K, N; const char* name; };
+        // Test cases matching TinyLlama prefill
+        struct TestCase { uint32_t M, K, N; const char* name; bool aligned; };
         std::vector<TestCase> tests = {
-            {32, 2048, 2048, "Attn Q/K/V pp32"},
-            {64, 2048, 2048, "Attn Q/K/V pp64"},
-            {128, 2048, 2048, "Attn Q/K/V pp128"},
-            {256, 2048, 2048, "Attn Q/K/V pp256"},
-            {512, 2048, 2048, "Attn Q/K/V pp512"},
-            {32, 2048, 5632, "FFN gate/up pp32"},
-            {128, 2048, 5632, "FFN gate/up pp128"},
-            {512, 2048, 5632, "FFN gate/up pp512"},
-            {32, 5632, 2048, "FFN down pp32"},
-            {128, 5632, 2048, "FFN down pp128"},
+            {32, 2048, 2048, "Attn Q/K/V pp32", true},
+            {64, 2048, 2048, "Attn Q/K/V pp64", true},
+            {128, 2048, 2048, "Attn Q/K/V pp128", true},
+            {256, 2048, 2048, "Attn Q/K/V pp256", true},
+            {512, 2048, 2048, "Attn Q/K/V pp512", true},
+            {32, 2048, 5632, "FFN gate/up pp32", true},
+            {128, 2048, 5632, "FFN gate/up pp128", true},
+            {512, 2048, 5632, "FFN gate/up pp512", true},
+            {32, 5632, 2048, "FFN down pp32", true},
+            {128, 5632, 2048, "FFN down pp128", true},
+            // Unaligned cases (require bounds checking)
+            {33, 2048, 2048, "Unaligned M=33", false},
+            {64, 2048, 2049, "Unaligned N=2049", false},
         };
 
         constexpr uint32_t NR0 = 64, NR1 = 32;
@@ -130,12 +148,12 @@ int main() {
                   << std::setw(8) << "M"
                   << std::setw(8) << "K"
                   << std::setw(8) << "N"
-                  << std::setw(11) << "F32(us)"
-                  << std::setw(11) << "F16(us)"
+                  << std::setw(11) << "00(us)"
+                  << std::setw(11) << "11(us)"
                   << std::setw(9) << "Speedup" << "\n";
         std::cout << std::string(77, '-') << "\n";
 
-        double total_f32_time = 0, total_f16_time = 0;
+        double total_00_time = 0, total_11_time = 0;
 
         for (const auto& tc : tests) {
             uint32_t M = tc.M, K = tc.K, N = tc.N;
@@ -143,62 +161,58 @@ int main() {
             // Q4_K: 256 elements per block, 144 bytes per block
             size_t num_blocks = (size_t(K) * N + 255) / 256;
             size_t W_size = num_blocks * 144;
-            size_t X_size_f32 = size_t(M) * K * sizeof(float);
-            size_t X_size_f16 = size_t(M) * K * sizeof(uint16_t);  // half
-            size_t Y_size_f32 = size_t(M) * N * sizeof(float);
-            size_t Y_size_f16 = size_t(M) * N * sizeof(uint16_t);  // half
+            size_t X_size = size_t(M) * K * sizeof(float);
+            size_t Y_size = size_t(M) * N * sizeof(float);
 
-            // F32 buffers
-            id<MTLBuffer> X_buf_f32 = [device newBufferWithLength:X_size_f32 options:MTLResourceStorageModeShared];
+            id<MTLBuffer> X_buf = [device newBufferWithLength:X_size options:MTLResourceStorageModeShared];
             id<MTLBuffer> W_buf = [device newBufferWithLength:W_size options:MTLResourceStorageModeShared];
-            id<MTLBuffer> Y_buf_f32 = [device newBufferWithLength:Y_size_f32 options:MTLResourceStorageModeShared];
-
-            // F16 input kernel uses half input, float output (llama.cpp style)
-            id<MTLBuffer> X_buf_f16 = [device newBufferWithLength:X_size_f16 options:MTLResourceStorageModeShared];
-            id<MTLBuffer> Y_buf_f16 = [device newBufferWithLength:Y_size_f32 options:MTLResourceStorageModeShared];  // Float output!
+            id<MTLBuffer> Y_buf = [device newBufferWithLength:Y_size options:MTLResourceStorageModeShared];
 
             // Initialize with test data
-            float* X_f32 = (float*)[X_buf_f32 contents];
-            uint16_t* X_f16 = (uint16_t*)[X_buf_f16 contents];
+            float* X = (float*)[X_buf contents];
             uint8_t* W_ptr = (uint8_t*)[W_buf contents];
-
-            for (size_t i = 0; i < size_t(M) * K; i++) {
-                float val = 0.01f * (i % 100);
-                X_f32[i] = val;
-                // Convert to half (simple approximation for benchmark)
-                uint32_t f = *(uint32_t*)&val;
-                uint16_t h = ((f >> 16) & 0x8000) | (((f >> 13) - (127 - 15) << 10) & 0x7c00) | ((f >> 13) & 0x03ff);
-                X_f16[i] = h;
-            }
+            for (size_t i = 0; i < size_t(M) * K; i++) X[i] = 0.01f * (i % 100);
             for (size_t i = 0; i < W_size; i++) W_ptr[i] = rand() % 256;
 
-            // Benchmark both kernels
-            double us_f32 = bench_kernel(f32_pipeline, X_buf_f32, W_buf, Y_buf_f32, M, K, N);
-            double us_f16 = bench_kernel(f16_pipeline, X_buf_f16, W_buf, Y_buf_f16, M, K, N);
+            // Use appropriate kernel based on alignment
+            id<MTLComputePipelineState> fast_pipe = tc.aligned ? pipe_00 : pipe_11;
 
-            double speedup = us_f32 / us_f16;
-            total_f32_time += us_f32;
-            total_f16_time += us_f16;
+            // Benchmark: compare no-bounds-check vs full-bounds-check
+            double us_00 = tc.aligned ? bench_kernel(pipe_00, X_buf, W_buf, Y_buf, M, K, N) : 0;
+            double us_11 = bench_kernel(pipe_11, X_buf, W_buf, Y_buf, M, K, N);
 
-            std::cout << std::setw(22) << tc.name
-                      << std::setw(8) << M
-                      << std::setw(8) << K
-                      << std::setw(8) << N
-                      << std::setw(11) << std::fixed << std::setprecision(1) << us_f32
-                      << std::setw(11) << std::setprecision(1) << us_f16
-                      << std::setw(8) << std::setprecision(2) << speedup << "x\n";
+            if (tc.aligned) {
+                double speedup = us_11 / us_00;
+                total_00_time += us_00;
+                total_11_time += us_11;
+
+                std::cout << std::setw(22) << tc.name
+                          << std::setw(8) << M
+                          << std::setw(8) << K
+                          << std::setw(8) << N
+                          << std::setw(11) << std::fixed << std::setprecision(1) << us_00
+                          << std::setw(11) << std::setprecision(1) << us_11
+                          << std::setw(8) << std::setprecision(2) << speedup << "x\n";
+            } else {
+                std::cout << std::setw(22) << tc.name
+                          << std::setw(8) << M
+                          << std::setw(8) << K
+                          << std::setw(8) << N
+                          << std::setw(11) << "-"
+                          << std::setw(11) << std::fixed << std::setprecision(1) << us_11
+                          << std::setw(9) << "(N/A)\n";
+            }
         }
 
         std::cout << std::string(77, '-') << "\n";
-        std::cout << std::setw(54) << "Total:"
-                  << std::setw(11) << std::fixed << std::setprecision(1) << total_f32_time
-                  << std::setw(11) << std::setprecision(1) << total_f16_time
-                  << std::setw(8) << std::setprecision(2) << (total_f32_time / total_f16_time) << "x\n";
+        std::cout << std::setw(54) << "Total (aligned):"
+                  << std::setw(11) << std::fixed << std::setprecision(1) << total_00_time
+                  << std::setw(11) << std::setprecision(1) << total_11_time
+                  << std::setw(8) << std::setprecision(2) << (total_11_time / total_00_time) << "x\n";
 
-        std::cout << "\nBandwidth savings with F16 I/O:\n";
-        std::cout << "  F32: X[M*K*4] + Y[M*N*4] = " << (2*512*2048*4 + 2*512*5632*4)/1e6 << " MB per FFN layer\n";
-        std::cout << "  F16: X[M*K*2] + Y[M*N*2] = " << (2*512*2048*2 + 2*512*5632*2)/1e6 << " MB per FFN layer\n";
-        std::cout << "  Reduction: 50%\n";
+        std::cout << "\nFunction constant variants:\n";
+        std::cout << "  00 (bc_inp=false, bc_out=false): No bounds checking - fastest\n";
+        std::cout << "  11 (bc_inp=true,  bc_out=true):  Full bounds checking - safe for any dimension\n";
     }
     return 0;
 }

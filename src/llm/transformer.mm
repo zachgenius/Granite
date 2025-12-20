@@ -2971,14 +2971,14 @@ Result<void*> TransformerModel::forward_prefill_raw(
     auto* pipe_embedding = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("embedding_lookup"));
     auto* pipe_rms_batch = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("rms_norm_batch"));
     auto* pipe_rms_batch_f16 = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("rms_norm_batch_f16"));
-    auto* pipe_matmul_q4k = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("matmul_q4k_simdgroup"));
-    auto* pipe_matmul_q4k_fast = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("matmul_q4k_simdgroup_fast"));
+    auto* pipe_matmul_q4k = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("matmul_q4k_simdgroup_11"));
+    auto* pipe_matmul_q4k_fast = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("matmul_q4k_simdgroup_00"));
     auto* pipe_matmul_f16 = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("matmul_f16"));
 
     // Helper to select fast kernel when dimensions are aligned
-    // NR1=32 (M rows), NR0=64 (N cols), SGMM_NK=32 (K blocks)
-    auto select_q4k_pipe = [&](uint32_t m, uint32_t k, uint32_t n) -> MTL::ComputePipelineState* {
-        if (pipe_matmul_q4k_fast && (m % 32 == 0) && (n % 64 == 0) && (k % 32 == 0)) {
+    // NR1=32 (M rows), NR0=64 (N cols) - function constants eliminate bounds checking
+    auto select_q4k_pipe = [&](uint32_t m, uint32_t /*k*/, uint32_t n) -> MTL::ComputePipelineState* {
+        if (pipe_matmul_q4k_fast && (m % 32 == 0) && (n % 64 == 0)) {
             return pipe_matmul_q4k_fast;
         }
         return pipe_matmul_q4k;
