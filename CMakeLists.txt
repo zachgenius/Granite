@@ -394,3 +394,8 @@ add_executable(benchmark_matmul_gpu tools/benchmark_matmul_gpu.mm)
 target_link_libraries(benchmark_matmul_gpu granite)
 target_include_directories(benchmark_matmul_gpu PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+add_executable(profile_prefill_kernels tools/profile_prefill_kernels.mm)
+set_source_files_properties(tools/profile_prefill_kernels.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+target_link_libraries(profile_prefill_kernels PRIVATE granite metal-cpp "-framework Metal" "-framework Foundation")
+target_include_directories(profile_prefill_kernels PRIVATE ${CMAKE_SOURCE_DIR}/src)
+

@@ -857,7 +857,7 @@ kernel void matmul_q4k_simd(
 // 4 simdgroups (128 threads) per threadgroup
 // =============================================================================
 
-// Helper to extract 6-bit scale and min for dequantization into tiles
+// Helper to extract 6-bit scale and min for dequantization
 inline half2 get_scale_min_k4_h(int j, int k, device const uint8_t* q) {
     return j < 4 ? half2{half(q[j+0+k] & 63), half(q[j+4+k] & 63)}
                  : half2{half((q[j+4+k] & 0xF) | ((q[j-4+k] & 0xc0) >> 2)),
@@ -946,78 +946,64 @@ kernel void matmul_q4k_simdgroup(
 
     const short iy = 8 * (tiitg % NL1);  // K offset for input loading
 
+    // Pointer-based iteration matching llama.cpp pattern
+    // nl = number of 16-element chunks per Q4_K block (256/16 = 16)
+    constexpr short nl = QK_K / 16;  // 16 for Q4_K
+    short il = il0;  // Position within Q4_K block (0..15)
+
+    // Initial weight pointer for this thread's row
+    device const block_q4_K* x = (lr0 < nr0) ?
+        &weights[(r0 + lr0) * num_blocks_k + il0/nl] : nullptr;
+
+    // Input pointer for this thread's row
+    device const float* y = (lr1 < nr1) ? X + (r1 + lr1) * K + iy : nullptr;
+
     // Process K dimension in chunks
     for (uint loop_k = 0; loop_k < K; loop_k += SGMM_NK) {
-        // Each weight-loading thread loads 16 elements at K position: loop_k + 16*il0
-        // Thread il0=0 loads first 16 elements, il0=1 loads second 16 elements
-        // This covers all SGMM_NK=32 elements per iteration
-        uint k_position = loop_k + 16 * il0;
-        uint block_idx = k_position / QK_K;
-        uint within_block = (k_position % QK_K) / 16;
-
         // Load and dequantize weights into sa
-        // Weight W[n, k] for output dimension n = r0 + lr0
         half4x4 temp_a;
-        if (lr0 < nr0 && block_idx < num_blocks_k) {
-            device const block_q4_K* w_block = &weights[(r0 + lr0) * num_blocks_k + block_idx];
-            dequantize_q4_k_to_half4x4(w_block, within_block, temp_a);
+        if (x != nullptr) {
+            dequantize_q4_k_to_half4x4(x, il, temp_a);
         } else {
             temp_a = half4x4(0);
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Store weight tile with layout matching simdgroup_load expectations
-        // Pre-compute loop-invariant values
-        const short sy_w = lr0 / 8;               // N block index (0..7 for NR0=64)
-        const short lx_w = lr0 % 8;               // Within N block
-
-        // Unrolled stores with pre-computed indices
-        // First 8 elements (i=0..7): sx = 2*il0, varying ly = i%8
-        {
-            const short ib0 = 8 * (2 * il0) + sy_w;
-            threadgroup half* sa_dst = sa + 64 * ib0 + lx_w;
-            sa_dst[0]  = temp_a[0][0];  // i=0, ly=0
-            sa_dst[8]  = temp_a[0][1];  // i=1, ly=1
-            sa_dst[16] = temp_a[0][2];  // i=2, ly=2
-            sa_dst[24] = temp_a[0][3];  // i=3, ly=3
-            sa_dst[32] = temp_a[1][0];  // i=4, ly=4
-            sa_dst[40] = temp_a[1][1];  // i=5, ly=5
-            sa_dst[48] = temp_a[1][2];  // i=6, ly=6
-            sa_dst[56] = temp_a[1][3];  // i=7, ly=7
-        }
-        // Second 8 elements (i=8..15): sx = 2*il0+1, varying ly = i%8
-        {
-            const short ib1 = 8 * (2 * il0 + 1) + sy_w;
-            threadgroup half* sa_dst = sa + 64 * ib1 + lx_w;
-            sa_dst[0]  = temp_a[2][0];  // i=8,  ly=0
-            sa_dst[8]  = temp_a[2][1];  // i=9,  ly=1
-            sa_dst[16] = temp_a[2][2];  // i=10, ly=2
-            sa_dst[24] = temp_a[2][3];  // i=11, ly=3
-            sa_dst[32] = temp_a[3][0];  // i=12, ly=4
-            sa_dst[40] = temp_a[3][1];  // i=13, ly=5
-            sa_dst[48] = temp_a[3][2];  // i=14, ly=6
-            sa_dst[56] = temp_a[3][3];  // i=15, ly=7
+        // Store weight tile - exactly matching llama.cpp pattern
+        // Uses FOR_UNROLL and pointer arithmetic (NOT array indexing which is slower)
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = (short)(tiitg/NL0)/8;
+            const short lx = (short)(tiitg/NL0)%8;
+            const short ly = i%8;
+            const short ib = 8*sx + sy;
+            *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
         }
 
         // Load input into sb - llama.cpp style with half2x4 cast
-        // Input X[m, k] for batch index m = r1 + lr1
-        if (lr1 < nr1) {
+        if (y != nullptr) {
             const short sx = tiitg % NL1;       // K block index
             const short sy = lr1 / 8;           // M block index
             const short ly = lr1 % 8;           // Within M block
             const short ib = 4 * sx + sy;
 
             // Single vector load with type cast (matches llama.cpp pattern)
-            // Note: no bounds check needed since K is always a multiple of 32
-            device const float2x4* x_ptr = (device const float2x4*)(X + (r1 + lr1) * K + loop_k + iy);
-            *((threadgroup half2x4*)(sb + 64 * ib + 8 * ly)) = half2x4(*x_ptr);
+            *(threadgroup half2x4*)(sb + 64 * ib + 8 * ly) = half2x4(*(device const float2x4*)y);
         }
+
+        // Advance pointers for next iteration (matching llama.cpp exactly)
+        // il advances by 2 each iteration (we load 32 elements = 2 chunks of 16)
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        // x advances when we cross a block boundary (when il wraps to < 2)
+        x = (il < 2 && x != nullptr) ? x + 1 : x;
+        // y advances by NK elements each iteration
+        y = (y != nullptr) ? y + SGMM_NK : nullptr;
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Simdgroup matrix multiply-accumulate
-        // Each simdgroup computes 32x16 output: 32 N rows x 16 M rows
         threadgroup const half* lsma = sa + 4 * 64 * (sgitg % 2);  // Weight tiles
         threadgroup const half* lsmb = sb + 2 * 64 * (sgitg / 2);  // Input tiles
 
@@ -1025,30 +1011,24 @@ kernel void matmul_q4k_simdgroup(
         for (short ik = 0; ik < SGMM_NK / 8; ik++) {
             simdgroup_barrier(mem_flags::mem_none);
 
-            // Load 4 weight 8x8 tiles (32 N rows)
-            simdgroup_load(ma[0], lsma + 64 * 0, 8, 0, false);
-            simdgroup_load(ma[1], lsma + 64 * 1, 8, 0, false);
-            simdgroup_load(ma[2], lsma + 64 * 2, 8, 0, false);
-            simdgroup_load(ma[3], lsma + 64 * 3, 8, 0, false);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            }
 
             simdgroup_barrier(mem_flags::mem_none);
 
-            // Load 2 input 8x8 tiles (16 M rows)
-            simdgroup_load(mb[0], lsmb + 64 * 0, 8, 0, false);
-            simdgroup_load(mb[1], lsmb + 64 * 1, 8, 0, false);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            }
 
             simdgroup_barrier(mem_flags::mem_none);
 
-            // Compute: mc[i] = mb[i/4] @ ma[i%4]
-            // Result: 8 matrices of 8x8 covering 16x32 output
-            simdgroup_multiply_accumulate(mc[0], mb[0], ma[0], mc[0]);
-            simdgroup_multiply_accumulate(mc[1], mb[0], ma[1], mc[1]);
-            simdgroup_multiply_accumulate(mc[2], mb[0], ma[2], mc[2]);
-            simdgroup_multiply_accumulate(mc[3], mb[0], ma[3], mc[3]);
-            simdgroup_multiply_accumulate(mc[4], mb[1], ma[0], mc[4]);
-            simdgroup_multiply_accumulate(mc[5], mb[1], ma[1], mc[5]);
-            simdgroup_multiply_accumulate(mc[6], mb[1], ma[2], mc[6]);
-            simdgroup_multiply_accumulate(mc[7], mb[1], ma[3], mc[7]);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
 
             lsma += 8 * 64;
             lsmb += 4 * 64;
@@ -1071,19 +1051,13 @@ kernel void matmul_q4k_simdgroup(
     //    mc[4..7] are M rows 8-15 with N cols 0-7, 8-15, 16-23, 24-31
 
     if (sg_m + 16 <= M && sg_n + 32 <= N) {
-        // Full tile - store with row-major layout
-        // Y[sg_m + m_off, sg_n + n_off] = mc[...][m_local][n_local]
+        // Full tile - store with row-major layout (matching llama.cpp)
         device float* C = Y + sg_m * N + sg_n;
 
-        // Unrolled stores: i/4 gives M block, i%4 gives N block
-        simdgroup_store(mc[0], C + 0 * N + 0,  N, 0, false);
-        simdgroup_store(mc[1], C + 0 * N + 8,  N, 0, false);
-        simdgroup_store(mc[2], C + 0 * N + 16, N, 0, false);
-        simdgroup_store(mc[3], C + 0 * N + 24, N, 0, false);
-        simdgroup_store(mc[4], C + 8 * N + 0,  N, 0, false);
-        simdgroup_store(mc[5], C + 8 * N + 8,  N, 0, false);
-        simdgroup_store(mc[6], C + 8 * N + 16, N, 0, false);
-        simdgroup_store(mc[7], C + 8 * N + 24, N, 0, false);
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], C + 8*(i%4) + 8*N*(i/4), N, 0, false);
+        }
     } else {
         // Partial tile - use threadgroup memory as intermediate
         threadgroup float* sc = (threadgroup float*)(shmem);
