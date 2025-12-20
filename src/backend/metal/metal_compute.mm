@@ -424,6 +424,7 @@ private:
             "matvec_q4k", "matmul_q4k", "matmul_q4k_vec", "matmul_q4k_tiled", "matmul_q4k_simd",
             "matmul_q4k_simdgroup",  // simdgroup_half8x8 optimized matmul
             "matmul_q4k_simdgroup_fast",  // No bounds checking - for aligned dimensions
+            "matmul_q4k_simdgroup_fast_f16",  // Half precision I/O - reduced bandwidth
             "matvec_f16", "matmul_f16",
             "matvec_q8_0", "matmul_q8_0",
             "matvec_q4_0", "matmul_q4_0",
@@ -435,14 +436,19 @@ private:
             "matvec_q3_k", "matmul_q3_k",
             "matvec_q2_k", "matmul_q2_k",
             // Normalization and element-wise
-            "rms_norm", "rms_norm_f16", "rms_norm_batch", "rms_norm_batch_f16", "silu", "elementwise_mul", "rope",
-            "elementwise_add", "rope_multihead", "softmax_row",
+            "rms_norm", "rms_norm_f16", "rms_norm_batch", "rms_norm_batch_f16",
+            "rms_norm_batch_half", "rms_norm_batch_half_f32w",  // Half I/O for prefill
+            "rms_norm_batch_f32_to_f16", "rms_norm_batch_f16w_to_f16",  // Float input, half output
+            "silu", "elementwise_mul", "rope",
+            "elementwise_add", "elementwise_add_half",
+            "convert_f32_to_f16", "convert_f16_to_f32",  // Format conversion
+            "rope_multihead", "softmax_row",
             // Basic attention
             "attention_decode", "kv_cache_append", "kv_cache_append_f16",
             "multihead_attention_decode", "multihead_attention_decode_f16kv",
             "embedding_lookup",
             // Fused kernels
-            "silu_mul",
+            "silu_mul", "silu_mul_half",
             "rms_norm_matvec_q4k", "rms_norm_matvec_f16",
             "rms_norm_matvec_q8_0", "rms_norm_matvec_q4_0", "rms_norm_matvec_iq4_nl",
             "rms_norm_matvec_iq4_xs", "rms_norm_matvec_iq3_s", "rms_norm_matvec_q6_k",
@@ -622,6 +628,19 @@ Result<void> MetalCompute::matmul_q4k(
     }
     // Scalar kernel for M=1
     return impl_->dispatch_matmul("matmul_q4k", X, W, Y, M, K, N);
+}
+
+Result<void> MetalCompute::matmul_q4k_f16(
+    MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
+    uint32_t M, uint32_t K, uint32_t N)
+{
+    // Half precision input kernel (llama.cpp style: half input, float output)
+    // Only works for aligned dimensions on the fast kernel path
+    if (M >= 32 && M % 32 == 0 && N % 64 == 0 && K % 32 == 0) {
+        return impl_->dispatch_matmul_simdgroup("matmul_q4k_simdgroup_fast_f16", X, W, Y, M, K, N);
+    }
+    // Fall back to f32 kernel for unaligned dimensions (would need conversion in caller)
+    return matmul_q4k(X, W, Y, M, K, N);
 }
 
 // -----------------------------------------------------------------------------
@@ -910,6 +929,56 @@ Result<void> MetalCompute::rms_norm_batch_f16(
     return {};
 }
 
+Result<void> MetalCompute::rms_norm_batch_f32_to_f16(
+    MTL::Buffer* x, MTL::Buffer* weight, MTL::Buffer* out,
+    uint32_t batch_size, uint32_t hidden_dim, float eps)
+{
+    auto* encoder = impl_->get_encoder();
+    auto* pipeline = impl_->get_pipeline("rms_norm_batch_f32_to_f16");
+    if (!pipeline) {
+        return Error(ErrorCode::InternalError, "rms_norm_batch_f32_to_f16 pipeline not found");
+    }
+
+    encoder->setComputePipelineState(pipeline);
+    encoder->setBuffer(x, 0, 0);
+    encoder->setBuffer(weight, 0, 1);
+    encoder->setBuffer(out, 0, 2);
+    encoder->setBytes(&batch_size, sizeof(batch_size), 3);
+    encoder->setBytes(&hidden_dim, sizeof(hidden_dim), 4);
+    encoder->setBytes(&eps, sizeof(eps), 5);
+
+    MTL::Size grid_size = MTL::Size::Make(batch_size, 1, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
+
+    return {};
+}
+
+Result<void> MetalCompute::rms_norm_batch_f16w_to_f16(
+    MTL::Buffer* x, MTL::Buffer* weight, MTL::Buffer* out,
+    uint32_t batch_size, uint32_t hidden_dim, float eps)
+{
+    auto* encoder = impl_->get_encoder();
+    auto* pipeline = impl_->get_pipeline("rms_norm_batch_f16w_to_f16");
+    if (!pipeline) {
+        return Error(ErrorCode::InternalError, "rms_norm_batch_f16w_to_f16 pipeline not found");
+    }
+
+    encoder->setComputePipelineState(pipeline);
+    encoder->setBuffer(x, 0, 0);
+    encoder->setBuffer(weight, 0, 1);
+    encoder->setBuffer(out, 0, 2);
+    encoder->setBytes(&batch_size, sizeof(batch_size), 3);
+    encoder->setBytes(&hidden_dim, sizeof(hidden_dim), 4);
+    encoder->setBytes(&eps, sizeof(eps), 5);
+
+    MTL::Size grid_size = MTL::Size::Make(batch_size, 1, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
+
+    return {};
+}
+
 
 // =============================================================================
 // SECTION 5: Element-wise Operations
@@ -993,6 +1062,27 @@ Result<void> MetalCompute::elementwise_add(
     encoder->setBuffer(b, 0, 1);
     encoder->setBuffer(c, 0, 2);
     encoder->setBytes(&size, sizeof(size), 3);
+
+    MTL::Size grid_size = MTL::Size::Make(size, 1, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    encoder->dispatchThreads(grid_size, threadgroup_size);
+
+    return {};
+}
+
+Result<void> MetalCompute::convert_f32_to_f16(
+    MTL::Buffer* src, MTL::Buffer* dst, uint32_t size)
+{
+    auto* encoder = impl_->get_encoder();
+    auto* pipeline = impl_->get_pipeline("convert_f32_to_f16");
+    if (!pipeline) {
+        return Error(ErrorCode::InternalError, "convert_f32_to_f16 pipeline not found");
+    }
+
+    encoder->setComputePipelineState(pipeline);
+    encoder->setBuffer(src, 0, 0);
+    encoder->setBuffer(dst, 0, 1);
+    encoder->setBytes(&size, sizeof(size), 2);
 
     MTL::Size grid_size = MTL::Size::Make(size, 1, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);

@@ -71,6 +71,17 @@ public:
         uint32_t N           // Output dimension
     );
 
+    // Y = X @ W^T where W is Q4_K quantized (batched, half precision input)
+    // llama.cpp style: half input, float output for optimal memory bandwidth
+    Result<void> matmul_q4k_f16(
+        MTL::Buffer* X,      // Input [M, K] half
+        MTL::Buffer* W,      // Weights [N, K/256] Q4_K blocks
+        MTL::Buffer* Y,      // Output [M, N] float
+        uint32_t M,          // Batch size (number of tokens)
+        uint32_t K,          // Input dimension
+        uint32_t N           // Output dimension
+    );
+
     // =============================================================================
     // LLM Operations - Q8_0 Quantized Matrix Multiply
     // =============================================================================
@@ -352,6 +363,30 @@ public:
         float eps
     );
 
+    // Batched RMS Normalization with float input, half output (for f16 matmul)
+    // Eliminates separate conversion kernel before f16 matmul
+    // x: [batch_size, hidden_dim] float input
+    // out: [batch_size, hidden_dim] half output
+    // weight: [hidden_dim] FP32
+    Result<void> rms_norm_batch_f32_to_f16(
+        MTL::Buffer* x,
+        MTL::Buffer* weight,  // FP32 weights
+        MTL::Buffer* out,     // Half output
+        uint32_t batch_size,
+        uint32_t hidden_dim,
+        float eps
+    );
+
+    // Same as above but with FP16 weights
+    Result<void> rms_norm_batch_f16w_to_f16(
+        MTL::Buffer* x,
+        MTL::Buffer* weight,  // FP16 weights
+        MTL::Buffer* out,     // Half output
+        uint32_t batch_size,
+        uint32_t hidden_dim,
+        float eps
+    );
+
     // SiLU activation (in-place)
     Result<void> silu(MTL::Buffer* x, uint32_t size);
 
@@ -607,6 +642,17 @@ public:
         MTL::Buffer* a,
         MTL::Buffer* b,
         MTL::Buffer* c,
+        uint32_t size
+    );
+
+    // =============================================================================
+    // Format Conversion
+    // =============================================================================
+
+    // Convert float to half precision: dst[i] = (half)src[i]
+    Result<void> convert_f32_to_f16(
+        MTL::Buffer* src,    // Input [size] float
+        MTL::Buffer* dst,    // Output [size] half
         uint32_t size
     );
 

@@ -487,6 +487,8 @@ private:
         // Output buffers
         void* norm_out_buf = nullptr;    // [max_tokens * hidden_dim] - final RMSNorm output
         void* logits_buf = nullptr;      // [max_tokens * vocab_size] - output logits
+        // Half-precision buffer for f16 matmul input (llama.cpp style optimization)
+        void* matmul_input_f16 = nullptr; // [max_tokens * max(hidden_dim, intermediate_dim)] half
     };
     std::unique_ptr<PrefillBufferPool> prefill_pool_;
 

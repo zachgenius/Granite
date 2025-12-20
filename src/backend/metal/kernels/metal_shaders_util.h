@@ -195,6 +195,195 @@ kernel void rms_norm_batch_f16(
     }
 }
 
+// Batched RMS norm with float input, half output (for f16 matmul input)
+// x: [M, N] float input, out: [M, N] half output, weight: [N] float (broadcast)
+// This eliminates a separate conversion kernel before f16 matmul
+kernel void rms_norm_batch_f32_to_f16(
+    device const float* x          [[buffer(0)]],
+    device const float* weight     [[buffer(1)]],
+    device half* out               [[buffer(2)]],
+    constant uint& M               [[buffer(3)]],  // Batch size (num tokens)
+    constant uint& N               [[buffer(4)]],  // Hidden dim
+    constant float& eps            [[buffer(5)]],
+    uint tg_idx                    [[threadgroup_position_in_grid]],
+    uint tid                       [[thread_position_in_threadgroup]],
+    uint tg_size                   [[threads_per_threadgroup]]
+) {
+    if (tg_idx >= M) return;
+
+    device const float* x_row = x + tg_idx * N;
+    device half* out_row = out + tg_idx * N;
+
+    threadgroup float shared_sum[256];
+
+    float local_sum = 0.0f;
+    for (uint i = tid; i < N; i += tg_size) {
+        float val = x_row[i];
+        local_sum += val * val;
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup float inv_rms;
+    if (tid == 0) {
+        inv_rms = rsqrt(shared_sum[0] / float(N) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < N; i += tg_size) {
+        out_row[i] = half(x_row[i] * inv_rms * weight[i]);
+    }
+}
+
+// Same as above but with FP16 weights
+kernel void rms_norm_batch_f16w_to_f16(
+    device const float* x          [[buffer(0)]],
+    device const half* weight      [[buffer(1)]],
+    device half* out               [[buffer(2)]],
+    constant uint& M               [[buffer(3)]],
+    constant uint& N               [[buffer(4)]],
+    constant float& eps            [[buffer(5)]],
+    uint tg_idx                    [[threadgroup_position_in_grid]],
+    uint tid                       [[thread_position_in_threadgroup]],
+    uint tg_size                   [[threads_per_threadgroup]]
+) {
+    if (tg_idx >= M) return;
+
+    device const float* x_row = x + tg_idx * N;
+    device half* out_row = out + tg_idx * N;
+
+    threadgroup float shared_sum[256];
+
+    float local_sum = 0.0f;
+    for (uint i = tid; i < N; i += tg_size) {
+        float val = x_row[i];
+        local_sum += val * val;
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup float inv_rms;
+    if (tid == 0) {
+        inv_rms = rsqrt(shared_sum[0] / float(N) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < N; i += tg_size) {
+        out_row[i] = half(x_row[i] * inv_rms * float(weight[i]));
+    }
+}
+
+// Batched RMS norm with half precision I/O - for bandwidth-efficient prefill
+// x: [M, N] half input, out: [M, N] half output, weight: [N] half (broadcast)
+// Computation done in float for accuracy, I/O in half for bandwidth
+kernel void rms_norm_batch_half(
+    device const half* x           [[buffer(0)]],
+    device const half* weight      [[buffer(1)]],
+    device half* out               [[buffer(2)]],
+    constant uint& M               [[buffer(3)]],  // Batch size (num tokens)
+    constant uint& N               [[buffer(4)]],  // Hidden dim
+    constant float& eps            [[buffer(5)]],
+    uint tg_idx                    [[threadgroup_position_in_grid]],
+    uint tid                       [[thread_position_in_threadgroup]],
+    uint tg_size                   [[threads_per_threadgroup]]
+) {
+    if (tg_idx >= M) return;
+
+    // Pointer to this token's data
+    device const half* x_row = x + tg_idx * N;
+    device half* out_row = out + tg_idx * N;
+
+    threadgroup float shared_sum[256];
+
+    // Each thread sums multiple elements (compute in float for accuracy)
+    float local_sum = 0.0f;
+    for (uint i = tid; i < N; i += tg_size) {
+        float val = float(x_row[i]);
+        local_sum += val * val;
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Tree reduction
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Thread 0 computes inv_rms
+    threadgroup float inv_rms;
+    if (tid == 0) {
+        inv_rms = rsqrt(shared_sum[0] / float(N) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Each thread normalizes and scales its elements (output in half)
+    for (uint i = tid; i < N; i += tg_size) {
+        out_row[i] = half(float(x_row[i]) * inv_rms * float(weight[i]));
+    }
+}
+
+// Batched RMS norm with half precision I/O and FP32 weights
+kernel void rms_norm_batch_half_f32w(
+    device const half* x           [[buffer(0)]],
+    device const float* weight     [[buffer(1)]],
+    device half* out               [[buffer(2)]],
+    constant uint& M               [[buffer(3)]],
+    constant uint& N               [[buffer(4)]],
+    constant float& eps            [[buffer(5)]],
+    uint tg_idx                    [[threadgroup_position_in_grid]],
+    uint tid                       [[thread_position_in_threadgroup]],
+    uint tg_size                   [[threads_per_threadgroup]]
+) {
+    if (tg_idx >= M) return;
+
+    device const half* x_row = x + tg_idx * N;
+    device half* out_row = out + tg_idx * N;
+
+    threadgroup float shared_sum[256];
+
+    float local_sum = 0.0f;
+    for (uint i = tid; i < N; i += tg_size) {
+        float val = float(x_row[i]);
+        local_sum += val * val;
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup float inv_rms;
+    if (tid == 0) {
+        inv_rms = rsqrt(shared_sum[0] / float(N) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < N; i += tg_size) {
+        out_row[i] = half(float(x_row[i]) * inv_rms * weight[i]);
+    }
+}
+
 kernel void silu(
     device float* x                [[buffer(0)]],
     constant uint& size            [[buffer(1)]],
@@ -277,6 +466,40 @@ kernel void elementwise_add(
 ) {
     if (gid >= size) return;
     c[gid] = a[gid] + b[gid];
+}
+
+// Half-precision elementwise add for bandwidth-efficient prefill
+kernel void elementwise_add_half(
+    device const half* a           [[buffer(0)]],
+    device const half* b           [[buffer(1)]],
+    device half* c                 [[buffer(2)]],
+    constant uint& size            [[buffer(3)]],
+    uint gid                       [[thread_position_in_grid]]
+) {
+    if (gid >= size) return;
+    c[gid] = a[gid] + b[gid];
+}
+
+// Float-to-half conversion for prefill pipeline
+kernel void convert_f32_to_f16(
+    device const float* src        [[buffer(0)]],
+    device half* dst               [[buffer(1)]],
+    constant uint& size            [[buffer(2)]],
+    uint gid                       [[thread_position_in_grid]]
+) {
+    if (gid >= size) return;
+    dst[gid] = half(src[gid]);
+}
+
+// Half-to-float conversion
+kernel void convert_f16_to_f32(
+    device const half* src         [[buffer(0)]],
+    device float* dst              [[buffer(1)]],
+    constant uint& size            [[buffer(2)]],
+    uint gid                       [[thread_position_in_grid]]
+) {
+    if (gid >= size) return;
+    dst[gid] = float(src[gid]);
 }
 
 // RoPE for multi-head attention

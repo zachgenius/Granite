@@ -276,6 +276,20 @@ kernel void silu_mul(
     c[gid] = silu_val * b[gid];
 }
 
+// Half-precision fused SiLU + multiply for bandwidth-efficient prefill
+kernel void silu_mul_half(
+    device const half* a           [[buffer(0)]],   // gate input
+    device const half* b           [[buffer(1)]],   // up input
+    device half* c                 [[buffer(2)]],   // output
+    constant uint& size            [[buffer(3)]],
+    uint gid                       [[thread_position_in_grid]]
+) {
+    if (gid >= size) return;
+    float val = float(a[gid]);
+    float silu_val = val / (1.0f + exp(-val));
+    c[gid] = half(silu_val * float(b[gid]));
+}
+
 // Fused RMSNorm + Q4_K MatVec
 // Computes: y = RMSNorm(x, weight) @ W^T (Q4_K)
 // Each threadgroup:

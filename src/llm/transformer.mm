@@ -2645,6 +2645,8 @@ Result<void> TransformerModel::ensure_prefill_pool(int num_tokens) {
         // FFN-specific buffers
         if (prefill_pool_->ffn_gate_buf) static_cast<MTL::Buffer*>(prefill_pool_->ffn_gate_buf)->release();
         if (prefill_pool_->ffn_up_buf) static_cast<MTL::Buffer*>(prefill_pool_->ffn_up_buf)->release();
+        // Half-precision buffer
+        if (prefill_pool_->matmul_input_f16) static_cast<MTL::Buffer*>(prefill_pool_->matmul_input_f16)->release();
         // Output buffers
         if (prefill_pool_->norm_out_buf) static_cast<MTL::Buffer*>(prefill_pool_->norm_out_buf)->release();
         if (prefill_pool_->logits_buf) static_cast<MTL::Buffer*>(prefill_pool_->logits_buf)->release();
@@ -2682,6 +2684,11 @@ Result<void> TransformerModel::ensure_prefill_pool(int num_tokens) {
     prefill_pool_->ffn_gate_buf = gpu->create_buffer(alloc_tokens * intermediate_dim * sizeof(float));
     prefill_pool_->ffn_up_buf = gpu->create_buffer(alloc_tokens * intermediate_dim * sizeof(float));
 
+    // Half-precision buffer for f16 matmul input (llama.cpp style optimization)
+    // Size: max(hidden_dim, intermediate_dim) * alloc_tokens * sizeof(half)
+    int max_dim = std::max(hidden_dim, intermediate_dim);
+    prefill_pool_->matmul_input_f16 = gpu->create_buffer(alloc_tokens * max_dim * sizeof(uint16_t));
+
     // Output buffers
     prefill_pool_->norm_out_buf = gpu->create_buffer(alloc_tokens * hidden_dim * sizeof(float));
     prefill_pool_->logits_buf = gpu->create_buffer(alloc_tokens * vocab_size * sizeof(float));
@@ -2691,6 +2698,7 @@ Result<void> TransformerModel::ensure_prefill_pool(int num_tokens) {
         !prefill_pool_->ffn_input_buf || !prefill_pool_->block_output_buf ||
         !prefill_pool_->q_buf || !prefill_pool_->k_buf || !prefill_pool_->v_buf ||
         !prefill_pool_->attn_out_buf || !prefill_pool_->ffn_gate_buf || !prefill_pool_->ffn_up_buf ||
+        !prefill_pool_->matmul_input_f16 ||
         !prefill_pool_->norm_out_buf || !prefill_pool_->logits_buf) {
         GRANITE_FAIL(ErrorCode::OutOfMemory, "Failed to allocate prefill buffer pool");
     }
@@ -2775,6 +2783,7 @@ Result<void> TransformerModel::transformer_block_prefill_raw(
     auto* attn_out_buf = static_cast<MTL::Buffer*>(prefill_pool_->attn_out_buf);
     auto* gate_buf = static_cast<MTL::Buffer*>(prefill_pool_->ffn_gate_buf);
     auto* up_buf = static_cast<MTL::Buffer*>(prefill_pool_->ffn_up_buf);
+    auto* matmul_f16_buf = static_cast<MTL::Buffer*>(prefill_pool_->matmul_input_f16);
 
     // Get KV cache for this layer
     auto& layer_cache = gpu_kv_cache_->layers[layer];
@@ -2785,7 +2794,14 @@ Result<void> TransformerModel::transformer_block_prefill_raw(
     bool attn_norm_f16 = (attn_norm_weight->dtype() == DataType::FP16);
     bool ffn_norm_f16 = (ffn_norm_weight->dtype() == DataType::FP16);
 
+    // Check if dimensions are aligned for f16 fast kernel
+    // M >= 32 and all dimensions divisible by their tile sizes
+    auto can_use_f16_fast = [](int M, int K, int N) {
+        return M >= 32 && M % 32 == 0 && N % 64 == 0 && K % 32 == 0;
+    };
+
     // Helper lambda to dispatch matmul based on weight's quantization type
+    // For Q4_K with aligned dimensions, uses f16 input kernel for better bandwidth
     auto dispatch_matmul = [&](MTL::Buffer* in, MTL::Buffer* weight, MTL::Buffer* out,
                                GGMLType qtype, int M, int K, int N) {
         switch (qtype) {
@@ -2796,7 +2812,15 @@ Result<void> TransformerModel::transformer_block_prefill_raw(
             case GGMLType::IQ3_S: gpu->matmul_iq3_s(in, weight, out, M, K, N); break;
             case GGMLType::Q6_K:  gpu->matmul_q6_k(in, weight, out, M, K, N); break;
             case GGMLType::Q5_K:  gpu->matmul_q5_k(in, weight, out, M, K, N); break;
-            case GGMLType::Q4_K:  gpu->matmul_q4k(in, weight, out, M, K, N); break;
+            case GGMLType::Q4_K:
+                // Use f16 input kernel for aligned dimensions (llama.cpp optimization)
+                if (can_use_f16_fast(M, K, N)) {
+                    gpu->convert_f32_to_f16(in, matmul_f16_buf, M * K);
+                    gpu->matmul_q4k_f16(matmul_f16_buf, weight, out, M, K, N);
+                } else {
+                    gpu->matmul_q4k(in, weight, out, M, K, N);
+                }
+                break;
             case GGMLType::Q3_K:  gpu->matmul_q3_k(in, weight, out, M, K, N); break;
             case GGMLType::Q2_K:  gpu->matmul_q2_k(in, weight, out, M, K, N); break;
             default: gpu->matmul_q4k(in, weight, out, M, K, N); break;
@@ -2807,19 +2831,40 @@ Result<void> TransformerModel::transformer_block_prefill_raw(
     // ATTENTION BLOCK
     // =====================================================================
 
-    // 1. RMSNorm for attention
-    if (attn_norm_f16) {
-        gpu->rms_norm_batch_f16(h_buf, attn_norm_buf, attn_input_buf,
-                                num_tokens, hidden_dim, model_config_.rms_norm_eps);
-    } else {
-        gpu->rms_norm_batch(h_buf, attn_norm_buf, attn_input_buf,
-                           num_tokens, hidden_dim, model_config_.rms_norm_eps);
-    }
+    // Check if we should use the fused RMSNorm->f16 + f16 matmul path
+    // This is beneficial when all Q/K/V projections are Q4_K with aligned dimensions
+    bool use_attn_f16_path = (raw_wq->quant_type == GGMLType::Q4_K) &&
+                             can_use_f16_fast(num_tokens, hidden_dim, q_dim) &&
+                             can_use_f16_fast(num_tokens, hidden_dim, kv_dim);
 
-    // 2. Q/K/V projections
-    dispatch_matmul(attn_input_buf, wq_buf, q_buf, raw_wq->quant_type, num_tokens, hidden_dim, q_dim);
-    dispatch_matmul(attn_input_buf, wk_buf, k_buf, raw_wk->quant_type, num_tokens, hidden_dim, kv_dim);
-    dispatch_matmul(attn_input_buf, wv_buf, v_buf, raw_wv->quant_type, num_tokens, hidden_dim, kv_dim);
+    // 1. RMSNorm for attention (output to f16 buffer if using f16 matmul path)
+    if (use_attn_f16_path) {
+        // Fused RMSNorm -> half output, then use f16 matmul for Q/K/V
+        if (attn_norm_f16) {
+            gpu->rms_norm_batch_f16w_to_f16(h_buf, attn_norm_buf, matmul_f16_buf,
+                                           num_tokens, hidden_dim, model_config_.rms_norm_eps);
+        } else {
+            gpu->rms_norm_batch_f32_to_f16(h_buf, attn_norm_buf, matmul_f16_buf,
+                                          num_tokens, hidden_dim, model_config_.rms_norm_eps);
+        }
+        // Q/K/V projections using f16 matmul directly
+        gpu->matmul_q4k_f16(matmul_f16_buf, wq_buf, q_buf, num_tokens, hidden_dim, q_dim);
+        gpu->matmul_q4k_f16(matmul_f16_buf, wk_buf, k_buf, num_tokens, hidden_dim, kv_dim);
+        gpu->matmul_q4k_f16(matmul_f16_buf, wv_buf, v_buf, num_tokens, hidden_dim, kv_dim);
+    } else {
+        // Standard path: RMSNorm -> f32 output
+        if (attn_norm_f16) {
+            gpu->rms_norm_batch_f16(h_buf, attn_norm_buf, attn_input_buf,
+                                    num_tokens, hidden_dim, model_config_.rms_norm_eps);
+        } else {
+            gpu->rms_norm_batch(h_buf, attn_norm_buf, attn_input_buf,
+                               num_tokens, hidden_dim, model_config_.rms_norm_eps);
+        }
+        // 2. Q/K/V projections (with per-matmul conversion if Q4_K)
+        dispatch_matmul(attn_input_buf, wq_buf, q_buf, raw_wq->quant_type, num_tokens, hidden_dim, q_dim);
+        dispatch_matmul(attn_input_buf, wk_buf, k_buf, raw_wk->quant_type, num_tokens, hidden_dim, kv_dim);
+        dispatch_matmul(attn_input_buf, wv_buf, v_buf, raw_wv->quant_type, num_tokens, hidden_dim, kv_dim);
+    }
 
     // 3. Apply RoPE
     gpu->rope_multihead(q_buf, k_buf, num_heads, num_kv_heads, num_tokens, head_dim,
@@ -2845,18 +2890,36 @@ Result<void> TransformerModel::transformer_block_prefill_raw(
     // FFN BLOCK
     // =====================================================================
 
-    // 8. RMSNorm for FFN
-    if (ffn_norm_f16) {
-        gpu->rms_norm_batch_f16(post_attn_buf, ffn_norm_buf, ffn_input_buf,
-                                num_tokens, hidden_dim, model_config_.rms_norm_eps);
-    } else {
-        gpu->rms_norm_batch(post_attn_buf, ffn_norm_buf, ffn_input_buf,
-                           num_tokens, hidden_dim, model_config_.rms_norm_eps);
-    }
+    // Check if we should use fused RMSNorm->f16 path for gate/up projections
+    bool use_ffn_f16_path = (raw_wgate->quant_type == GGMLType::Q4_K) &&
+                            can_use_f16_fast(num_tokens, hidden_dim, intermediate_dim);
 
-    // 9. Gate and Up projections
-    dispatch_matmul(ffn_input_buf, wgate_buf, gate_buf, raw_wgate->quant_type, num_tokens, hidden_dim, intermediate_dim);
-    dispatch_matmul(ffn_input_buf, wup_buf, up_buf, raw_wup->quant_type, num_tokens, hidden_dim, intermediate_dim);
+    // 8. RMSNorm for FFN (output to f16 buffer if using f16 matmul path)
+    if (use_ffn_f16_path) {
+        // Fused RMSNorm -> half output for gate/up projections
+        if (ffn_norm_f16) {
+            gpu->rms_norm_batch_f16w_to_f16(post_attn_buf, ffn_norm_buf, matmul_f16_buf,
+                                           num_tokens, hidden_dim, model_config_.rms_norm_eps);
+        } else {
+            gpu->rms_norm_batch_f32_to_f16(post_attn_buf, ffn_norm_buf, matmul_f16_buf,
+                                          num_tokens, hidden_dim, model_config_.rms_norm_eps);
+        }
+        // Gate and Up projections using f16 matmul directly
+        gpu->matmul_q4k_f16(matmul_f16_buf, wgate_buf, gate_buf, num_tokens, hidden_dim, intermediate_dim);
+        gpu->matmul_q4k_f16(matmul_f16_buf, wup_buf, up_buf, num_tokens, hidden_dim, intermediate_dim);
+    } else {
+        // Standard path
+        if (ffn_norm_f16) {
+            gpu->rms_norm_batch_f16(post_attn_buf, ffn_norm_buf, ffn_input_buf,
+                                    num_tokens, hidden_dim, model_config_.rms_norm_eps);
+        } else {
+            gpu->rms_norm_batch(post_attn_buf, ffn_norm_buf, ffn_input_buf,
+                               num_tokens, hidden_dim, model_config_.rms_norm_eps);
+        }
+        // 9. Gate and Up projections
+        dispatch_matmul(ffn_input_buf, wgate_buf, gate_buf, raw_wgate->quant_type, num_tokens, hidden_dim, intermediate_dim);
+        dispatch_matmul(ffn_input_buf, wup_buf, up_buf, raw_wup->quant_type, num_tokens, hidden_dim, intermediate_dim);
+    }
 
     // 10. SiLU activation and multiply
     gpu->silu_mul(gate_buf, up_buf, gate_buf, num_tokens * intermediate_dim);

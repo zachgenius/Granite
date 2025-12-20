@@ -626,11 +626,18 @@ kernel void matmul_q4k_simd(
 // 4 simdgroups (128 threads) per threadgroup
 // =============================================================================
 
-// Helper to extract 6-bit scale and min for dequantization
+// Helper to extract 6-bit scale and min for dequantization (half precision)
 inline half2 get_scale_min_k4_h(int j, int k, device const uint8_t* q) {
     return j < 4 ? half2{half(q[j+0+k] & 63), half(q[j+4+k] & 63)}
                  : half2{half((q[j+4+k] & 0xF) | ((q[j-4+k] & 0xc0) >> 2)),
                          half((q[j+4+k] >> 4) | ((q[j-0+k] & 0xc0) >> 2))};
+}
+
+// Helper to extract 6-bit scale and min (uchar precision - matches llama.cpp)
+inline uchar2 get_scale_min_k4_just2(int j, int k, device const uchar * q) {
+    return j < 4 ? uchar2{uchar(q[j+0+k] & 63), uchar(q[j+4+k] & 63)}
+                 : uchar2{uchar((q[j+4+k] & 0xF) | ((q[j-4+k] & 0xc0) >> 2)),
+                          uchar((q[j+4+k] >> 4) | ((q[j-0+k] & 0xc0) >> 2))};
 }
 
 // Dequantize 16 elements of Q4_K into a 4x4 half matrix
@@ -655,6 +662,44 @@ inline void dequantize_q4_k_to_half4x4(
     for (int i = 0; i < 16; ++i) {
         reg[i/4][i%4] = dl * half(q[i] & mask) - ml;
     }
+}
+
+// Optimized dequantization using float math (matches llama.cpp for better precision/perf)
+inline void dequantize_q4_k_to_half4x4_opt(
+    device const block_q4_K* xb,
+    short il,
+    thread half4x4& reg
+) {
+    device const uchar* q = xb->qs;
+
+    short is = (il/4) * 2;
+    q = q + (il/4) * 32 + 16 * (il&1);
+    il = il & 3;
+    const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
+    const float d   = il < 2 ? float(xb->d) : float(xb->d) / 16.f;
+    const float min = float(xb->dmin);
+    const float dl = d * float(sc[0]);
+    const float ml = min * float(sc[1]);
+
+    const ushort mask = il < 2 ? 0x0F : 0xF0;
+
+    // Manually unrolled loop for better performance
+    reg[0][0] = half(dl * float(q[0] & mask) - ml);
+    reg[0][1] = half(dl * float(q[1] & mask) - ml);
+    reg[0][2] = half(dl * float(q[2] & mask) - ml);
+    reg[0][3] = half(dl * float(q[3] & mask) - ml);
+    reg[1][0] = half(dl * float(q[4] & mask) - ml);
+    reg[1][1] = half(dl * float(q[5] & mask) - ml);
+    reg[1][2] = half(dl * float(q[6] & mask) - ml);
+    reg[1][3] = half(dl * float(q[7] & mask) - ml);
+    reg[2][0] = half(dl * float(q[8] & mask) - ml);
+    reg[2][1] = half(dl * float(q[9] & mask) - ml);
+    reg[2][2] = half(dl * float(q[10] & mask) - ml);
+    reg[2][3] = half(dl * float(q[11] & mask) - ml);
+    reg[3][0] = half(dl * float(q[12] & mask) - ml);
+    reg[3][1] = half(dl * float(q[13] & mask) - ml);
+    reg[3][2] = half(dl * float(q[14] & mask) - ml);
+    reg[3][3] = half(dl * float(q[15] & mask) - ml);
 }
 
 // Configuration - matches llama.cpp kernel_mul_mm
@@ -984,6 +1029,131 @@ kernel void matmul_q4k_simdgroup_fast(
     }
 
     // Direct store - no bounds checking
+    const uint sg_n = r0 + 32 * (sgitg % 2);
+    const uint sg_m = r1 + 16 * (sgitg / 2);
+    device float* C = Y + sg_m * N + sg_n;
+
+    #pragma clang loop unroll(full)
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], C + 8*(i%4) + 8*N*(i/4), N, 0, false);
+    }
+}
+
+// =============================================================================
+// FAST SIMDGROUP MATRIX Q4_K Matmul - Half Precision Input (llama.cpp style)
+// =============================================================================
+// Like matmul_q4k_simdgroup_fast but reads half precision activations.
+// This halves the memory bandwidth for reading X while keeping float output.
+// REQUIRES: M % 32 == 0 && N % 64 == 0 && K % 32 == 0
+// =============================================================================
+
+kernel void matmul_q4k_simdgroup_fast_f16(
+    device const half* X           [[buffer(0)]],  // Input [M, K] half precision
+    device const void* W           [[buffer(1)]],  // Weights [N, K/256] Q4_K blocks
+    device float* Y                [[buffer(2)]],  // Output [M, N] float (no conversion needed)
+    constant uint& M               [[buffer(3)]],
+    constant uint& K               [[buffer(4)]],
+    constant uint& N               [[buffer(5)]],
+    threadgroup char* shmem        [[threadgroup(0)]],
+    uint3 tgpig                    [[threadgroup_position_in_grid]],
+    ushort tiitg                   [[thread_index_in_threadgroup]],
+    ushort sgitg                   [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup half* sa = (threadgroup half*)(shmem);
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);
+
+    const uint num_blocks_k = K / QK_K;
+    const device block_q4_K* weights = (const device block_q4_K*)W;
+
+    const uint r0 = tgpig.y * SGMM_NR0;
+    const uint r1 = tgpig.x * SGMM_NR1;
+
+    constexpr short NL0 = SGMM_NK / 16;
+    constexpr short NL1 = SGMM_NK / 8;
+
+    const short lr0 = tiitg / NL0;
+    const short lr1 = tiitg / NL1;
+    const short il0 = tiitg % NL0;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];  // Accumulate in float for precision
+
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    }
+
+    const short iy = 8 * (tiitg % NL1);
+
+    constexpr short nl = QK_K / 16;
+    short il = il0;
+
+    device const block_q4_K* x = &weights[(r0 + lr0) * num_blocks_k + il0/nl];
+    device const half* y = X + (r1 + lr1) * K + iy;
+
+    for (uint loop_k = 0; loop_k < K; loop_k += SGMM_NK) {
+        half4x4 temp_a;
+        dequantize_q4_k_to_half4x4(x, il, temp_a);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = (short)(tiitg/NL0)/8;
+            const short lx = (short)(tiitg/NL0)%8;
+            const short ly = i%8;
+            const short ib = 8*sx + sy;
+            *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+        }
+
+        // Direct half load from device - saves 50% bandwidth vs float
+        {
+            const short sx = tiitg % NL1;
+            const short sy = lr1 / 8;
+            const short ly = lr1 % 8;
+            const short ib = 4 * sx + sy;
+            *(threadgroup half2x4*)(sb + 64 * ib + 8 * ly) = *(device const half2x4*)y;
+        }
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        x = (il < 2) ? x + 1 : x;
+        y = y + SGMM_NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half* lsma = sa + 4 * 64 * (sgitg % 2);
+        threadgroup const half* lsmb = sb + 2 * 64 * (sgitg / 2);
+
+        #pragma clang loop unroll(full)
+        for (short ik = 0; ik < SGMM_NK / 8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+
+    // Direct store to float output - no conversion overhead!
     const uint sg_n = r0 + 32 * (sgitg % 2);
     const uint sg_m = r1 + 16 * (sgitg / 2);
     device float* C = Y + sg_m * N + sg_n;
