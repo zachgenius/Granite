@@ -533,8 +533,18 @@ kernel void elementwise_add(
     constant uint& size            [[buffer(3)]],
     uint gid                       [[thread_position_in_grid]]
 ) {
-    if (gid >= size) return;
-    c[gid] = a[gid] + b[gid];
+    // Process 4 elements per thread for better memory bandwidth
+    uint idx = gid * 4;
+    if (idx + 3 < size) {
+        float4 va = *((device const float4*)(a + idx));
+        float4 vb = *((device const float4*)(b + idx));
+        *((device float4*)(c + idx)) = va + vb;
+    } else if (idx < size) {
+        // Handle remaining elements
+        for (uint i = idx; i < size; i++) {
+            c[i] = a[i] + b[i];
+        }
+    }
 }
 
 // Half-precision elementwise add for bandwidth-efficient prefill

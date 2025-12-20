@@ -263,6 +263,7 @@ kernel void multihead_attention_decode(
 
 // Fused SiLU + Elementwise Multiply: c = silu(a) * b
 // Used in SwiGLU FFN: silu(gate) * up
+// Vectorized to process 4 elements per thread for better bandwidth
 kernel void silu_mul(
     device const float* a          [[buffer(0)]],   // gate input
     device const float* b          [[buffer(1)]],   // up input
@@ -270,10 +271,20 @@ kernel void silu_mul(
     constant uint& size            [[buffer(3)]],
     uint gid                       [[thread_position_in_grid]]
 ) {
-    if (gid >= size) return;
-    float val = a[gid];
-    float silu_val = val / (1.0f + exp(-val));
-    c[gid] = silu_val * b[gid];
+    uint idx = gid * 4;
+    if (idx + 3 < size) {
+        float4 va = *((device const float4*)(a + idx));
+        float4 vb = *((device const float4*)(b + idx));
+        // SiLU: x / (1 + exp(-x))
+        float4 silu_va = va / (1.0f + exp(-va));
+        *((device float4*)(c + idx)) = silu_va * vb;
+    } else if (idx < size) {
+        for (uint i = idx; i < size; i++) {
+            float val = a[i];
+            float silu_val = val / (1.0f + exp(-val));
+            c[i] = silu_val * b[i];
+        }
+    }
 }
 
 // Half-precision fused SiLU + multiply for bandwidth-efficient prefill

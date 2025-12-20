@@ -3230,7 +3230,7 @@ Result<void*> TransformerModel::forward_prefill_raw(
                                   MTL::Size::Make(128, 1, 1));
 
         // ---------------------------------------------------------------------
-        // 9. Attention residual add
+        // 9. Attention residual add (vectorized - 4 elements per thread)
         // ---------------------------------------------------------------------
         uint32_t count_hd = M * hd;
         enc->setComputePipelineState(pipe_add);
@@ -3238,7 +3238,7 @@ Result<void*> TransformerModel::forward_prefill_raw(
         enc->setBuffer(attn_input_buf, 0, 1);
         enc->setBuffer(post_attn_buf, 0, 2);
         enc->setBytes(&count_hd, 4, 3);
-        enc->dispatchThreads(MTL::Size::Make(count_hd, 1, 1), MTL::Size::Make(256, 1, 1));
+        enc->dispatchThreads(MTL::Size::Make((count_hd + 3) / 4, 1, 1), MTL::Size::Make(256, 1, 1));
 
         // ---------------------------------------------------------------------
         // 10. FFN RMSNorm
@@ -3281,7 +3281,7 @@ Result<void*> TransformerModel::forward_prefill_raw(
                                   MTL::Size::Make(128, 1, 1));
 
         // ---------------------------------------------------------------------
-        // 13. SiLU activation + multiply
+        // 13. SiLU activation + multiply (vectorized - 4 elements per thread)
         // ---------------------------------------------------------------------
         uint32_t count_int = M * intd;
         enc->setComputePipelineState(pipe_silu_mul);
@@ -3289,7 +3289,7 @@ Result<void*> TransformerModel::forward_prefill_raw(
         enc->setBuffer(up_buf, 0, 1);
         enc->setBuffer(gate_buf, 0, 2);
         enc->setBytes(&count_int, 4, 3);
-        enc->dispatchThreads(MTL::Size::Make(count_int, 1, 1), MTL::Size::Make(256, 1, 1));
+        enc->dispatchThreads(MTL::Size::Make((count_int + 3) / 4, 1, 1), MTL::Size::Make(256, 1, 1));
 
         // ---------------------------------------------------------------------
         // 14. Down projection: [M, intermediate] @ [hidden, intermediate]^T
@@ -3306,14 +3306,14 @@ Result<void*> TransformerModel::forward_prefill_raw(
                                   MTL::Size::Make(128, 1, 1));
 
         // ---------------------------------------------------------------------
-        // 15. FFN residual add -> hidden_buf for next layer
+        // 15. FFN residual add -> hidden_buf for next layer (vectorized)
         // ---------------------------------------------------------------------
         enc->setComputePipelineState(pipe_add);
         enc->setBuffer(post_attn_buf, 0, 0);
         enc->setBuffer(ffn_input_buf, 0, 1);
         enc->setBuffer(hidden_buf, 0, 2);
         enc->setBytes(&count_hd, 4, 3);
-        enc->dispatchThreads(MTL::Size::Make(count_hd, 1, 1), MTL::Size::Make(256, 1, 1));
+        enc->dispatchThreads(MTL::Size::Make((count_hd + 3) / 4, 1, 1), MTL::Size::Make(256, 1, 1));
     }
 
     // =========================================================================
