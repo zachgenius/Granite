@@ -28,7 +28,7 @@ int main() {
         MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
         options.fastMathEnabled = YES;
         
-        NSString* source = @(METAL_SHADER_SOURCE);
+        NSString* source = @(METAL_SHADER_SOURCE.c_str());
         id<MTLLibrary> library = [device newLibraryWithSource:source 
                                                       options:options 
                                                         error:&error];

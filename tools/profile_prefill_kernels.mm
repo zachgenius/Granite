@@ -46,7 +46,7 @@ int main(int argc, char** argv) {
     // Compile shaders
     NS::Error* error = nullptr;
     MTL::CompileOptions* options = MTL::CompileOptions::alloc()->init();
-    NS::String* source = NS::String::string(METAL_SHADER_SOURCE, NS::UTF8StringEncoding);
+    NS::String* source = NS::String::string(METAL_SHADER_SOURCE.c_str(), NS::UTF8StringEncoding);
     MTL::Library* library = device->newLibrary(source, options, &error);
     if (!library) {
         std::cerr << "Failed to compile shaders" << std::endl;
