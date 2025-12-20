@@ -39,7 +39,6 @@ void print_usage(const char* program) {
     std::cerr << "  --draft-model <path>  Enable speculative decoding with draft model\n";
     std::cerr << "  --max-tokens <n>      Maximum tokens to generate (default: 20)\n";
     std::cerr << "  --spec-k <n>          Initial speculation depth (default: 4)\n";
-    std::cerr << "  --coreml-ffn          Use CoreML/ANE for FFN (power-efficient mode)\n";
     std::cerr << "\nExamples:\n";
     std::cerr << "  " << program << " model.gguf \"Hello\"\n";
     std::cerr << "  " << program << " large.gguf --draft-model small.gguf \"Hello\"\n";
@@ -61,7 +60,6 @@ int main(int argc, char* argv[]) {
     std::string prompt = "Hello";
     int max_tokens = 20;
     int spec_k = 4;
-    bool use_coreml_ffn = false;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -72,8 +70,6 @@ int main(int argc, char* argv[]) {
             max_tokens = std::atoi(argv[++i]);
         } else if (arg == "--spec-k" && i + 1 < argc) {
             spec_k = std::atoi(argv[++i]);
-        } else if (arg == "--coreml-ffn") {
-            use_coreml_ffn = true;
         } else if (arg == "--help" || arg == "-h") {
             print_usage(argv[0]);
             return 0;
@@ -213,17 +209,6 @@ int main(int argc, char* argv[]) {
         // Continue without GPU KV cache - will use CPU path
     }
 
-    // Enable CoreML FFN if requested (power-efficient mode)
-    if (use_coreml_ffn) {
-        GRANITE_LOG_INFO("Enabling CoreML FFN (power-efficient mode)...");
-        auto coreml_result = model.enable_coreml_ffn();
-        if (!coreml_result.ok()) {
-            GRANITE_LOG_WARN("Failed to enable CoreML FFN: {}", coreml_result.error().message());
-            GRANITE_LOG_WARN("Falling back to Metal GPU for FFN");
-        }
-    }
-#else
-    (void)use_coreml_ffn;  // Suppress unused warning
 #endif
 
     // Debug: Check actual weight shapes and sample values

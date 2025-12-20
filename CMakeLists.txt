@@ -153,32 +153,6 @@ if(APPLE AND GRANITE_BUILD_METAL)
 endif()
 
 # =============================================================================
-# CoreML/MPSGraph Backend (Apple only, for ANE acceleration)
-# =============================================================================
-
-option(GRANITE_BUILD_COREML "Build CoreML backend for ANE (Apple only)" ON)
-
-if(APPLE AND GRANITE_BUILD_COREML AND GRANITE_BUILD_METAL)
-    set(GRANITE_COREML_SOURCES
-        src/backend/coreml/coreml_ffn.mm
-    )
-
-    target_sources(granite PRIVATE ${GRANITE_COREML_SOURCES})
-
-    target_link_libraries(granite
-        PRIVATE
-            "-framework MetalPerformanceShadersGraph"
-    )
-
-    target_compile_definitions(granite PUBLIC GRANITE_HAS_COREML=1)
-
-    # Enable ARC for CoreML Objective-C++ files
-    set_source_files_properties(${GRANITE_COREML_SOURCES} PROPERTIES
-        COMPILE_FLAGS "-fobjc-arc"
-    )
-endif()
-
-# =============================================================================
 # CPU Backend
 # =============================================================================
 
@@ -376,10 +350,6 @@ target_link_libraries(test_paged_flash_attention PRIVATE granite metal-cpp "-fra
 add_executable(benchmark_paged_attention tools/benchmark_paged_attention.mm)
 set_source_files_properties(tools/benchmark_paged_attention.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 target_link_libraries(benchmark_paged_attention PRIVATE granite metal-cpp "-framework Metal" "-framework Foundation")
-
-add_executable(test_coreml_ane tools/test_coreml_ane.mm)
-set_source_files_properties(tools/test_coreml_ane.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
-target_link_libraries(test_coreml_ane PRIVATE granite metal-cpp "-framework Metal" "-framework Foundation" "-framework MetalPerformanceShadersGraph")
 
 # =============================================================================
 # Installation
