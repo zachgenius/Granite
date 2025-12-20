@@ -2909,7 +2909,17 @@ Result<void*> TransformerModel::forward_prefill_raw(
     auto* pipe_rms_batch = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("rms_norm_batch"));
     auto* pipe_rms_batch_f16 = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("rms_norm_batch_f16"));
     auto* pipe_matmul_q4k = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("matmul_q4k_simdgroup"));
+    auto* pipe_matmul_q4k_fast = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("matmul_q4k_simdgroup_fast"));
     auto* pipe_matmul_f16 = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("matmul_f16"));
+
+    // Helper to select fast kernel when dimensions are aligned
+    // NR1=32 (M rows), NR0=64 (N cols), SGMM_NK=32 (K blocks)
+    auto select_q4k_pipe = [&](uint32_t m, uint32_t k, uint32_t n) -> MTL::ComputePipelineState* {
+        if (pipe_matmul_q4k_fast && (m % 32 == 0) && (n % 64 == 0) && (k % 32 == 0)) {
+            return pipe_matmul_q4k_fast;
+        }
+        return pipe_matmul_q4k;
+    };
     auto* pipe_rope = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("rope_multihead"));
     auto* pipe_kv_append = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("kv_cache_append_f16"));
     auto* pipe_attn = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("flash_attention_prefill"));
@@ -3045,7 +3055,7 @@ Result<void*> TransformerModel::forward_prefill_raw(
         // ---------------------------------------------------------------------
         // 2. Q projection: [M, hidden] @ [q_dim, hidden]^T -> [M, q_dim]
         // ---------------------------------------------------------------------
-        enc->setComputePipelineState(pipe_matmul_q4k);
+        enc->setComputePipelineState(select_q4k_pipe(M, hd, qd));
         enc->setBuffer(attn_input_buf, 0, 0);
         enc->setBuffer(wq_buf, 0, 1);
         enc->setBuffer(q_buf, 0, 2);
@@ -3059,7 +3069,7 @@ Result<void*> TransformerModel::forward_prefill_raw(
         // ---------------------------------------------------------------------
         // 3. K projection: [M, hidden] @ [kv_dim, hidden]^T -> [M, kv_dim]
         // ---------------------------------------------------------------------
-        enc->setComputePipelineState(pipe_matmul_q4k);
+        enc->setComputePipelineState(select_q4k_pipe(M, hd, kvd));
         enc->setBuffer(attn_input_buf, 0, 0);
         enc->setBuffer(wk_buf, 0, 1);
         enc->setBuffer(k_buf, 0, 2);
@@ -3073,7 +3083,7 @@ Result<void*> TransformerModel::forward_prefill_raw(
         // ---------------------------------------------------------------------
         // 4. V projection: [M, hidden] @ [kv_dim, hidden]^T -> [M, kv_dim]
         // ---------------------------------------------------------------------
-        enc->setComputePipelineState(pipe_matmul_q4k);
+        enc->setComputePipelineState(select_q4k_pipe(M, hd, kvd));
         enc->setBuffer(attn_input_buf, 0, 0);
         enc->setBuffer(wv_buf, 0, 1);
         enc->setBuffer(v_buf, 0, 2);
@@ -3145,7 +3155,7 @@ Result<void*> TransformerModel::forward_prefill_raw(
         // ---------------------------------------------------------------------
         // 8. Output projection (Wo): [M, q_dim] @ [hidden, q_dim]^T -> [M, hidden]
         // ---------------------------------------------------------------------
-        enc->setComputePipelineState(pipe_matmul_q4k);
+        enc->setComputePipelineState(select_q4k_pipe(M, qd, hd));
         enc->setBuffer(attn_out_buf, 0, 0);
         enc->setBuffer(wo_buf, 0, 1);
         enc->setBuffer(attn_input_buf, 0, 2);  // reuse buffer
@@ -3182,7 +3192,7 @@ Result<void*> TransformerModel::forward_prefill_raw(
         // ---------------------------------------------------------------------
         // 11. Gate projection: [M, hidden] @ [intermediate, hidden]^T
         // ---------------------------------------------------------------------
-        enc->setComputePipelineState(pipe_matmul_q4k);
+        enc->setComputePipelineState(select_q4k_pipe(M, hd, intd));
         enc->setBuffer(ffn_input_buf, 0, 0);
         enc->setBuffer(wgate_buf, 0, 1);
         enc->setBuffer(gate_buf, 0, 2);
@@ -3196,7 +3206,7 @@ Result<void*> TransformerModel::forward_prefill_raw(
         // ---------------------------------------------------------------------
         // 12. Up projection: [M, hidden] @ [intermediate, hidden]^T
         // ---------------------------------------------------------------------
-        enc->setComputePipelineState(pipe_matmul_q4k);
+        enc->setComputePipelineState(select_q4k_pipe(M, hd, intd));
         enc->setBuffer(ffn_input_buf, 0, 0);
         enc->setBuffer(wup_buf, 0, 1);
         enc->setBuffer(up_buf, 0, 2);
@@ -3221,7 +3231,7 @@ Result<void*> TransformerModel::forward_prefill_raw(
         // ---------------------------------------------------------------------
         // 14. Down projection: [M, intermediate] @ [hidden, intermediate]^T
         // ---------------------------------------------------------------------
-        enc->setComputePipelineState(pipe_matmul_q4k);
+        enc->setComputePipelineState(select_q4k_pipe(M, intd, hd));
         enc->setBuffer(gate_buf, 0, 0);
         enc->setBuffer(wdown_buf, 0, 1);
         enc->setBuffer(ffn_input_buf, 0, 2);  // reuse buffer

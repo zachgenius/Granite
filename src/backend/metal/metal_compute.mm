@@ -423,6 +423,7 @@ private:
             // Core quantized kernels
             "matvec_q4k", "matmul_q4k", "matmul_q4k_vec", "matmul_q4k_tiled", "matmul_q4k_simd",
             "matmul_q4k_simdgroup",  // simdgroup_half8x8 optimized matmul
+            "matmul_q4k_simdgroup_fast",  // No bounds checking - for aligned dimensions
             "matvec_f16", "matmul_f16",
             "matvec_q8_0", "matmul_q8_0",
             "matvec_q4_0", "matmul_q4_0",
@@ -604,6 +605,11 @@ Result<void> MetalCompute::matmul_q4k(
     // FP16 intermediate precision gives ~0.5 max absolute error vs FP32 reference.
     // Note: The kernel processes 32 rows (NR1) at a time, so M >= 32 is ideal.
     if (M >= 32) {
+        // Use fast kernel when dimensions are perfectly aligned (no bounds checking needed)
+        // NR1=32 (M rows), NR0=64 (N cols), SGMM_NK=32 (K blocks)
+        if (M % 32 == 0 && N % 64 == 0 && K % 32 == 0) {
+            return impl_->dispatch_matmul_simdgroup("matmul_q4k_simdgroup_fast", X, W, Y, M, K, N);
+        }
         return impl_->dispatch_matmul_simdgroup("matmul_q4k_simdgroup", X, W, Y, M, K, N);
     }
     // Use tiled kernel for medium batches

@@ -866,6 +866,135 @@ kernel void matmul_q4k_simdgroup(
 }
 
 // =============================================================================
+// FAST SIMDGROUP MATRIX Q4_K Matmul (Fully Aligned Dimensions)
+// =============================================================================
+// Same as matmul_q4k_simdgroup but ALL conditionals removed.
+// REQUIRES: M % 32 == 0 && N % 64 == 0 && K % 32 == 0
+// This eliminates ALL bounds checking and conditional branches.
+// =============================================================================
+
+kernel void matmul_q4k_simdgroup_fast(
+    device const float* X          [[buffer(0)]],
+    device const void* W           [[buffer(1)]],
+    device float* Y                [[buffer(2)]],
+    constant uint& M               [[buffer(3)]],
+    constant uint& K               [[buffer(4)]],
+    constant uint& N               [[buffer(5)]],
+    threadgroup char* shmem        [[threadgroup(0)]],
+    uint3 tgpig                    [[threadgroup_position_in_grid]],
+    ushort tiitg                   [[thread_index_in_threadgroup]],
+    ushort sgitg                   [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup half* sa = (threadgroup half*)(shmem);
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);
+
+    const uint num_blocks_k = K / QK_K;
+    const device block_q4_K* weights = (const device block_q4_K*)W;
+
+    const uint r0 = tgpig.y * SGMM_NR0;
+    const uint r1 = tgpig.x * SGMM_NR1;
+
+    // No bounds checking - dimensions are aligned
+    constexpr short NL0 = SGMM_NK / 16;
+    constexpr short NL1 = SGMM_NK / 8;
+
+    const short lr0 = tiitg / NL0;  // No min() needed
+    const short lr1 = tiitg / NL1;  // No min() needed
+    const short il0 = tiitg % NL0;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    const short iy = 8 * (tiitg % NL1);
+
+    constexpr short nl = QK_K / 16;
+    short il = il0;
+
+    // Direct pointer assignment - no nullptr check
+    device const block_q4_K* x = &weights[(r0 + lr0) * num_blocks_k + il0/nl];
+    device const float* y = X + (r1 + lr1) * K + iy;
+
+    for (uint loop_k = 0; loop_k < K; loop_k += SGMM_NK) {
+        // No nullptr check - always dequantize
+        half4x4 temp_a;
+        dequantize_q4_k_to_half4x4(x, il, temp_a);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = (short)(tiitg/NL0)/8;
+            const short lx = (short)(tiitg/NL0)%8;
+            const short ly = i%8;
+            const short ib = 8*sx + sy;
+            *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+        }
+
+        // No nullptr check - always load
+        {
+            const short sx = tiitg % NL1;
+            const short sy = lr1 / 8;
+            const short ly = lr1 % 8;
+            const short ib = 4 * sx + sy;
+            *(threadgroup half2x4*)(sb + 64 * ib + 8 * ly) = half2x4(*(device const float2x4*)y);
+        }
+
+        // Simplified pointer advance - no nullptr checks
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        x = (il < 2) ? x + 1 : x;
+        y = y + SGMM_NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half* lsma = sa + 4 * 64 * (sgitg % 2);
+        threadgroup const half* lsmb = sb + 2 * 64 * (sgitg / 2);
+
+        #pragma clang loop unroll(full)
+        for (short ik = 0; ik < SGMM_NK / 8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+
+    // Direct store - no bounds checking
+    const uint sg_n = r0 + 32 * (sgitg % 2);
+    const uint sg_m = r1 + 16 * (sgitg / 2);
+    device float* C = Y + sg_m * N + sg_n;
+
+    #pragma clang loop unroll(full)
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], C + 8*(i%4) + 8*N*(i/4), N, 0, false);
+    }
+}
+
+// =============================================================================
 // Q8_0 Matrix-Vector Multiplication (Single Token Decode)
 // =============================================================================
 // Optimized using same techniques as Q4_K:
