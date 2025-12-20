@@ -468,7 +468,8 @@ private:
             "paged_attention_decode", "paged_kv_cache_append",
             "batched_paged_attention_decode",
             // Paged flash attention (long context support)
-            "paged_flash_attention_decode_d64", "paged_flash_attention_decode_d128"
+            "paged_flash_attention_decode_d64", "paged_flash_attention_decode_d64_v2",
+            "paged_flash_attention_decode_d128"
         };
 
         for (const auto& name : kernels) {
@@ -516,6 +517,41 @@ private:
             fc_values->setConstantValue(&v.bc_out, MTL::DataTypeBool, FC_MUL_MM + 1);
 
             MTL::Function* func = library->newFunction(sgmm_func_name, fc_values, &error);
+            fc_values->release();
+
+            if (!func) {
+                GRANITE_LOG_WARN("Function '{}' not found with constants", v.name);
+                continue;
+            }
+
+            MTL::ComputePipelineState* pipeline = device_->newComputePipelineState(func, &error);
+            func->release();
+
+            if (!pipeline) {
+                GRANITE_LOG_WARN("Failed to create pipeline for '{}'", v.name);
+                continue;
+            }
+
+            pipelines_[v.name] = pipeline;
+            GRANITE_LOG_DEBUG("Created Metal pipeline: {} (bc_inp={}, bc_out={})", v.name, v.bc_inp, v.bc_out);
+        }
+
+        // Compile FP16 input variants of simdgroup matmul
+        SgmmVariant sgmm_f16_variants[] = {
+            {"matmul_q4k_simdgroup_f16_00", false, false},
+            {"matmul_q4k_simdgroup_f16_01", false, true},
+            {"matmul_q4k_simdgroup_f16_10", true, false},
+            {"matmul_q4k_simdgroup_f16_11", true, true},
+        };
+
+        NS::String* sgmm_f16_func_name = NS::String::string("matmul_q4k_simdgroup_f16", NS::UTF8StringEncoding);
+
+        for (const auto& v : sgmm_f16_variants) {
+            MTL::FunctionConstantValues* fc_values = MTL::FunctionConstantValues::alloc()->init();
+            fc_values->setConstantValue(&v.bc_inp, MTL::DataTypeBool, FC_MUL_MM + 0);
+            fc_values->setConstantValue(&v.bc_out, MTL::DataTypeBool, FC_MUL_MM + 1);
+
+            MTL::Function* func = library->newFunction(sgmm_f16_func_name, fc_values, &error);
             fc_values->release();
 
             if (!func) {
@@ -674,8 +710,18 @@ Result<void> MetalCompute::matmul_q4k_f16(
     MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
     uint32_t M, uint32_t K, uint32_t N)
 {
-    // TODO: Add dedicated f16 input variant with function constants if needed
-    // For now, delegate to f32 kernel (caller needs to convert)
+    // FP16 input simdgroup matmul kernel for prefill batches (M >= 32)
+    // Uses simdgroup_half8x8 matrices with FP16 activation input.
+    // This reduces memory bandwidth by 2x for activations.
+    if (M >= 32) {
+        // Use fast kernel when dimensions are perfectly aligned (no bounds checking needed)
+        if (M % 32 == 0 && N % 64 == 0) {
+            return impl_->dispatch_matmul_simdgroup("matmul_q4k_simdgroup_f16_00", X, W, Y, M, K, N);
+        }
+        return impl_->dispatch_matmul_simdgroup("matmul_q4k_simdgroup_f16_11", X, W, Y, M, K, N);
+    }
+    // For small batches, convert to FP32 on-the-fly is not worth it - fall back to FP32 kernel
+    // The caller should use convert_f32_to_f16 only when M >= 32
     return matmul_q4k(X, W, Y, M, K, N);
 }
 
@@ -1816,9 +1862,10 @@ Result<void> MetalCompute::paged_attention_decode(
     // Use paged flash attention for longer sequences or by default for efficiency
     // Flash attention uses online softmax - no O(seq_len) memory requirement
     // Old kernel limited to 4096 tokens due to threadgroup memory
+    // v2 kernel uses per-simdgroup accumulators + NE/NL parallelism (llama.cpp style)
     const char* kernel_name = nullptr;
     if (head_dim == 64) {
-        kernel_name = "paged_flash_attention_decode_d64";
+        kernel_name = "paged_flash_attention_decode_d64_v2";
     } else if (head_dim == 128) {
         kernel_name = "paged_flash_attention_decode_d128";
     } else {

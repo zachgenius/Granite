@@ -3422,6 +3422,238 @@ kernel void paged_flash_attention_decode_d64(
 }
 
 // =============================================================================
+// PAGED FLASH ATTENTION - head_dim=64 OPTIMIZED (llama.cpp style)
+// Per-simdgroup accumulators, NE/NL parallelism, direct V access
+// =============================================================================
+
+kernel void paged_flash_attention_decode_d64_v2(
+    device const float* Q              [[buffer(0)]],   // [num_heads, 64] FP32
+    device const half* K_cache         [[buffer(1)]],   // [num_blocks * block_size, num_kv_heads, head_dim] FP16
+    device const half* V_cache         [[buffer(2)]],   // [num_blocks * block_size, num_kv_heads, head_dim] FP16
+    device const int* block_table      [[buffer(3)]],   // [num_logical_blocks]
+    device float* output               [[buffer(4)]],   // [num_heads, 64] FP32
+    constant uint& num_heads           [[buffer(5)]],
+    constant uint& num_kv_heads        [[buffer(6)]],
+    constant uint& seq_len             [[buffer(7)]],   // Total sequence length
+    constant uint& head_dim            [[buffer(8)]],   // Must be 64
+    constant uint& block_size          [[buffer(9)]],   // Tokens per block (e.g., 16)
+    constant float& scale              [[buffer(10)]],
+    uint head_idx                      [[threadgroup_position_in_grid]],
+    ushort tiisg                       [[thread_index_in_simdgroup]],
+    ushort sgitg                       [[simdgroup_index_in_threadgroup]]
+) {
+    if (head_idx >= num_heads) return;
+
+    // Constants for head_dim=64
+    constexpr uint DK = 64;
+    constexpr uint DK4 = DK / 4;     // 16 float4s per head
+    constexpr uint C = PAGED_FLASH_TILE; // 32 K positions per tile
+    constexpr uint NW = 32;          // Threads per simdgroup
+    constexpr uint NSG = 4;          // Simdgroups per threadgroup
+
+    // NE/NL parallelism: 16 threads (NL) per K, 2 K positions (NE) in parallel
+    constexpr uint NL = DK4;         // 16 threads per K dot product
+    constexpr uint NE = NW / NL;     // 2 K positions in parallel
+
+    // Thread role within simdgroup
+    const ushort tx = tiisg % NL;    // 0-15: which float4 element
+    const ushort ty = tiisg / NL;    // 0-1: which K position (of NE)
+
+    // GQA: map query head to KV head
+    const uint heads_per_kv = num_heads / num_kv_heads;
+    const uint kv_head = head_idx / heads_per_kv;
+
+    // Pointers
+    device const float4* q4 = (device const float4*)(Q + head_idx * DK);
+    device float4* out4 = (device float4*)(output + head_idx * DK);
+
+    // KV stride for indexing: cache[physical_pos, kv_head, d]
+    const uint kv_stride = num_kv_heads * DK;
+
+    // Shared memory - per-simdgroup accumulators
+    threadgroup float4 sq4[DK4];         // Query vector (16 float4s)
+    threadgroup float ss[NSG][C];        // Attention scores per simdgroup
+    threadgroup float4 so4[NSG * DK4];   // Output accumulators per simdgroup
+    threadgroup float sm_s[NSG];         // Running sum per simdgroup
+    threadgroup float sm_m[NSG];         // Running max per simdgroup
+    threadgroup uint phys_pos[NSG][C];   // Physical positions cache per simdgroup
+
+    const uint tid = tiisg + sgitg * NW;
+
+    // Load Q into shared memory
+    if (tid < DK4) {
+        sq4[tid] = q4[tid];
+    }
+
+    // Initialize per-simdgroup output accumulator
+    threadgroup float4* my_so4 = so4 + sgitg * DK4;
+    threadgroup uint* my_phys = phys_pos[sgitg];  // Per-simdgroup physical pos cache
+
+    if (tiisg < DK4) {
+        my_so4[tiisg] = float4(0.0f);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Online softmax state (per-simdgroup)
+    float S = 0.0f;
+    float M = -FLT_MAX / 2;
+
+    // Process KV cache in tiles - each simdgroup handles different tiles independently
+    for (uint ic0 = sgitg; ic0 * C < seq_len; ic0 += NSG) {
+        const uint ic = ic0 * C;
+        const uint tile_len = min(C, seq_len - ic);
+
+        // =====================================================================
+        // Pre-compute block lookups for this tile (per-simdgroup, no cross-sg barrier)
+        // Each thread in the simdgroup computes its assigned positions
+        // =====================================================================
+        for (uint i = tiisg; i < tile_len; i += NW) {
+            uint logical_pos = ic + i;
+            uint logical_block = logical_pos / block_size;
+            uint blk_offset = logical_pos % block_size;
+            int physical_block = block_table[logical_block];
+            my_phys[i] = physical_block * block_size + blk_offset;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // =====================================================================
+        // Q * K^T with NE/NL parallelism - use cached physical positions
+        // =====================================================================
+        for (uint kk = 0; kk < tile_len; kk += NE) {
+            const uint k_idx = kk + ty;
+            float score = 0.0f;
+
+            if (k_idx < tile_len) {
+                // Use cached physical position
+                uint physical_pos = my_phys[k_idx];
+
+                // Direct K access: K[physical_pos, kv_head, :]
+                device const half4* k4_vec = (device const half4*)(K_cache + physical_pos * kv_stride + kv_head * DK);
+
+                // Each thread computes dot(Q[tx], K[k_idx][tx])
+                float4 q_vec = sq4[tx];
+                float4 k_vec = float4(k4_vec[tx]);
+                float partial = dot(q_vec, k_vec);
+
+                // Reduce across NL threads using simd_shuffle_down
+                partial += simd_shuffle_down(partial, 8);
+                partial += simd_shuffle_down(partial, 4);
+                partial += simd_shuffle_down(partial, 2);
+                partial += simd_shuffle_down(partial, 1);
+
+                score = partial * scale;
+            }
+
+            // Thread 0 and 16 (tx=0 for each ty) write their scores
+            if (tx == 0 && k_idx < tile_len) {
+                ss[sgitg][k_idx] = score;
+            }
+        }
+
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // =====================================================================
+        // Online softmax update (same as contiguous)
+        // =====================================================================
+        const float old_M = M;
+
+        // Find max in this tile
+        float local_max = -FLT_MAX / 2;
+        for (uint k = tiisg; k < tile_len; k += NW) {
+            local_max = max(local_max, ss[sgitg][k]);
+        }
+        float tile_max = simd_max(local_max);
+        M = max(M, tile_max);
+
+        const float ms = exp(old_M - M);
+
+        // Compute exp and sum
+        float local_sum = 0.0f;
+        for (uint k = tiisg; k < tile_len; k += NW) {
+            float vs = exp(ss[sgitg][k] - M);
+            ss[sgitg][k] = vs;
+            local_sum += vs;
+        }
+        float tile_sum = simd_sum(local_sum);
+        S = S * ms + tile_sum;
+
+        // Scale previous output
+        if (tiisg < DK4) {
+            my_so4[tiisg] *= ms;
+        }
+
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // =====================================================================
+        // O += P * V with NE/NL parallelism - use cached physical positions
+        // =====================================================================
+        float4 accum = float4(0.0f);
+
+        for (uint kk = 0; kk < tile_len; kk += NE) {
+            const uint k_idx = kk + ty;
+            if (k_idx < tile_len) {
+                // Use cached physical position (same as K)
+                uint physical_pos = my_phys[k_idx];
+
+                // Direct V access: V[physical_pos, kv_head, :]
+                device const half4* v4_vec = (device const half4*)(V_cache + physical_pos * kv_stride + kv_head * DK);
+
+                float weight = ss[sgitg][k_idx];
+                float4 v_vec = float4(v4_vec[tx]);
+                accum += v_vec * weight;
+            }
+        }
+
+        // Reduce across ty (NE dimension)
+        accum += simd_shuffle_down(accum, NL);
+
+        // Only ty=0 threads (0-15) have the complete sum
+        if (ty == 0) {
+            my_so4[tx] += accum;
+        }
+
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // =====================================================================
+    // Cross-simdgroup reduction (same as contiguous)
+    // =====================================================================
+    if (tiisg == 0) {
+        sm_s[sgitg] = S;
+        sm_m[sgitg] = M;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0) {
+        // Find global max
+        float final_M = sm_m[0];
+        for (uint sg = 1; sg < NSG; ++sg) {
+            final_M = max(final_M, sm_m[sg]);
+        }
+
+        // Compute combined sum
+        float final_S = 0.0f;
+        for (uint sg = 0; sg < NSG; ++sg) {
+            final_S += sm_s[sg] * exp(sm_m[sg] - final_M);
+        }
+
+        // Combine output vectors
+        if (tiisg < DK4) {
+            float4 final_o = float4(0.0f);
+            for (uint sg = 0; sg < NSG; ++sg) {
+                float scale_sg = exp(sm_m[sg] - final_M);
+                final_o += so4[sg * DK4 + tiisg] * scale_sg;
+            }
+
+            float inv_S = (final_S > 0.0f) ? 1.0f / final_S : 0.0f;
+            out4[tiisg] = final_o * inv_S;
+        }
+    }
+}
+
+// =============================================================================
 // PAGED FLASH ATTENTION - head_dim=128 specialization
 // =============================================================================
 
