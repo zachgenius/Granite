@@ -664,7 +664,8 @@ inline void dequantize_q4_k_to_half4x4(
     }
 }
 
-// Optimized dequantization using float math (matches llama.cpp for better precision/perf)
+// Optimized dequantization using float intermediates (matches llama.cpp math)
+// Manually unrolled for performance - Metal compiler doesn't auto-unroll as well
 inline void dequantize_q4_k_to_half4x4_opt(
     device const block_q4_K* xb,
     short il,
@@ -676,30 +677,30 @@ inline void dequantize_q4_k_to_half4x4_opt(
     q = q + (il/4) * 32 + 16 * (il&1);
     il = il & 3;
     const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
-    const float d   = il < 2 ? float(xb->d) : float(xb->d) / 16.f;
-    const float min = float(xb->dmin);
-    const float dl = d * float(sc[0]);
-    const float ml = min * float(sc[1]);
+    const float d   = il < 2 ? xb->d : xb->d / 16.h;
+    const float min = xb->dmin;
+    const float dl = d * sc[0];
+    const float ml = min * sc[1];
 
     const ushort mask = il < 2 ? 0x0F : 0xF0;
 
-    // Manually unrolled loop for better performance
-    reg[0][0] = half(dl * float(q[0] & mask) - ml);
-    reg[0][1] = half(dl * float(q[1] & mask) - ml);
-    reg[0][2] = half(dl * float(q[2] & mask) - ml);
-    reg[0][3] = half(dl * float(q[3] & mask) - ml);
-    reg[1][0] = half(dl * float(q[4] & mask) - ml);
-    reg[1][1] = half(dl * float(q[5] & mask) - ml);
-    reg[1][2] = half(dl * float(q[6] & mask) - ml);
-    reg[1][3] = half(dl * float(q[7] & mask) - ml);
-    reg[2][0] = half(dl * float(q[8] & mask) - ml);
-    reg[2][1] = half(dl * float(q[9] & mask) - ml);
-    reg[2][2] = half(dl * float(q[10] & mask) - ml);
-    reg[2][3] = half(dl * float(q[11] & mask) - ml);
-    reg[3][0] = half(dl * float(q[12] & mask) - ml);
-    reg[3][1] = half(dl * float(q[13] & mask) - ml);
-    reg[3][2] = half(dl * float(q[14] & mask) - ml);
-    reg[3][3] = half(dl * float(q[15] & mask) - ml);
+    // Manually unrolled - faster than loop on Metal
+    reg[0][0] = dl * (q[0] & mask) - ml;
+    reg[0][1] = dl * (q[1] & mask) - ml;
+    reg[0][2] = dl * (q[2] & mask) - ml;
+    reg[0][3] = dl * (q[3] & mask) - ml;
+    reg[1][0] = dl * (q[4] & mask) - ml;
+    reg[1][1] = dl * (q[5] & mask) - ml;
+    reg[1][2] = dl * (q[6] & mask) - ml;
+    reg[1][3] = dl * (q[7] & mask) - ml;
+    reg[2][0] = dl * (q[8] & mask) - ml;
+    reg[2][1] = dl * (q[9] & mask) - ml;
+    reg[2][2] = dl * (q[10] & mask) - ml;
+    reg[2][3] = dl * (q[11] & mask) - ml;
+    reg[3][0] = dl * (q[12] & mask) - ml;
+    reg[3][1] = dl * (q[13] & mask) - ml;
+    reg[3][2] = dl * (q[14] & mask) - ml;
+    reg[3][3] = dl * (q[15] & mask) - ml;
 }
 
 // =============================================================================
@@ -779,12 +780,12 @@ kernel void matmul_q4k_simdgroup(
         half4x4 temp_a;
         if (FC_mm_bc_inp) {
             if (x != nullptr) {
-                dequantize_q4_k_to_half4x4(x, il, temp_a);
+                dequantize_q4_k_to_half4x4_opt(x, il, temp_a);
             } else {
                 temp_a = half4x4(0);
             }
         } else {
-            dequantize_q4_k_to_half4x4(x, il, temp_a);
+            dequantize_q4_k_to_half4x4_opt(x, il, temp_a);
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);

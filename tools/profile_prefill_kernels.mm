@@ -63,6 +63,23 @@ int main(int argc, char** argv) {
         return pso;
     };
 
+    // Get matmul pipeline with function constants (no bounds checking for aligned dims)
+    auto get_matmul_pipeline = [&]() -> MTL::ComputePipelineState* {
+        constexpr uint32_t FC_MUL_MM = 100;
+        MTL::FunctionConstantValues* fc = MTL::FunctionConstantValues::alloc()->init();
+        bool bc_inp = false, bc_out = false;
+        fc->setConstantValue(&bc_inp, MTL::DataTypeBool, FC_MUL_MM + 0);
+        fc->setConstantValue(&bc_out, MTL::DataTypeBool, FC_MUL_MM + 1);
+
+        NS::String* fn_name = NS::String::string("matmul_q4k_simdgroup", NS::UTF8StringEncoding);
+        MTL::Function* fn = library->newFunction(fn_name, fc, &error);
+        fc->release();
+        if (!fn) return nullptr;
+        MTL::ComputePipelineState* pso = device->newComputePipelineState(fn, &error);
+        fn->release();
+        return pso;
+    };
+
     // Model dimensions (TinyLlama 1.1B)
     const uint32_t hidden_dim = 2048;
     const uint32_t num_heads = 32;
@@ -137,7 +154,7 @@ int main(int argc, char** argv) {
 
     // Get pipelines
     auto* pipe_rms_batch_f16 = get_pipeline("rms_norm_batch_f16");
-    auto* pipe_matmul_q4k = get_pipeline("matmul_q4k_simdgroup");
+    auto* pipe_matmul_q4k = get_matmul_pipeline();
     auto* pipe_rope = get_pipeline("rope_multihead");
     auto* pipe_kv_append = get_pipeline("kv_cache_append_f16");
     auto* pipe_attn = get_pipeline("flash_attention_prefill");

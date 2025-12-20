@@ -8,19 +8,20 @@
 #pragma once
 
 static const char* METAL_SHADER_UTIL = R"(
-// Optimized RMS norm with parallel reduction
+// Fast RMS norm using simd_sum for reduction (matches llama.cpp approach)
 kernel void rms_norm(
     device const float* x          [[buffer(0)]],
     device const float* weight     [[buffer(1)]],
     device float* out              [[buffer(2)]],
     constant uint& size            [[buffer(3)]],
     constant float& eps            [[buffer(4)]],
-    uint gid                       [[thread_position_in_grid]],
     uint tid                       [[thread_position_in_threadgroup]],
-    uint tg_size                   [[threads_per_threadgroup]]
+    uint tg_size                   [[threads_per_threadgroup]],
+    uint simd_lane                 [[thread_index_in_simdgroup]],
+    uint simd_group                [[simdgroup_index_in_threadgroup]]
 ) {
-    // Shared memory for reduction
-    threadgroup float shared_sum[256];
+    // Shared memory for inter-simdgroup reduction (only need 8 slots for 256 threads)
+    threadgroup float shared_sum[8];
 
     // Each thread sums multiple elements
     float local_sum = 0.0f;
@@ -28,72 +29,82 @@ kernel void rms_norm(
         float val = x[i];
         local_sum += val * val;
     }
-    shared_sum[tid] = local_sum;
+
+    // Fast simd reduction within each simdgroup (32 threads)
+    local_sum = simd_sum(local_sum);
+
+    // First thread of each simdgroup stores partial sum
+    if (simd_lane == 0) {
+        shared_sum[simd_group] = local_sum;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Tree reduction
-    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    // First simdgroup reduces the partial sums
+    float final_sum = 0.0f;
+    if (simd_group == 0 && simd_lane < (tg_size / 32)) {
+        final_sum = shared_sum[simd_lane];
+        final_sum = simd_sum(final_sum);
     }
 
-    // Thread 0 has final sum
+    // Thread 0 computes inv_rms
     threadgroup float inv_rms;
     if (tid == 0) {
-        inv_rms = rsqrt(shared_sum[0] / float(size) + eps);
+        inv_rms = rsqrt(final_sum / float(size) + eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Each thread normalizes and scales its elements
-    for (uint i = gid; i < size; i += tg_size) {
+    for (uint i = tid; i < size; i += tg_size) {
         out[i] = x[i] * inv_rms * weight[i];
     }
 }
 
-// RMS norm with FP16 weights
+// RMS norm with FP16 weights - using simd_sum
 kernel void rms_norm_f16(
     device const float* x          [[buffer(0)]],
     device const half* weight      [[buffer(1)]],
     device float* out              [[buffer(2)]],
     constant uint& size            [[buffer(3)]],
     constant float& eps            [[buffer(4)]],
-    uint gid                       [[thread_position_in_grid]],
     uint tid                       [[thread_position_in_threadgroup]],
-    uint tg_size                   [[threads_per_threadgroup]]
+    uint tg_size                   [[threads_per_threadgroup]],
+    uint simd_lane                 [[thread_index_in_simdgroup]],
+    uint simd_group                [[simdgroup_index_in_threadgroup]]
 ) {
-    threadgroup float shared_sum[256];
+    threadgroup float shared_sum[8];
 
     float local_sum = 0.0f;
     for (uint i = tid; i < size; i += tg_size) {
         float val = x[i];
         local_sum += val * val;
     }
-    shared_sum[tid] = local_sum;
+
+    local_sum = simd_sum(local_sum);
+    if (simd_lane == 0) {
+        shared_sum[simd_group] = local_sum;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    float final_sum = 0.0f;
+    if (simd_group == 0 && simd_lane < (tg_size / 32)) {
+        final_sum = shared_sum[simd_lane];
+        final_sum = simd_sum(final_sum);
     }
 
     threadgroup float inv_rms;
     if (tid == 0) {
-        inv_rms = rsqrt(shared_sum[0] / float(size) + eps);
+        inv_rms = rsqrt(final_sum / float(size) + eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint i = gid; i < size; i += tg_size) {
+    for (uint i = tid; i < size; i += tg_size) {
         out[i] = x[i] * inv_rms * float(weight[i]);
     }
 }
 
 // Batched RMS norm with FP32 weights - processes M tokens of size N each
 // x: [M, N] input, out: [M, N] output, weight: [N] (broadcast)
-// One threadgroup per token (row)
+// One threadgroup per token (row) - using simd_sum for fast reduction
 kernel void rms_norm_batch(
     device const float* x          [[buffer(0)]],
     device const float* weight     [[buffer(1)]],
@@ -103,7 +114,9 @@ kernel void rms_norm_batch(
     constant float& eps            [[buffer(5)]],
     uint tg_idx                    [[threadgroup_position_in_grid]],
     uint tid                       [[thread_position_in_threadgroup]],
-    uint tg_size                   [[threads_per_threadgroup]]
+    uint tg_size                   [[threads_per_threadgroup]],
+    uint simd_lane                 [[thread_index_in_simdgroup]],
+    uint simd_group                [[simdgroup_index_in_threadgroup]]
 ) {
     if (tg_idx >= M) return;
 
@@ -111,41 +124,50 @@ kernel void rms_norm_batch(
     device const float* x_row = x + tg_idx * N;
     device float* out_row = out + tg_idx * N;
 
-    threadgroup float shared_sum[256];
+    threadgroup float shared_sum[8];
 
-    // Each thread sums multiple elements
+    // Each thread sums multiple elements with float4 vectorized loads
     float local_sum = 0.0f;
-    for (uint i = tid; i < N; i += tg_size) {
+    uint i = tid * 4;
+    for (; i + 3 < N; i += tg_size * 4) {
+        float4 val = *((device const float4*)(x_row + i));
+        local_sum += dot(val, val);
+    }
+    // Handle remaining elements
+    for (; i < N; i += tg_size) {
         float val = x_row[i];
         local_sum += val * val;
     }
-    shared_sum[tid] = local_sum;
+
+    // Fast simd reduction
+    local_sum = simd_sum(local_sum);
+    if (simd_lane == 0) {
+        shared_sum[simd_group] = local_sum;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Tree reduction
-    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    float final_sum = 0.0f;
+    if (simd_group == 0 && simd_lane < (tg_size / 32)) {
+        final_sum = shared_sum[simd_lane];
+        final_sum = simd_sum(final_sum);
     }
 
     // Thread 0 computes inv_rms
     threadgroup float inv_rms;
     if (tid == 0) {
-        inv_rms = rsqrt(shared_sum[0] / float(N) + eps);
+        inv_rms = rsqrt(final_sum / float(N) + eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Each thread normalizes and scales its elements
-    for (uint i = tid; i < N; i += tg_size) {
-        out_row[i] = x_row[i] * inv_rms * weight[i];
+    for (uint j = tid; j < N; j += tg_size) {
+        out_row[j] = x_row[j] * inv_rms * weight[j];
     }
 }
 
 // Batched RMS norm with FP16 weights - processes M tokens of size N each
 // x: [M, N] input, out: [M, N] output, weight: [N] (broadcast)
-// One threadgroup per token (row)
+// One threadgroup per token (row) - using simd_sum for fast reduction
 kernel void rms_norm_batch_f16(
     device const float* x          [[buffer(0)]],
     device const half* weight      [[buffer(1)]],
@@ -155,49 +177,56 @@ kernel void rms_norm_batch_f16(
     constant float& eps            [[buffer(5)]],
     uint tg_idx                    [[threadgroup_position_in_grid]],
     uint tid                       [[thread_position_in_threadgroup]],
-    uint tg_size                   [[threads_per_threadgroup]]
+    uint tg_size                   [[threads_per_threadgroup]],
+    uint simd_lane                 [[thread_index_in_simdgroup]],
+    uint simd_group                [[simdgroup_index_in_threadgroup]]
 ) {
     if (tg_idx >= M) return;
 
-    // Pointer to this token's data
     device const float* x_row = x + tg_idx * N;
     device float* out_row = out + tg_idx * N;
 
-    threadgroup float shared_sum[256];
+    threadgroup float shared_sum[8];
 
-    // Each thread sums multiple elements
+    // Vectorized accumulation
     float local_sum = 0.0f;
-    for (uint i = tid; i < N; i += tg_size) {
+    uint i = tid * 4;
+    for (; i + 3 < N; i += tg_size * 4) {
+        float4 val = *((device const float4*)(x_row + i));
+        local_sum += dot(val, val);
+    }
+    for (; i < N; i += tg_size) {
         float val = x_row[i];
         local_sum += val * val;
     }
-    shared_sum[tid] = local_sum;
+
+    // Fast simd reduction
+    local_sum = simd_sum(local_sum);
+    if (simd_lane == 0) {
+        shared_sum[simd_group] = local_sum;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Tree reduction
-    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    float final_sum = 0.0f;
+    if (simd_group == 0 && simd_lane < (tg_size / 32)) {
+        final_sum = shared_sum[simd_lane];
+        final_sum = simd_sum(final_sum);
     }
 
-    // Thread 0 computes inv_rms
     threadgroup float inv_rms;
     if (tid == 0) {
-        inv_rms = rsqrt(shared_sum[0] / float(N) + eps);
+        inv_rms = rsqrt(final_sum / float(N) + eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Each thread normalizes and scales its elements
-    for (uint i = tid; i < N; i += tg_size) {
-        out_row[i] = x_row[i] * inv_rms * float(weight[i]);
+    for (uint j = tid; j < N; j += tg_size) {
+        out_row[j] = x_row[j] * inv_rms * float(weight[j]);
     }
 }
 
 // Batched RMS norm with float input, half output (for f16 matmul input)
 // x: [M, N] float input, out: [M, N] half output, weight: [N] float (broadcast)
-// This eliminates a separate conversion kernel before f16 matmul
+// This eliminates a separate conversion kernel before f16 matmul - using simd_sum
 kernel void rms_norm_batch_f32_to_f16(
     device const float* x          [[buffer(0)]],
     device const float* weight     [[buffer(1)]],
@@ -207,42 +236,52 @@ kernel void rms_norm_batch_f32_to_f16(
     constant float& eps            [[buffer(5)]],
     uint tg_idx                    [[threadgroup_position_in_grid]],
     uint tid                       [[thread_position_in_threadgroup]],
-    uint tg_size                   [[threads_per_threadgroup]]
+    uint tg_size                   [[threads_per_threadgroup]],
+    uint simd_lane                 [[thread_index_in_simdgroup]],
+    uint simd_group                [[simdgroup_index_in_threadgroup]]
 ) {
     if (tg_idx >= M) return;
 
     device const float* x_row = x + tg_idx * N;
     device half* out_row = out + tg_idx * N;
 
-    threadgroup float shared_sum[256];
+    threadgroup float shared_sum[8];
 
     float local_sum = 0.0f;
-    for (uint i = tid; i < N; i += tg_size) {
+    uint i = tid * 4;
+    for (; i + 3 < N; i += tg_size * 4) {
+        float4 val = *((device const float4*)(x_row + i));
+        local_sum += dot(val, val);
+    }
+    for (; i < N; i += tg_size) {
         float val = x_row[i];
         local_sum += val * val;
     }
-    shared_sum[tid] = local_sum;
+
+    local_sum = simd_sum(local_sum);
+    if (simd_lane == 0) {
+        shared_sum[simd_group] = local_sum;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    float final_sum = 0.0f;
+    if (simd_group == 0 && simd_lane < (tg_size / 32)) {
+        final_sum = shared_sum[simd_lane];
+        final_sum = simd_sum(final_sum);
     }
 
     threadgroup float inv_rms;
     if (tid == 0) {
-        inv_rms = rsqrt(shared_sum[0] / float(N) + eps);
+        inv_rms = rsqrt(final_sum / float(N) + eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint i = tid; i < N; i += tg_size) {
-        out_row[i] = half(x_row[i] * inv_rms * weight[i]);
+    for (uint j = tid; j < N; j += tg_size) {
+        out_row[j] = half(x_row[j] * inv_rms * weight[j]);
     }
 }
 
-// Same as above but with FP16 weights
+// Same as above but with FP16 weights - using simd_sum
 kernel void rms_norm_batch_f16w_to_f16(
     device const float* x          [[buffer(0)]],
     device const half* weight      [[buffer(1)]],
@@ -252,44 +291,54 @@ kernel void rms_norm_batch_f16w_to_f16(
     constant float& eps            [[buffer(5)]],
     uint tg_idx                    [[threadgroup_position_in_grid]],
     uint tid                       [[thread_position_in_threadgroup]],
-    uint tg_size                   [[threads_per_threadgroup]]
+    uint tg_size                   [[threads_per_threadgroup]],
+    uint simd_lane                 [[thread_index_in_simdgroup]],
+    uint simd_group                [[simdgroup_index_in_threadgroup]]
 ) {
     if (tg_idx >= M) return;
 
     device const float* x_row = x + tg_idx * N;
     device half* out_row = out + tg_idx * N;
 
-    threadgroup float shared_sum[256];
+    threadgroup float shared_sum[8];
 
     float local_sum = 0.0f;
-    for (uint i = tid; i < N; i += tg_size) {
+    uint i = tid * 4;
+    for (; i + 3 < N; i += tg_size * 4) {
+        float4 val = *((device const float4*)(x_row + i));
+        local_sum += dot(val, val);
+    }
+    for (; i < N; i += tg_size) {
         float val = x_row[i];
         local_sum += val * val;
     }
-    shared_sum[tid] = local_sum;
+
+    local_sum = simd_sum(local_sum);
+    if (simd_lane == 0) {
+        shared_sum[simd_group] = local_sum;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    float final_sum = 0.0f;
+    if (simd_group == 0 && simd_lane < (tg_size / 32)) {
+        final_sum = shared_sum[simd_lane];
+        final_sum = simd_sum(final_sum);
     }
 
     threadgroup float inv_rms;
     if (tid == 0) {
-        inv_rms = rsqrt(shared_sum[0] / float(N) + eps);
+        inv_rms = rsqrt(final_sum / float(N) + eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint i = tid; i < N; i += tg_size) {
-        out_row[i] = half(x_row[i] * inv_rms * float(weight[i]));
+    for (uint j = tid; j < N; j += tg_size) {
+        out_row[j] = half(x_row[j] * inv_rms * float(weight[j]));
     }
 }
 
 // Batched RMS norm with half precision I/O - for bandwidth-efficient prefill
 // x: [M, N] half input, out: [M, N] half output, weight: [N] half (broadcast)
-// Computation done in float for accuracy, I/O in half for bandwidth
+// Computation done in float for accuracy, I/O in half for bandwidth - using simd_sum
 kernel void rms_norm_batch_half(
     device const half* x           [[buffer(0)]],
     device const half* weight      [[buffer(1)]],
@@ -299,47 +348,56 @@ kernel void rms_norm_batch_half(
     constant float& eps            [[buffer(5)]],
     uint tg_idx                    [[threadgroup_position_in_grid]],
     uint tid                       [[thread_position_in_threadgroup]],
-    uint tg_size                   [[threads_per_threadgroup]]
+    uint tg_size                   [[threads_per_threadgroup]],
+    uint simd_lane                 [[thread_index_in_simdgroup]],
+    uint simd_group                [[simdgroup_index_in_threadgroup]]
 ) {
     if (tg_idx >= M) return;
 
-    // Pointer to this token's data
     device const half* x_row = x + tg_idx * N;
     device half* out_row = out + tg_idx * N;
 
-    threadgroup float shared_sum[256];
+    threadgroup float shared_sum[8];
 
-    // Each thread sums multiple elements (compute in float for accuracy)
+    // Vectorized half4 loads for better bandwidth
     float local_sum = 0.0f;
-    for (uint i = tid; i < N; i += tg_size) {
+    uint i = tid * 4;
+    for (; i + 3 < N; i += tg_size * 4) {
+        half4 h4 = *((device const half4*)(x_row + i));
+        float4 val = float4(h4);
+        local_sum += dot(val, val);
+    }
+    for (; i < N; i += tg_size) {
         float val = float(x_row[i]);
         local_sum += val * val;
     }
-    shared_sum[tid] = local_sum;
+
+    // Fast simd reduction
+    local_sum = simd_sum(local_sum);
+    if (simd_lane == 0) {
+        shared_sum[simd_group] = local_sum;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Tree reduction
-    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    float final_sum = 0.0f;
+    if (simd_group == 0 && simd_lane < (tg_size / 32)) {
+        final_sum = shared_sum[simd_lane];
+        final_sum = simd_sum(final_sum);
     }
 
-    // Thread 0 computes inv_rms
     threadgroup float inv_rms;
     if (tid == 0) {
-        inv_rms = rsqrt(shared_sum[0] / float(N) + eps);
+        inv_rms = rsqrt(final_sum / float(N) + eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Each thread normalizes and scales its elements (output in half)
-    for (uint i = tid; i < N; i += tg_size) {
-        out_row[i] = half(float(x_row[i]) * inv_rms * float(weight[i]));
+    for (uint j = tid; j < N; j += tg_size) {
+        out_row[j] = half(float(x_row[j]) * inv_rms * float(weight[j]));
     }
 }
 
-// Batched RMS norm with half precision I/O and FP32 weights
+// Batched RMS norm with half precision I/O and FP32 weights - using simd_sum
 kernel void rms_norm_batch_half_f32w(
     device const half* x           [[buffer(0)]],
     device const float* weight     [[buffer(1)]],
@@ -349,38 +407,49 @@ kernel void rms_norm_batch_half_f32w(
     constant float& eps            [[buffer(5)]],
     uint tg_idx                    [[threadgroup_position_in_grid]],
     uint tid                       [[thread_position_in_threadgroup]],
-    uint tg_size                   [[threads_per_threadgroup]]
+    uint tg_size                   [[threads_per_threadgroup]],
+    uint simd_lane                 [[thread_index_in_simdgroup]],
+    uint simd_group                [[simdgroup_index_in_threadgroup]]
 ) {
     if (tg_idx >= M) return;
 
     device const half* x_row = x + tg_idx * N;
     device half* out_row = out + tg_idx * N;
 
-    threadgroup float shared_sum[256];
+    threadgroup float shared_sum[8];
 
     float local_sum = 0.0f;
-    for (uint i = tid; i < N; i += tg_size) {
+    uint i = tid * 4;
+    for (; i + 3 < N; i += tg_size * 4) {
+        half4 h4 = *((device const half4*)(x_row + i));
+        float4 val = float4(h4);
+        local_sum += dot(val, val);
+    }
+    for (; i < N; i += tg_size) {
         float val = float(x_row[i]);
         local_sum += val * val;
     }
-    shared_sum[tid] = local_sum;
+
+    local_sum = simd_sum(local_sum);
+    if (simd_lane == 0) {
+        shared_sum[simd_group] = local_sum;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    float final_sum = 0.0f;
+    if (simd_group == 0 && simd_lane < (tg_size / 32)) {
+        final_sum = shared_sum[simd_lane];
+        final_sum = simd_sum(final_sum);
     }
 
     threadgroup float inv_rms;
     if (tid == 0) {
-        inv_rms = rsqrt(shared_sum[0] / float(N) + eps);
+        inv_rms = rsqrt(final_sum / float(N) + eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint i = tid; i < N; i += tg_size) {
-        out_row[i] = half(float(x_row[i]) * inv_rms * weight[i]);
+    for (uint j = tid; j < N; j += tg_size) {
+        out_row[j] = half(float(x_row[j]) * inv_rms * weight[j]);
     }
 }
 
