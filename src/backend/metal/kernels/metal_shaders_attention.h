@@ -1445,7 +1445,7 @@ kernel void multihead_attention_decode_f16kv(
 // NOTE: K_TILE=64 matches llama.cpp's NCPSG for optimal performance
 
 constant constexpr uint FA_DK = 64;      // head dimension (compile-time for TinyLlama)
-constant constexpr uint FA_Q_TILE = 8;   // queries per threadgroup
+constant constexpr uint FA_Q_TILE = 16;  // queries per threadgroup (increased from 8 to reduce dispatches)
 constant constexpr uint FA_K_TILE = 64;  // KV positions per iteration (llama.cpp uses 64)
 constant constexpr uint FA_NSG = 4;      // simdgroups per threadgroup
 constant constexpr uint FA_NW = 32;      // SIMD width

@@ -3021,9 +3021,9 @@ Result<void*> TransformerModel::forward_prefill_raw(
     constexpr uint32_t NR1 = 32;  // Batch rows per threadgroup
     constexpr size_t SHMEM_SIZE = 8192;  // 8KB threadgroup memory
 
-    // Flash attention constants
-    constexpr uint32_t Q_TILE = 8;
-    constexpr uint32_t K_TILE = 32;
+    // Flash attention constants (must match kernel: FA_Q_TILE=16, FA_K_TILE=64)
+    constexpr uint32_t Q_TILE = 16;
+    constexpr uint32_t K_TILE = 64;
     constexpr uint32_t DK = 64;
     constexpr size_t ATTN_SHMEM = Q_TILE * DK * 2 + Q_TILE * DK * 2 + Q_TILE * K_TILE * 2;
 
