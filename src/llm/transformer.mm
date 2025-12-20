@@ -2668,7 +2668,9 @@ Result<Tensor> TransformerModel::attention_paged_gpu(
     int q_dim = num_heads * head_dim;
     int kv_dim = num_kv_heads * head_dim;
     int block_size = block_manager_->block_size();
-    int current_len = paged_cache_->seq_len();
+    // Use start_pos consistently - it represents the position of the current token
+    // paged_cache_->seq_len() may have been incremented on layer 0, so don't use it
+    int current_len = start_pos;
     int total_seq = current_len + 1;
 
     // Allocate new blocks if needed (only on layer 0)
@@ -3956,12 +3958,16 @@ Result<Tensor> TransformerModel::attention_gpu(
     bool is_decode = (total_tokens == 1);
 
     // Check for paged attention mode first (highest priority)
+    // When paged attention is active, use it for ALL layers unconditionally.
+    // The seq_len is managed internally by paged_cache_ and should be trusted.
     if (is_decode && is_paged_attention()) {
-        int paged_len = paged_cache_->seq_len();
-        // Use paged path when cache length matches expected position
-        if (paged_len == start_pos) {
-            return attention_paged_gpu(hidden, layer, start_pos);
+        auto result = attention_paged_gpu(hidden, layer, start_pos);
+        // After last layer, sync CPU cache length to match paged cache
+        // This keeps forward_single's start_pos calculation correct
+        if (result.ok() && layer == model_config_.num_layers - 1 && kv_cache) {
+            kv_cache->increment_seq_len(1);
         }
+        return result;
     }
 
     // Check if GPU cache exists and is allocated
