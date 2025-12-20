@@ -687,8 +687,8 @@ public:
 
     // Multi-head attention on GPU
     // Q: [num_heads, seq_q, head_dim]
-    // K: [num_kv_heads, seq_kv, head_dim]
-    // V: [num_kv_heads, seq_kv, head_dim]
+    // K: [num_kv_heads, max_seq, head_dim] (max_seq is cache allocation size, seq_kv is actual length)
+    // V: [num_kv_heads, max_seq, head_dim]
     // output: [num_heads, seq_q, head_dim]
     Result<void> multihead_attention(
         MTL::Buffer* Q,
@@ -700,7 +700,8 @@ public:
         uint32_t seq_q,
         uint32_t seq_kv,
         uint32_t head_dim,
-        float scale
+        float scale,
+        uint32_t max_seq = 0  // KV cache stride (0 = use seq_kv for backwards compat/decode)
     );
 
     // =============================================================================

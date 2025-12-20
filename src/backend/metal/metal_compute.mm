@@ -423,7 +423,7 @@ private:
             // Core quantized kernels
             "matvec_q4k", "matmul_q4k", "matmul_q4k_vec", "matmul_q4k_tiled", "matmul_q4k_simd",
             "matmul_q4k_simdgroup",  // simdgroup_half8x8 optimized matmul
-            "matvec_f16", "matmul_f16", "matmul_f16_simd", "matvec_f32",
+            "matvec_f16", "matmul_f16", "matmul_f16_simd", "matmul_f16_simdgroup", "matvec_f32",
             "matvec_q8_0", "matmul_q8_0",
             "matvec_q4_0", "matmul_q4_0",
             "matvec_iq4_nl", "matmul_iq4_nl",
@@ -1405,8 +1405,11 @@ Result<void> MetalCompute::kv_cache_append(
 Result<void> MetalCompute::multihead_attention(
     MTL::Buffer* Q, MTL::Buffer* K, MTL::Buffer* V, MTL::Buffer* output,
     uint32_t num_heads, uint32_t num_kv_heads,
-    uint32_t seq_q, uint32_t seq_kv, uint32_t head_dim, float scale)
+    uint32_t seq_q, uint32_t seq_kv, uint32_t head_dim, float scale,
+    uint32_t max_seq)
 {
+    // If max_seq is 0, use seq_kv as stride (backwards compat for decode)
+    if (max_seq == 0) max_seq = seq_kv;
     auto* encoder = impl_->get_encoder();
 
     // Select kernel based on seq_q:
@@ -1498,6 +1501,7 @@ Result<void> MetalCompute::multihead_attention(
         encoder->setBytes(&scale, sizeof(scale), 9);
         uint32_t start_pos = 0;  // For prefill, start_pos is 0
         encoder->setBytes(&start_pos, sizeof(start_pos), 10);
+        encoder->setBytes(&max_seq, sizeof(max_seq), 11);  // KV cache stride
 
         // Threadgroup memory layout (no V buffer, half scores):
         // sq[Q_TILE * DK] = 8 * 64 = 512 halfs = 1024 bytes

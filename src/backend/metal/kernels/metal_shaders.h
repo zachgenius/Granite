@@ -3964,9 +3964,10 @@ kernel void attention_decode(
     output[gid] = out_val;
 }
 
-// KV cache append kernel
+// KV cache append kernel with layout transpose
 // Copies new K/V to the cache at the current position
-// cache: [num_heads, max_seq, head_dim], new_kv: [num_heads, new_len, head_dim]
+// new_kv: [new_len, num_heads, head_dim] (sequence-major from matmul output)
+// cache: [num_heads, max_seq, head_dim] (head-major for attention kernels)
 kernel void kv_cache_append(
     device const float* new_kv     [[buffer(0)]],
     device float* cache            [[buffer(1)]],
@@ -3983,17 +3984,17 @@ kernel void kv_cache_append(
 
     if (h >= num_heads || s >= new_len || d >= head_dim) return;
 
-    // Source: [num_heads, new_len, head_dim]
-    uint src_idx = h * new_len * head_dim + s * head_dim + d;
-    // Dest: [num_heads, max_seq, head_dim]
+    // Source layout: [new_len, num_heads, head_dim] (sequence-major from matmul output)
+    // Dest layout:   [num_heads, max_seq, head_dim] (head-major for attention kernels)
+    uint src_idx = s * num_heads * head_dim + h * head_dim + d;
     uint dst_idx = h * max_seq * head_dim + (current_len + s) * head_dim + d;
 
     cache[dst_idx] = new_kv[src_idx];
 }
 
-// KV cache append with float->half conversion
-// new_kv: [num_heads, new_len, head_dim] float
-// cache: [num_heads, max_seq, head_dim] half
+// KV cache append with float->half conversion and layout transpose
+// new_kv: [new_len, num_heads, head_dim] float (sequence-major from matmul)
+// cache: [num_heads, max_seq, head_dim] half (head-major for attention)
 kernel void kv_cache_append_f16(
     device const float* new_kv     [[buffer(0)]],
     device half* cache             [[buffer(1)]],
@@ -4010,7 +4011,9 @@ kernel void kv_cache_append_f16(
 
     if (h >= num_heads || s >= new_len || d >= head_dim) return;
 
-    uint src_idx = h * new_len * head_dim + s * head_dim + d;
+    // Source layout: [new_len, num_heads, head_dim] (sequence-major from matmul output)
+    // Dest layout:   [num_heads, max_seq, head_dim] (head-major for attention kernels)
+    uint src_idx = s * num_heads * head_dim + h * head_dim + d;
     uint dst_idx = h * max_seq * head_dim + (current_len + s) * head_dim + d;
 
     // Convert float to half when storing
@@ -5329,6 +5332,7 @@ kernel void flash_attention_prefill(
     constant uint& head_dim        [[buffer(8)]],
     constant float& scale          [[buffer(9)]],
     constant uint& start_pos       [[buffer(10)]],
+    constant uint& max_seq         [[buffer(11)]],  // KV cache stride (max sequence length)
     threadgroup half* shmem        [[threadgroup(0)]],
     uint2 tgid                     [[threadgroup_position_in_grid]],
     uint tid                       [[thread_index_in_threadgroup]],
@@ -5353,20 +5357,24 @@ kernel void flash_attention_prefill(
     threadgroup half* ss = shmem + 2 * FA_Q_TILE * FA_DK;            // 8 * 32 = 256 halfs
 
     // Pointers to global memory
-    device const float* q_ptr = Q + head_idx * seq_q * head_dim;
-    device const half* k_ptr = K + kv_head * seq_kv * head_dim;
-    device const half* v_ptr = V + kv_head * seq_kv * head_dim;
-    device float* out_ptr = output + head_idx * seq_q * head_dim;
+    // Q layout: [seq_q, num_heads, head_dim] (sequence-major from matmul output)
+    // K/V layout: [num_kv_heads, max_seq, head_dim] (head-major in cache, use max_seq for stride!)
+    // output layout: [seq_q, num_heads, head_dim] (sequence-major)
+    device const half* k_ptr = K + kv_head * max_seq * head_dim;
+    device const half* v_ptr = V + kv_head * max_seq * head_dim;
 
     // Load Q into shared memory (convert float to half)
+    // Q is in [seq_q, num_heads, head_dim] layout
     #pragma clang loop unroll(full)
     for (uint i = tid; i < FA_Q_TILE * FA_DK; i += FA_NSG * FA_NW) {
         uint q_row = i / FA_DK;
         uint q_col = i % FA_DK;
         uint global_q_pos = q_base + q_row;
 
+        // Index into [seq_q, num_heads, head_dim]: global_q_pos * (num_heads * head_dim) + head_idx * head_dim + q_col
+        uint q_idx = global_q_pos * num_heads * head_dim + head_idx * head_dim + q_col;
         sq[q_row * FA_DK + q_col] = (global_q_pos < seq_q && q_col < head_dim) ?
-            half(q_ptr[global_q_pos * head_dim + q_col]) : half(0.0f);
+            half(Q[q_idx]) : half(0.0f);
     }
 
     // Zero output accumulator
@@ -5497,6 +5505,7 @@ kernel void flash_attention_prefill(
     }
 
     // Final normalization and write to global memory
+    // Output layout: [seq_q, num_heads, head_dim] (sequence-major)
     #pragma clang loop unroll(full)
     for (uint jj = 0; jj < NQ; jj++) {
         uint j = jj * FA_NSG + simd_id;
@@ -5507,7 +5516,9 @@ kernel void flash_attention_prefill(
         float inv_sum = 1.0f / (S[jj] + 1e-6f);
 
         for (uint d = simd_lane; d < FA_DK; d += FA_NW) {
-            out_ptr[global_q_pos * head_dim + d] = float(so[j * FA_DK + d]) * inv_sum;
+            // Index into [seq_q, num_heads, head_dim]: global_q_pos * (num_heads * head_dim) + head_idx * head_dim + d
+            uint out_idx = global_q_pos * num_heads * head_dim + head_idx * head_dim + d;
+            output[out_idx] = float(so[j * FA_DK + d]) * inv_sum;
         }
     }
 }
@@ -7464,6 +7475,268 @@ kernel void paged_flash_attention_decode_d128(
         out_head[tid * 4 + 1] = result.y;
         out_head[tid * 4 + 2] = result.z;
         out_head[tid * 4 + 3] = result.w;
+    }
+}
+
+// =============================================================================
+// SIMDGROUP FP16 MATMUL (Optimized for Output Projection)
+// =============================================================================
+// Uses simdgroup_half8x8 matrices and simdgroup_multiply_accumulate.
+//
+// Computes: Y[M, N] = X[M, K] @ W[N, K]^T
+// Where X is [M, K] float32, W is [N, K] half, Y is [M, N] float32
+//
+// Memory layout (matching Q4K kernel):
+// - Weights sa: stored as [K, N] in 8x8 blocks (K in rows, N in cols within block)
+// - Inputs sb: stored as [M, K] in 8x8 blocks (M in rows, K in cols within block)
+// - simdgroup_load reads both with stride 8
+// - mb @ ma = [M,K] @ [K,N] = [M,N]
+//
+// Tile sizes: 64 N x 32 M per threadgroup, 4 simdgroups
+// =============================================================================
+
+constant constexpr uint F16_NR0 = 64;   // N output per threadgroup
+constant constexpr uint F16_NR1 = 32;   // M output per threadgroup
+constant constexpr uint F16_NK  = 32;   // K per iteration
+
+kernel void matmul_f16_simdgroup(
+    device const float* X          [[buffer(0)]],  // Input [M, K]
+    device const half* W           [[buffer(1)]],  // Weights [N, K]
+    device float* Y                [[buffer(2)]],  // Output [M, N]
+    constant uint& M               [[buffer(3)]],  // Batch size
+    constant uint& K               [[buffer(4)]],  // Input dim
+    constant uint& N               [[buffer(5)]],  // Output dim (vocab)
+    threadgroup char* shmem        [[threadgroup(0)]],
+    uint3 tgpig                    [[threadgroup_position_in_grid]],
+    ushort tiitg                   [[thread_index_in_threadgroup]],
+    ushort sgitg                   [[simdgroup_index_in_threadgroup]]
+) {
+    // Threadgroup memory: 32 8x8 blocks for weights + 16 8x8 blocks for inputs
+    // sa: 32 blocks * 64 half = 4096 bytes (8 N-blocks * 4 K-blocks)
+    // sb: 16 blocks * 64 half = 2048 bytes (4 M-blocks * 4 K-blocks)
+    threadgroup half* sa = (threadgroup half*)(shmem);
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);
+
+    const uint r0 = tgpig.y * F16_NR0;  // N start
+    const uint r1 = tgpig.x * F16_NR1;  // M start
+
+    const short nr0 = min((uint)F16_NR0, N - r0);
+    const short nr1 = min((uint)F16_NR1, M - r1);
+
+    // Thread assignment for loading (matches Q4K)
+    // IMPORTANT: Use min() to clamp row indices so extra threads duplicate valid data
+    // instead of leaving uninitialized memory
+    const short NL0 = 2;  // Weights: 128 threads / 2 = 64 N rows, each loads 16 K elements
+    const short NL1 = 4;  // Inputs: 128 threads / 4 = 32 M rows, each loads 8 K elements
+
+    const short lr0 = min((short)(tiitg / NL0), (short)(nr0 - 1));  // Weight N row, clamped
+    const short lr1 = min((short)(tiitg / NL1), (short)(nr1 - 1));  // Input M row, clamped
+    const short il0 = tiitg % NL0;  // K chunk for weights (0..1, each 16 elements)
+    const short il1 = tiitg % NL1;  // K chunk for inputs (0..3, each 8 elements)
+
+    // Accumulators: mc[m_block*4 + n_block] for 8x8 output tiles
+    simdgroup_float8x8 mc[8];
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    // Pre-compute weight store indices (N-block and position within)
+    const short sy_w = lr0 / 8;   // N block (0..7)
+    const short lx_w = lr0 % 8;   // Position within N block (0..7)
+
+    // Pre-compute input store indices (M-block and position within)
+    const short sy_x = lr1 / 8;   // M block (0..3)
+    const short ly_x = lr1 % 8;   // Position within M block (0..7)
+
+    // K-loop: process 32 K elements per iteration
+    for (uint loop_k = 0; loop_k < K; loop_k += F16_NK) {
+        // Zero-initialize threadgroup memory to handle partial tiles (M or N < tile size)
+        // sa: 4096 bytes = 2048 half, sb: 2048 bytes = 1024 half, total: 3072 half
+        // 128 threads * 24 = 3072
+        for (short i = 0; i < 24; i++) {
+            ((threadgroup half*)shmem)[tiitg * 24 + i] = half(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Load weights into sa with [K, N] layout in 8x8 blocks
+        // Block index = K_block * 8 + N_block
+        // Within block: K in rows (stride 8), N in cols
+        // NOTE: No conditional - lr0 is clamped so all threads load valid data (duplicates are ok)
+        // First 8 K elements (il0 * 16 + 0..7)
+        {
+            const short k_block = il0 * 2;  // K block 0 or 2
+            const short ib = k_block * 8 + sy_w;  // Block index
+            uint k_pos = loop_k + il0 * 16;
+            device const half* w_ptr = W + (r0 + lr0) * K + k_pos;
+            threadgroup half* dst = sa + 64 * ib + lx_w;
+
+            if (k_pos + 7 < K) {
+                dst[0]  = w_ptr[0];
+                dst[8]  = w_ptr[1];
+                dst[16] = w_ptr[2];
+                dst[24] = w_ptr[3];
+                dst[32] = w_ptr[4];
+                dst[40] = w_ptr[5];
+                dst[48] = w_ptr[6];
+                dst[56] = w_ptr[7];
+            } else {
+                for (short i = 0; i < 8; i++) {
+                    dst[i * 8] = (k_pos + i < K) ? w_ptr[i] : half(0);
+                }
+            }
+        }
+        // Second 8 K elements (il0 * 16 + 8..15)
+        {
+            const short k_block = il0 * 2 + 1;  // K block 1 or 3
+            const short ib = k_block * 8 + sy_w;
+            uint k_pos = loop_k + il0 * 16 + 8;
+            device const half* w_ptr = W + (r0 + lr0) * K + k_pos;
+            threadgroup half* dst = sa + 64 * ib + lx_w;
+
+            if (k_pos + 7 < K) {
+                dst[0]  = w_ptr[0];
+                dst[8]  = w_ptr[1];
+                dst[16] = w_ptr[2];
+                dst[24] = w_ptr[3];
+                dst[32] = w_ptr[4];
+                dst[40] = w_ptr[5];
+                dst[48] = w_ptr[6];
+                dst[56] = w_ptr[7];
+            } else {
+                for (short i = 0; i < 8; i++) {
+                    dst[i * 8] = (k_pos + i < K) ? w_ptr[i] : half(0);
+                }
+            }
+        }
+
+        // Load inputs into sb with [M, K] layout in 8x8 blocks
+        // Block index = K_block * 4 + M_block
+        // Within block: M in rows (stride 8), K in cols
+        // NOTE: No conditional - lr1 is clamped so all threads load valid data (duplicates are ok)
+        {
+            const short k_block = il1;  // K block 0..3
+            const short ib = k_block * 4 + sy_x;
+            uint k_pos = loop_k + il1 * 8;
+            device const float* x_ptr = X + (r1 + lr1) * K + k_pos;
+            threadgroup half* dst = sb + 64 * ib + ly_x * 8;
+
+            if (k_pos + 7 < K) {
+                dst[0] = half(x_ptr[0]);
+                dst[1] = half(x_ptr[1]);
+                dst[2] = half(x_ptr[2]);
+                dst[3] = half(x_ptr[3]);
+                dst[4] = half(x_ptr[4]);
+                dst[5] = half(x_ptr[5]);
+                dst[6] = half(x_ptr[6]);
+                dst[7] = half(x_ptr[7]);
+            } else {
+                for (short i = 0; i < 8; i++) {
+                    dst[i] = (k_pos + i < K) ? half(x_ptr[i]) : half(0);
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Simdgroup matrix multiply-accumulate
+        // Each simdgroup: 16 M x 32 N output
+        // sgitg 0: N[0:32], M[0:16]
+        // sgitg 1: N[32:64], M[0:16]
+        // sgitg 2: N[0:32], M[16:32]
+        // sgitg 3: N[32:64], M[16:32]
+        // IMPORTANT: Reset pointers each K iteration (they advance in the ik loop)
+        threadgroup const half* lsma = sa + 4 * 64 * (sgitg % 2);  // Weight tiles for this simdgroup
+        threadgroup const half* lsmb = sb + 2 * 64 * (sgitg / 2);  // Input tiles for this simdgroup
+
+        simdgroup_half8x8 ma[4];
+        simdgroup_half8x8 mb[2];
+
+        // Process 4 K-blocks of 8 elements each
+        #pragma clang loop unroll(full)
+        for (short ik = 0; ik < 4; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+
+            // Load 4 weight tiles [K=8, N=8] -> transposed gives [K, N]
+            simdgroup_load(ma[0], lsma + 64 * 0, 8, 0, false);
+            simdgroup_load(ma[1], lsma + 64 * 1, 8, 0, false);
+            simdgroup_load(ma[2], lsma + 64 * 2, 8, 0, false);
+            simdgroup_load(ma[3], lsma + 64 * 3, 8, 0, false);
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            // Load 2 input tiles [M=8, K=8]
+            simdgroup_load(mb[0], lsmb + 64 * 0, 8, 0, false);
+            simdgroup_load(mb[1], lsmb + 64 * 1, 8, 0, false);
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            // mc[m_block*4 + n_block] += mb[m_block] @ ma[n_block]
+            simdgroup_multiply_accumulate(mc[0], mb[0], ma[0], mc[0]);
+            simdgroup_multiply_accumulate(mc[1], mb[0], ma[1], mc[1]);
+            simdgroup_multiply_accumulate(mc[2], mb[0], ma[2], mc[2]);
+            simdgroup_multiply_accumulate(mc[3], mb[0], ma[3], mc[3]);
+            simdgroup_multiply_accumulate(mc[4], mb[1], ma[0], mc[4]);
+            simdgroup_multiply_accumulate(mc[5], mb[1], ma[1], mc[5]);
+            simdgroup_multiply_accumulate(mc[6], mb[1], ma[2], mc[6]);
+            simdgroup_multiply_accumulate(mc[7], mb[1], ma[3], mc[7]);
+
+            lsma += 8 * 64;  // Advance to next K block (8 blocks of weights)
+            lsmb += 4 * 64;  // Advance to next K block (4 blocks of inputs)
+        }
+    }
+
+    // Store results
+    const uint sg_n = 32 * (sgitg % 2);
+    const uint sg_m = 16 * (sgitg / 2);
+    const uint out_m = r1 + sg_m;
+    const uint out_n = r0 + sg_n;
+
+    if (out_m + 16 <= M && out_n + 32 <= N) {
+        // Full tile - direct store
+        device float* C = Y + out_m * N + out_n;
+        simdgroup_store(mc[0], C + 0 * N + 0,  N, 0, false);
+        simdgroup_store(mc[1], C + 0 * N + 8,  N, 0, false);
+        simdgroup_store(mc[2], C + 0 * N + 16, N, 0, false);
+        simdgroup_store(mc[3], C + 0 * N + 24, N, 0, false);
+        simdgroup_store(mc[4], C + 8 * N + 0,  N, 0, false);
+        simdgroup_store(mc[5], C + 8 * N + 8,  N, 0, false);
+        simdgroup_store(mc[6], C + 8 * N + 16, N, 0, false);
+        simdgroup_store(mc[7], C + 8 * N + 24, N, 0, false);
+    } else {
+        // Partial tile - through threadgroup memory
+        // Each simdgroup needs its own 512-float region (8 blocks × 64 floats)
+        // Total: 4 simdgroups × 512 floats × 4 bytes = 8192 bytes (fits in shmem)
+        threadgroup float* sc = (threadgroup float*)shmem + sgitg * 512;
+
+        simdgroup_store(mc[0], sc + 64 * 0, 8, 0, false);
+        simdgroup_store(mc[1], sc + 64 * 1, 8, 0, false);
+        simdgroup_store(mc[2], sc + 64 * 2, 8, 0, false);
+        simdgroup_store(mc[3], sc + 64 * 3, 8, 0, false);
+        simdgroup_store(mc[4], sc + 64 * 4, 8, 0, false);
+        simdgroup_store(mc[5], sc + 64 * 5, 8, 0, false);
+        simdgroup_store(mc[6], sc + 64 * 6, 8, 0, false);
+        simdgroup_store(mc[7], sc + 64 * 7, 8, 0, false);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Each thread in this simdgroup writes its portion of the 16×32 output
+        // Thread index within simdgroup for writing
+        const ushort thread_in_sg = tiitg - sgitg * 32;
+        for (uint idx = thread_in_sg; idx < 16 * 32; idx += 32) {
+            const uint local_m = idx / 32;
+            const uint local_n = idx % 32;
+            const uint global_m = out_m + local_m;
+            const uint global_n = out_n + local_n;
+
+            if (global_m < M && global_n < N) {
+                const uint m_block = local_m / 8;
+                const uint n_block = local_n / 8;
+                const uint m_local = local_m % 8;
+                const uint n_local = local_n % 8;
+                const uint sc_idx = (m_block * 4 + n_block) * 64 + m_local * 8 + n_local;
+                Y[global_m * N + global_n] = sc[sc_idx];
+            }
+        }
     }
 }
 )";

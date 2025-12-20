@@ -330,8 +330,9 @@ Result<Tensor> TransformerModel::forward(
     // For GPU prefill (start_pos=0, multiple tokens), use the raw buffer path
     // that eliminates ~130+ Tensor allocations per prefill
     // Raw prefill fast path - uses pre-allocated buffers to reduce CPU overhead
-    constexpr bool use_raw_prefill = true;
-    if (use_raw_prefill && use_gpu_ && total_tokens > 1 && start_pos == 0 && gpu_kv_cache_ && gpu_kv_cache_->is_allocated()) {
+    // Note: Requires M >= 32 for simdgroup matmul kernel to work correctly
+    constexpr bool use_raw_prefill = true;  // Re-enabled after fixing KV cache stride bug
+    if (use_raw_prefill && use_gpu_ && total_tokens >= 32 && start_pos == 0 && gpu_kv_cache_ && gpu_kv_cache_->is_allocated()) {
         auto* gpu = get_metal_compute();
         if (gpu && gpu->is_initialized()) {
             // Extract tokens from input tensor
@@ -2855,7 +2856,7 @@ Result<void> TransformerModel::transformer_block_prefill_raw(
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
     gpu->multihead_attention(q_buf, k_cache_buf, v_cache_buf, attn_out_buf,
                             num_heads, num_kv_heads, num_tokens, num_tokens,
-                            head_dim, scale);
+                            head_dim, scale, max_seq);  // Pass max_seq for KV cache stride
 
     // 6. Output projection (Wo) - reuse attn_input_buf for output (hidden_dim)
     dispatch_matmul(attn_out_buf, wo_buf, attn_input_buf, raw_wo->quant_type, num_tokens, q_dim, hidden_dim);
@@ -3159,6 +3160,7 @@ Result<void*> TransformerModel::forward_prefill_raw(
         enc->setBytes(&hd_dim, 4, 8);
         enc->setBytes(&attn_scale, 4, 9);
         enc->setBytes(&start_pos_u, 4, 10);
+        enc->setBytes(&ms, 4, 11);  // max_seq - KV cache stride (CRITICAL fix!)
         enc->setThreadgroupMemoryLength(ATTN_SHMEM, 0);
         uint32_t num_q_blocks = (M + Q_TILE - 1) / Q_TILE;
         enc->dispatchThreadgroups(MTL::Size::Make(nh, num_q_blocks, 1), MTL::Size::Make(128, 1, 1));
@@ -3780,7 +3782,8 @@ Result<Tensor> TransformerModel::attention_gpu(
                         total_tokens,  // seq_q
                         total_tokens,  // seq_kv (same as seq_q for prefill)
                         head_dim,
-                        scale
+                        scale,
+                        max_seq  // KV cache stride for flash_attention_prefill
                     );
 
                     // 5. Output projection - use Wo's actual quantization type
