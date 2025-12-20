@@ -208,9 +208,24 @@ public:
             MPSGraphTensorData* output_data = [[MPSGraphTensorData alloc]
                 initWithMTLBuffer:output shape:output_shape dataType:MPSDataTypeFloat32];
 
-            NSArray<MPSGraphTensorData*>* inputsArray = @[
-                input_data, w_gate_data, w_up_data, w_down_data
-            ];
+            // Build inputsArray in the order expected by the executable's feedTensors
+            // The feedTensors property returns the placeholders in the order expected by runWith:
+            NSArray<MPSGraphTensor*>* feedTensors = cached->executable.feedTensors;
+            NSMutableArray<MPSGraphTensorData*>* inputsArray = [[NSMutableArray alloc] initWithCapacity:feedTensors.count];
+
+            for (MPSGraphTensor* tensor in feedTensors) {
+                // Match tensors by comparing to cached placeholders
+                if (tensor == cached->input_placeholder) {
+                    [inputsArray addObject:input_data];
+                } else if (tensor == cached->w_gate_placeholder) {
+                    [inputsArray addObject:w_gate_data];
+                } else if (tensor == cached->w_up_placeholder) {
+                    [inputsArray addObject:w_up_data];
+                } else if (tensor == cached->w_down_placeholder) {
+                    [inputsArray addObject:w_down_data];
+                }
+            }
+
             NSArray<MPSGraphTensorData*>* resultsArray = @[output_data];
 
             // Execute synchronously

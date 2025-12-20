@@ -408,9 +408,15 @@ public:
     void set_use_gpu(bool use_gpu) { use_gpu_ = use_gpu; }
     [[nodiscard]] bool use_gpu() const { return use_gpu_; }
 
-    /// Enable/disable CoreML/ANE acceleration for attention
+    /// Enable/disable CoreML/ANE acceleration for attention (DEPRECATED - too slow)
     void set_use_coreml(bool use_coreml) { use_coreml_ = use_coreml; }
     [[nodiscard]] bool use_coreml() const { return use_coreml_; }
+
+    /// Enable CoreML/ANE for FFN (power-efficient mode)
+    /// Requires FP16 weights - will dequantize Q4_K at init time
+    /// Returns error if ANE not available or initialization fails
+    [[nodiscard]] Result<void> enable_coreml_ffn();
+    [[nodiscard]] bool use_coreml_ffn() const { return use_coreml_ffn_; }
 
     /// Get raw weight by name (for GPU path)
     [[nodiscard]] const RawWeight* get_raw_weight(const std::string& name) const;
@@ -457,7 +463,8 @@ private:
     IComputeBackend* backend_ = nullptr;
     std::unique_ptr<GGUFFile> gguf_;
     bool use_gpu_ = false;
-    bool use_coreml_ = false;  // Use CoreML/ANE for attention
+    bool use_coreml_ = false;  // Legacy: was for CoreML attention (deprecated, too slow)
+    bool use_coreml_ffn_ = false;  // Use CoreML/ANE for FFN (power-efficient mode)
 
 #ifdef GRANITE_HAS_METAL
     std::unique_ptr<GPUKVCache> gpu_kv_cache_;
@@ -543,12 +550,20 @@ private:
         void* wgate_buf = nullptr;
         void* wup_buf = nullptr;
         void* wdown_buf = nullptr;
+        // FP16 FFN weights for CoreML/ANE offload (dequantized from Q4_K)
+        void* wgate_f16_buf = nullptr;
+        void* wup_f16_buf = nullptr;
+        void* wdown_f16_buf = nullptr;
     };
     std::vector<LayerWeightCache> layer_weight_cache_;
     bool layer_cache_initialized_ = false;
+    bool coreml_ffn_initialized_ = false;
 
     // Initialize layer weight cache (call once after model load)
     void init_layer_weight_cache();
+
+    // Initialize CoreML FFN with dequantized FP16 weights
+    Result<void> init_coreml_ffn();
 #endif
 
     // Layer forward pass
