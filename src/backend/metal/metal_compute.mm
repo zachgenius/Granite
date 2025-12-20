@@ -423,7 +423,7 @@ private:
             // Core quantized kernels
             "matvec_q4k", "matmul_q4k", "matmul_q4k_vec", "matmul_q4k_tiled", "matmul_q4k_simd",
             "matmul_q4k_simdgroup",  // simdgroup_half8x8 optimized matmul
-            "matvec_f16", "matmul_f16", "matmul_f16_simd", "matmul_f16_simdgroup", "matvec_f32",
+            "matvec_f16", "matmul_f16",
             "matvec_q8_0", "matmul_q8_0",
             "matvec_q4_0", "matmul_q4_0",
             "matvec_iq4_nl", "matmul_iq4_nl",

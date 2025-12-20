@@ -291,29 +291,6 @@ Result<Tensor> TransformerModel::embed(const Tensor& token_ids) {
 // SECTION 3: Forward Pass
 // =============================================================================
 
-// Helper to print tensor stats for debugging
-static void debug_tensor_stats(const std::string& name, const Tensor& t, IComputeBackend* backend) {
-    auto map_result = backend->map_buffer(t.buffer());
-    if (!map_result.ok()) return;
-
-    const float* data = static_cast<const float*>(map_result.value());
-    size_t count = 1;
-    for (size_t i = 0; i < t.shape().size(); i++) count *= t.shape()[i];
-
-    float min_val = data[0], max_val = data[0], sum = 0;
-    for (size_t i = 0; i < count; i++) {
-        min_val = std::min(min_val, data[i]);
-        max_val = std::max(max_val, data[i]);
-        sum += data[i];
-    }
-    float mean = sum / count;
-
-    GRANITE_LOG_INFO("DEBUG {}: min={:.4f}, max={:.4f}, mean={:.4f}, first5=[{:.4f}, {:.4f}, {:.4f}, {:.4f}, {:.4f}]",
-                     name, min_val, max_val, mean, data[0], data[1], data[2], data[3], data[4]);
-
-    backend->unmap_buffer(t.buffer());
-}
-
 Result<Tensor> TransformerModel::forward(
     const Tensor& token_ids,
     KVCache* kv_cache,
