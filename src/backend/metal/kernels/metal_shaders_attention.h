@@ -1430,11 +1430,12 @@ kernel void multihead_attention_decode_f16kv(
 // Grid: (num_heads, ceil(seq_q / Q_TILE), 1)
 // Threadgroup: 128 threads (4 simdgroups)
 //
-// Template: DK=64 (head_dim), Q_TILE=8, K_TILE=32, NSG=4
+// Template: DK=64 (head_dim), Q_TILE=8, K_TILE=64, NSG=4
+// NOTE: K_TILE=64 matches llama.cpp's NCPSG for optimal performance
 
 constant constexpr uint FA_DK = 64;      // head dimension (compile-time for TinyLlama)
 constant constexpr uint FA_Q_TILE = 8;   // queries per threadgroup
-constant constexpr uint FA_K_TILE = 32;  // KV positions per iteration
+constant constexpr uint FA_K_TILE = 64;  // KV positions per iteration (llama.cpp uses 64)
 constant constexpr uint FA_NSG = 4;      // simdgroups per threadgroup
 constant constexpr uint FA_NW = 32;      // SIMD width
 
@@ -1513,28 +1514,34 @@ kernel void flash_attention_prefill(
         S[i] = 0.0f;
     }
 
-    // Loop over K/V positions in blocks of K_TILE
+    // Loop over K/V positions in blocks of K_TILE (64)
+    // With NSG=4 simdgroups, each handles 16 K positions (2 blocks of 8)
+    constexpr uint K_PER_SG = FA_K_TILE / FA_NSG;  // 16 K positions per simdgroup
+
     for (uint k_base = 0; k_base < seq_kv; k_base += FA_K_TILE) {
-        // Compute Q * K^T using simdgroup matrix operations
-        device const half* pk = k_ptr + (k_base + simd_id * 8) * head_dim;
-
-        // Compute 8x8 Q*K^T block using simdgroup matrix multiply
-        simdgroup_half8x8 mqk = simdgroup_half8x8(0);
-
-        // Iterate over head_dim in chunks of 8 - UNROLLED
+        // Each simdgroup processes 2 blocks of 8 K positions
         #pragma clang loop unroll(full)
-        for (uint d = 0; d < FA_DK; d += 8) {
-            simdgroup_half8x8 mq;
-            simdgroup_half8x8 mk;
+        for (uint kb = 0; kb < K_PER_SG / 8; kb++) {  // 2 iterations
+            device const half* pk = k_ptr + (k_base + simd_id * K_PER_SG + kb * 8) * head_dim;
 
-            simdgroup_load(mq, sq + d, FA_DK);
-            simdgroup_load(mk, pk + d, head_dim, 0, true);  // transpose
+            // Compute 8x8 Q*K^T block using simdgroup matrix multiply
+            simdgroup_half8x8 mqk = simdgroup_half8x8(0);
 
-            simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
+            // Iterate over head_dim in chunks of 8 - UNROLLED
+            #pragma clang loop unroll(full)
+            for (uint d = 0; d < FA_DK; d += 8) {
+                simdgroup_half8x8 mq;
+                simdgroup_half8x8 mk;
+
+                simdgroup_load(mq, sq + d, FA_DK);
+                simdgroup_load(mk, pk + d, head_dim, 0, true);  // transpose
+
+                simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
+            }
+
+            // Store Q*K^T scores to shared memory (half)
+            simdgroup_store(mqk, ss + simd_id * K_PER_SG + kb * 8, FA_K_TILE, 0, false);
         }
-
-        // Store Q*K^T scores to shared memory (half)
-        simdgroup_store(mqk, ss + simd_id * 8, FA_K_TILE, 0, false);
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
