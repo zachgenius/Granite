@@ -92,7 +92,6 @@ Result<void> LLMRunner::generate_streaming(
 
     // Tokenize prompt
     auto prompt_tokens = tokenizer_.encode(prompt, true);
-    GRANITE_LOG_DEBUG("Prompt tokens: {}", prompt_tokens.size());
 
     // Clear KV cache for new generation
     kv_cache_.clear();

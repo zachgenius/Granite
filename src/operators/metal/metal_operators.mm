@@ -1434,7 +1434,6 @@ void register_metal_operators() {
     registry.register_op(OpType::Softmax, BackendType::Metal,
                         []() { return std::make_unique<MetalSoftmaxOp>(); });
 
-    GRANITE_LOG_DEBUG("Registered Metal operators (MatMul, RMSNorm, Attention, Softmax, SiLU)");
 }
 
 }  // namespace granite

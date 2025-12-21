@@ -15,7 +15,6 @@ namespace granite {
 MemoryManager::MemoryManager(IComputeBackend* backend)
     : backend_(backend)
 {
-    GRANITE_LOG_DEBUG("MemoryManager initialized");
 }
 
 MemoryManager::~MemoryManager() {
@@ -30,7 +29,6 @@ MemoryManager::~MemoryManager() {
     }
     active_buffers_.clear();
 
-    GRANITE_LOG_DEBUG("MemoryManager destroyed - peak usage: {} bytes", stats_.peak_allocated);
 }
 
 // -----------------------------------------------------------------------------
@@ -249,7 +247,6 @@ void MemoryManager::clear_pool() {
 
     stats_.total_pooled = 0;
 
-    GRANITE_LOG_DEBUG("Cleared all buffer pools");
 }
 
 void MemoryManager::set_max_pool_size(size_t max_bytes) {

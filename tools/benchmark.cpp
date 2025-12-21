@@ -1,7 +1,4 @@
 #include <granite/granite.h>
-#ifdef GRANITE_HAS_METAL
-#include <granite/metal_compute.h>
-#endif
 #include <iostream>
 #include <chrono>
 #include <vector>
@@ -122,7 +119,7 @@ void benchmark_matmul(IComputeBackend* backend) {
     }
 }
 
-void benchmark_inference(const std::string& model_path, IComputeBackend* backend) {
+void benchmark_inference(const std::string& model_path, IComputeBackend* backend, bool full_logits = false) {
     print_header("LLM Inference Benchmark");
 
     // Load model
@@ -138,6 +135,7 @@ void benchmark_inference(const std::string& model_path, IComputeBackend* backend
     std::cout << "Model: " << config.num_layers << " layers, "
               << config.hidden_dim << " hidden, "
               << config.num_heads << " heads\n";
+    std::cout << "Logits mode: " << (full_logits ? "ALL tokens" : "last token only") << "\n";
 
     // Allocate KV cache
     auto kv_result = KVCache::allocate(config, 512, backend);
@@ -150,8 +148,8 @@ void benchmark_inference(const std::string& model_path, IComputeBackend* backend
     // Enable GPU mode and allocate GPU KV cache
 #ifdef GRANITE_HAS_METAL
     model.set_use_gpu(true);
-    // Match llama.cpp prompt processing behavior (logits for last token only).
-    model.set_prefill_last_token_only(true);
+    // Control logits computation: full_logits=false means last-token-only (faster)
+    model.set_prefill_last_token_only(!full_logits);
     auto gpu_cache_result = model.allocate_gpu_kv_cache(512);
     if (gpu_cache_result.ok()) {
         std::cout << "GPU KV cache allocated\n";
@@ -161,7 +159,6 @@ void benchmark_inference(const std::string& model_path, IComputeBackend* backend
 #endif
 
     // Benchmark prefill with different sequence lengths
-    std::cerr << "[DEBUG] Starting prefill benchmark...\n" << std::flush;
     std::cout << "\nPrefill (prompt processing):\n";
     std::cout << std::setw(15) << "Seq Length" << std::setw(15) << "Time (ms)"
               << std::setw(15) << "Tokens/sec" << "\n";
@@ -169,7 +166,6 @@ void benchmark_inference(const std::string& model_path, IComputeBackend* backend
     std::cout << std::flush;
 
     for (int64_t seq_len : {32, 128, 256, 512}) {  // Match llama.cpp benchmark sizes
-        std::cerr << "[DEBUG] Testing prefill seq_len=" << seq_len << "...\n" << std::flush;
         // Create token tensor
         std::vector<int64_t> shape = {1, seq_len};
         auto ids_result = Tensor::allocate(shape, DataType::INT32, backend);
@@ -193,14 +189,6 @@ void benchmark_inference(const std::string& model_path, IComputeBackend* backend
 #endif
 
         // Benchmark
-#ifdef GRANITE_HAS_METAL
-        auto* gpu = get_metal_compute();
-        if (gpu) {
-            gpu->enable_profiling(true);
-            gpu->reset_profiling_stats();
-        }
-#endif
-
         auto prefill = [&]() {
             kv_cache.clear();
 #ifdef GRANITE_HAS_METAL
@@ -217,22 +205,8 @@ void benchmark_inference(const std::string& model_path, IComputeBackend* backend
 
         std::cout << std::setw(15) << seq_len
                   << std::setw(15) << std::fixed << std::setprecision(2) << time_ms
-                  << std::setw(15) << std::fixed << std::setprecision(1) << tokens_per_sec;
-
-#ifdef GRANITE_HAS_METAL
-        // Print profiling stats (per single run, not averaged over benchmark iterations)
-        if (gpu) {
-            uint64_t dispatches, syncs, cmd_buffers;
-            double sync_time;
-            gpu->get_profiling_stats(dispatches, syncs, sync_time, cmd_buffers);
-            // Stats are cumulative over 3 iterations, divide by 3
-            std::cout << " [" << dispatches/3 << " dispatches, "
-                      << syncs/3 << " syncs, "
-                      << cmd_buffers/3 << " cmdbufs]";
-            gpu->enable_profiling(false);
-        }
-#endif
-        std::cout << "\n";
+                  << std::setw(15) << std::fixed << std::setprecision(1) << tokens_per_sec
+                  << "\n";
     }
 
     // Benchmark single-token generation (decode)
@@ -263,9 +237,7 @@ void benchmark_inference(const std::string& model_path, IComputeBackend* backend
     }
 
     // Benchmark single token generation at different cache lengths
-    std::cerr << "[DEBUG] Starting decode benchmark...\n" << std::flush;
     for (int cache_len : {1, 16, 64, 128}) {  // Reduced from 256 for faster benchmarking
-        std::cerr << "[DEBUG] Extending cache to " << cache_len << "...\n" << std::flush;
         // Get current cache length (prefer GPU cache if available)
         auto get_cache_len = [&]() -> int {
 #ifdef GRANITE_HAS_METAL
@@ -283,7 +255,6 @@ void benchmark_inference(const std::string& model_path, IComputeBackend* backend
         }
 
         // Benchmark single token
-        std::cerr << "[DEBUG] Benchmarking decode at len=" << get_cache_len() << "...\n" << std::flush;
         auto decode = [&]() {
             // Note: This modifies the cache, so results may vary
             auto result = model.forward_single(1, kv_cache);
@@ -401,18 +372,34 @@ int main(int argc, char* argv[]) {
     std::cout << "FP16 support: " << (caps.supports_fp16 ? "yes" : "no") << "\n";
 
     // Run benchmarks
-    std::cerr << "[DEBUG] Starting memory benchmark...\n" << std::flush;
     benchmark_memory(backend.get());
-    std::cerr << "[DEBUG] Starting matmul benchmark...\n" << std::flush;
     benchmark_matmul(backend.get());
 
     // If model path provided, run inference benchmark
     if (argc > 1) {
-        std::cerr << "[DEBUG] Starting inference benchmark...\n" << std::flush;
-        benchmark_inference(argv[1], backend.get());
+        std::string model_path;
+        bool full_logits = false;
+
+        for (int i = 1; i < argc; i++) {
+            std::string arg = argv[i];
+            if (arg == "--full-logits") {
+                full_logits = true;
+            } else if (arg[0] != '-') {
+                model_path = arg;
+            }
+        }
+
+        if (!model_path.empty()) {
+            benchmark_inference(model_path, backend.get(), full_logits);
+        } else {
+            std::cout << "\nUsage: " << argv[0] << " [model.gguf] [--full-logits]\n";
+            std::cout << "Provide a GGUF model path to run inference benchmarks.\n";
+            std::cout << "  --full-logits: Compute logits for all tokens (default: last token only)\n";
+        }
     } else {
-        std::cout << "\nUsage: " << argv[0] << " [model.gguf]\n";
+        std::cout << "\nUsage: " << argv[0] << " [model.gguf] [--full-logits]\n";
         std::cout << "Provide a GGUF model path to run inference benchmarks.\n";
+        std::cout << "  --full-logits: Compute logits for all tokens (default: last token only)\n";
     }
 
     backend->shutdown();

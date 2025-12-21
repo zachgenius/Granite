@@ -550,8 +550,6 @@ Result<void> GraphExecutor::compile(const Graph& graph) {
     }
     plan_->set_output_buffers(std::move(output_buffers));
 
-    GRANITE_LOG_DEBUG("Compiled graph with {} steps, {} bytes total memory",
-                      plan_->num_steps(), plan_->total_memory_bytes());
 
     return {};
 }

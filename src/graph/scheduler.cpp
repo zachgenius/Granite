@@ -215,9 +215,6 @@ Result<CompiledPlan> Scheduler::compile(const Graph& graph) {
     }
     plan.set_peak_memory(peak);
 
-    GRANITE_LOG_DEBUG("Compiled plan: {} ops, {} buffers, {} peak bytes",
-                      plan.num_operations(), plan.num_buffers(),
-                      plan.peak_memory_required());
 
     return plan;
 }

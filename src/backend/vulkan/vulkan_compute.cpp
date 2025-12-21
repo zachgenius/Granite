@@ -576,7 +576,6 @@ private:
         p.num_buffers = num_buffers;
         pipelines_[name] = p;
 
-        GRANITE_LOG_DEBUG("Created pipeline: {}", name);
         return {};
     }
 

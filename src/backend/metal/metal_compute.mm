@@ -534,7 +534,6 @@ private:
             }
 
             pipelines_[name] = pipeline;
-            GRANITE_LOG_DEBUG("Created Metal pipeline: {}", name);
         }
 
         // Compile matmul_q4k_simdgroup with function constants (llama.cpp style)
@@ -577,7 +576,6 @@ private:
             }
 
             pipelines_[v.name] = pipeline;
-            GRANITE_LOG_DEBUG("Created Metal pipeline: {} (bc_inp={}, bc_out={})", v.name, v.bc_inp, v.bc_out);
         }
 
         // Compile FP16 input variants of simdgroup matmul
@@ -612,7 +610,6 @@ private:
             }
 
             pipelines_[v.name] = pipeline;
-            GRANITE_LOG_DEBUG("Created Metal pipeline: {} (bc_inp={}, bc_out={})", v.name, v.bc_inp, v.bc_out);
         }
 
         // Compile fused_gate_up_q4k_simdgroup with function constants
@@ -648,7 +645,6 @@ private:
             }
 
             pipelines_[v.name] = pipeline;
-            GRANITE_LOG_DEBUG("Created Metal pipeline: {} (bc_inp={}, bc_out={})", v.name, v.bc_inp, v.bc_out);
         }
 
         library->release();

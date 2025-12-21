@@ -20,13 +20,6 @@ public:
 
         GRANITE_LOG_INFO("Initializing CPU backend");
 
-        // Detect SIMD capabilities
-#if defined(GRANITE_HAS_NEON)
-        GRANITE_LOG_DEBUG("NEON SIMD available");
-#elif defined(GRANITE_HAS_AVX2)
-        GRANITE_LOG_DEBUG("AVX2 SIMD available");
-#endif
-
         initialized_ = true;
         return {};
     }
@@ -74,14 +67,12 @@ public:
         BufferHandle handle{next_handle_++};
         buffers_[handle] = std::vector<uint8_t>(desc.size);
 
-        GRANITE_LOG_DEBUG("Created CPU buffer: id={}, size={}", handle.id, desc.size);
         return handle;
     }
 
     void destroy_buffer(BufferHandle handle) override {
         auto it = buffers_.find(handle);
         if (it != buffers_.end()) {
-            GRANITE_LOG_DEBUG("Destroyed CPU buffer: id={}", handle.id);
             buffers_.erase(it);
         }
     }

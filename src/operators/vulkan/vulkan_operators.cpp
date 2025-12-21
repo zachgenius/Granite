@@ -66,7 +66,6 @@ void register_vulkan_operators() {
     // registry.register_op(OpType::Add, BackendType::Vulkan,
     //                     []() { return std::make_unique<VulkanAddOp>(); });
 
-    GRANITE_LOG_DEBUG("Registered Vulkan operators (placeholder)");
 }
 
 }  // namespace granite

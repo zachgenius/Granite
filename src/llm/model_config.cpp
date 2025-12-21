@@ -70,8 +70,6 @@ Result<ModelConfig> parse_model_config(const GGUFFile& gguf) {
             int q_output_dim = static_cast<int>(q_weight->dimensions[1]);
             if (config.num_heads > 0 && q_output_dim > 0) {
                 config.head_dim = q_output_dim / config.num_heads;
-                GRANITE_LOG_DEBUG("Computed head_dim from Q weight: {} (Q output dim: {})",
-                                  config.head_dim, q_output_dim);
             }
         }
     }

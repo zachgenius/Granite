@@ -129,7 +129,6 @@ Result<void> SpeculativeRunner::generate_streaming(
 
     // Tokenize prompt
     auto prompt_tokens = tokenizer_.encode(prompt, true);
-    GRANITE_LOG_DEBUG("Prompt tokens: {}", prompt_tokens.size());
 
     // Clear KV caches for new generation
     target_kv_cache_.clear();
@@ -517,7 +516,6 @@ void SpeculativeRunner::build_tree(
         }
     }
 
-    GRANITE_LOG_DEBUG("Built speculation tree: {} nodes, max depth {}", tree.size(), depth);
 }
 
 std::vector<int32_t> SpeculativeRunner::verify_tree(
@@ -664,7 +662,6 @@ Result<void> SpeculativeRunner::generate_streaming_tree(
 
     // Tokenize prompt
     auto prompt_tokens = tokenizer_.encode(prompt, true);
-    GRANITE_LOG_DEBUG("Prompt tokens: {}", prompt_tokens.size());
 
     // Clear KV caches
     target_kv_cache_.clear();

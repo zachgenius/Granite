@@ -2347,7 +2347,6 @@ Result<Tensor> TransformerModel::feed_forward_gpu(const Tensor& hidden, int laye
 
     // Fall back to CPU if raw weights not available
     if (!w_gate || !w_up || !w_down) {
-        GRANITE_LOG_DEBUG("GPU weights not available for layer {}, falling back to CPU", layer);
         return feed_forward(hidden, layer);
     }
 
@@ -2854,14 +2853,11 @@ Result<void> TransformerModel::init_decode_pool() {
             !decode_pool_->attn_out_buf || !decode_pool_->ffn_gate_buf || !decode_pool_->ffn_up_buf) {
             GRANITE_LOG_WARN("Failed to allocate some GPU buffers for decode pool");
         } else {
-            GRANITE_LOG_DEBUG("GPU decode buffers allocated (q={}, kv={}, ffn={})",
-                             q_dim, kv_dim, intermediate_dim);
         }
     }
 
     decode_pool_->initialized = true;
 
-    GRANITE_LOG_DEBUG("Decode buffer pool initialized");
     return {};
 }
 
@@ -2956,7 +2952,6 @@ Result<void> TransformerModel::ensure_prefill_pool(int num_tokens) {
     prefill_pool_->max_tokens = alloc_tokens;
     prefill_pool_->initialized = true;
 
-    GRANITE_LOG_DEBUG("Prefill buffer pool initialized with {} token capacity", alloc_tokens);
     return {};
 }
 
@@ -3810,7 +3805,6 @@ Result<void> TransformerModel::sync_cpu_to_gpu_kv_cache(KVCache* kv_cache) {
     }
 
     gpu_kv_cache_->current_len = cpu_len;
-    GRANITE_LOG_DEBUG("Synced CPU KV cache to GPU: {} tokens", cpu_len);
 
     return {};
 }
@@ -3821,10 +3815,6 @@ Result<Tensor> TransformerModel::attention_full_gpu(
     int layer,
     int start_pos)
 {
-    // Debug logging disabled for performance - uncomment to trace attention calls
-    // if (layer == 0) {
-    //     GRANITE_LOG_DEBUG("ATTN_FULL_GPU enter layer={} sp={}", layer, start_pos);
-    // }
     std::string prefix = "blk." + std::to_string(layer) + ".";
 
     // Get raw quantized weights for GPU projection
@@ -4043,12 +4033,6 @@ Result<Tensor> TransformerModel::attention_gpu(
     if (is_decode && has_gpu_cache) {
         int gpu_len = gpu_kv_cache_->seq_len();
 
-        // Debug logging disabled for performance
-        // if (layer == 0) {
-        //     GRANITE_LOG_DEBUG("DECODE: layer={} start_pos={} gpu_len={} cpu_len={}",
-        //         layer, start_pos, gpu_len, kv_cache ? kv_cache->seq_len() : -1);
-        // }
-
         // If GPU cache is already valid (gpu_len == start_pos), use GPU path
         if (gpu_len == start_pos) {
             auto result = attention_full_gpu(hidden, layer, start_pos);
@@ -4096,13 +4080,6 @@ Result<Tensor> TransformerModel::attention_gpu(
             const RawWeight* raw_wk = get_raw_weight(prefix + "attn_k.weight");
             const RawWeight* raw_wv = get_raw_weight(prefix + "attn_v.weight");
             const RawWeight* raw_wo = get_raw_weight(prefix + "attn_output.weight");
-
-            // Debug logging disabled for performance
-            // if (layer == 0 && raw_wk && raw_wv) {
-            //     GRANITE_LOG_DEBUG("WEIGHTS: wk_type={} wv_type={} wk_size={} wv_size={}",
-            //         static_cast<int>(raw_wk->quant_type), static_cast<int>(raw_wv->quant_type),
-            //         raw_wk->size_bytes, raw_wv->size_bytes);
-            // }
 
             if (raw_wq && raw_wk && raw_wv && raw_wo &&
                 (raw_wq->quant_type == GGMLType::Q4_K || raw_wq->quant_type == GGMLType::Q5_K ||

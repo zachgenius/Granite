@@ -825,7 +825,6 @@ void register_cpu_operators() {
     registry.register_op(OpType::RMSNorm, BackendType::CPU,
                         []() { return std::make_unique<CPURMSNormOp>(); });
 
-    GRANITE_LOG_DEBUG("Registered CPU operators");
 }
 
 }  // namespace granite

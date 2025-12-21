@@ -19,8 +19,6 @@ void RoPECache::initialize(int max_seq_len, int head_dim, float theta) {
         }
     }
 
-    GRANITE_LOG_DEBUG("Initialized RoPE cache: max_seq={}, head_dim={}, theta={}",
-                      max_seq_len, head_dim, theta);
 }
 
 Result<void> RoPECache::apply(Tensor& q, Tensor& k, int start_pos, IComputeBackend* backend) {

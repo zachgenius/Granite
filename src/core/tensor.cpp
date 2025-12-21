@@ -65,8 +65,6 @@ Result<Tensor> Tensor::allocate(std::span<const int64_t> shape,
     tensor.dtype_ = dtype;
     tensor.backend_ = backend;
 
-    GRANITE_LOG_DEBUG("Allocated tensor: shape=[{}], dtype={}, size={}",
-                      fmt::join(shape, ", "), dtype_name(dtype), size_bytes);
 
     return tensor;
 }

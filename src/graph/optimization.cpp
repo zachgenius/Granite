@@ -57,7 +57,6 @@ Result<bool> DeadCodeEliminationPass::run(Graph& graph) {
         }
         if (all_outputs_dead && !node.outputs.empty()) {
             dead_count++;
-            GRANITE_LOG_DEBUG("DCE: Node '{}' is dead (outputs not used)", node.name);
         }
     }
 
@@ -99,7 +98,6 @@ Result<bool> ConstantFoldingPass::run(Graph& graph) {
     }
 
     if (candidates > 0) {
-        GRANITE_LOG_DEBUG("ConstantFolding: Found {} potential fold candidates", candidates);
     }
 
     return false;  // No modifications in placeholder
@@ -161,8 +159,6 @@ bool OperatorFusionPass::try_fuse_matmul_bias(Graph& graph) {
         matmul_node.attrs.set("bias_tensor", static_cast<int64_t>(bias_tensor));
 
         fused++;
-        GRANITE_LOG_DEBUG("Fused MatMul '{}' + Add '{}' -> FusedMatMulBias",
-                         matmul_node.name, add_node.name);
     }
 
     if (fused > 0) {
@@ -214,8 +210,6 @@ bool OperatorFusionPass::try_fuse_linear_activation(Graph& graph) {
         linear_node.attrs.set("fused_activation", static_cast<int64_t>(act_node.op));
 
         fused++;
-        GRANITE_LOG_DEBUG("Fused {} + {} into single kernel",
-                         op_type_name(linear_node.op), op_type_name(act_node.op));
     }
 
     if (fused > 0) {
@@ -280,7 +274,6 @@ Result<int> OptimizationPipeline::run(Graph& graph) {
     int modifications = 0;
 
     for (auto& pass : passes_) {
-        GRANITE_LOG_DEBUG("Running optimization pass: {}", pass->name());
 
         auto result = pass->run(graph);
         if (!result.ok()) {
@@ -308,7 +301,6 @@ Result<int> OptimizationPipeline::run_until_fixed_point(Graph& graph, int max_it
         total_modifications += mods;
 
         if (mods == 0) {
-            GRANITE_LOG_DEBUG("Optimization reached fixed point after {} iterations", i + 1);
             break;
         }
     }

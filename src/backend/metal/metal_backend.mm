@@ -151,14 +151,12 @@ public:
         BufferHandle handle{next_handle_++};
         buffers_[handle] = buffer;
 
-        GRANITE_LOG_DEBUG("Created Metal buffer: id={}, size={}", handle.id, desc.size);
         return handle;
     }
 
     void destroy_buffer(BufferHandle handle) override {
         auto it = buffers_.find(handle);
         if (it != buffers_.end()) {
-            GRANITE_LOG_DEBUG("Destroyed Metal buffer: id={}", handle.id);
             it->second->release();
             buffers_.erase(it);
         }
@@ -304,14 +302,12 @@ public:
         PipelineHandle handle{next_handle_++};
         pipelines_[handle] = pipeline;
 
-        GRANITE_LOG_DEBUG("Created Metal pipeline: id={}, entry={}", handle.id, desc.entry_point);
         return handle;
     }
 
     void destroy_pipeline(PipelineHandle handle) override {
         auto it = pipelines_.find(handle);
         if (it != pipelines_.end()) {
-            GRANITE_LOG_DEBUG("Destroyed Metal pipeline: id={}", handle.id);
             it->second->release();
             pipelines_.erase(it);
         }

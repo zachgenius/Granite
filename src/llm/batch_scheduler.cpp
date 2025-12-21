@@ -125,7 +125,6 @@ int BatchScheduler::submit(
     int id = request->request_id;
     prefill_queue_.push_back(std::move(request));
 
-    GRANITE_LOG_DEBUG("Submitted request {}: {} tokens", id, prefill_queue_.back()->prompt_tokens.size());
 
     return id;
 }

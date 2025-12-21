@@ -15,8 +15,6 @@ OperatorRegistry& OperatorRegistry::instance() {
 void OperatorRegistry::register_op(OpType op, BackendType backend, OperatorFactory factory) {
     Key key{op, backend};
     factories_[key] = std::move(factory);
-    GRANITE_LOG_DEBUG("Registered operator: {} for backend {}",
-                      op_type_name(op), backend_name(backend));
 }
 
 std::unique_ptr<IOperator> OperatorRegistry::create(OpType op, BackendType backend) const {
@@ -336,7 +334,6 @@ void initialize_operators() {
 #endif
 
     operators_initialized = true;
-    GRANITE_LOG_DEBUG("Operators initialized");
 }
 
 }  // namespace granite
