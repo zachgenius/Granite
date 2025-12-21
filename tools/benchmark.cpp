@@ -467,6 +467,15 @@ int main(int argc, char* argv[]) {
     // Create backend
     BackendType preferred_backend = BackendType::CPU;
     bool preferred_backend_set = false;
+    if (const char* backend_env = std::getenv("GRANITE_BACKEND")) {
+        BackendType parsed = BackendType::CPU;
+        if (parse_backend_arg(backend_env, parsed)) {
+            preferred_backend = parsed;
+            preferred_backend_set = true;
+        } else {
+            std::cerr << "Invalid GRANITE_BACKEND value, using default.\n";
+        }
+    }
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--backend" && i + 1 < argc) {
@@ -581,6 +590,7 @@ int main(int argc, char* argv[]) {
             std::cout << "  --kv-cache-max-seq <n>: Override KV cache max sequence length\n";
             std::cout << "  --profile: Print per-section timing stats\n";
             std::cout << "  --backend <cpu|metal|vulkan>: Force backend for benchmarking\n";
+            std::cout << "  GRANITE_BACKEND=cpu|metal|vulkan (env override)\n";
         }
     } else {
         std::cout << "\nUsage: " << argv[0] << " [model.gguf] [--full-logits]\n";
@@ -591,6 +601,7 @@ int main(int argc, char* argv[]) {
         std::cout << "  --kv-cache-max-seq <n>: Override KV cache max sequence length\n";
         std::cout << "  --profile: Print per-section timing stats\n";
         std::cout << "  --backend <cpu|metal|vulkan>: Force backend for benchmarking\n";
+        std::cout << "  GRANITE_BACKEND=cpu|metal|vulkan (env override)\n";
     }
 
     backend->shutdown();
