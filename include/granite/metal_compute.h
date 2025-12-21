@@ -4,6 +4,9 @@
 
 #ifdef GRANITE_HAS_METAL
 
+#include <string>
+#include <vector>
+
 // Forward declarations to avoid exposing Metal headers
 namespace MTL {
     class Device;
@@ -44,6 +47,16 @@ public:
     void get_profiling_stats(uint64_t& dispatches, uint64_t& syncs, double& sync_time_ms, uint64_t& cmd_buffers) const;
     void get_profiling_stats(uint64_t& dispatches, uint64_t& syncs, double& sync_time_ms, uint64_t& cmd_buffers,
                              double& gpu_time_ms, uint64_t& gpu_timed_buffers) const;
+
+    struct KernelTiming {
+        std::string name;
+        double gpu_time_ms = 0.0;
+        uint64_t dispatches = 0;
+    };
+
+    void enable_kernel_timing(bool enable);
+    void reset_kernel_timing();
+    std::vector<KernelTiming> get_kernel_timing_stats() const;
 
     // GPU Capture API (for Xcode GPU profiler)
     // Captures a GPU trace that can be opened in Xcode for detailed analysis

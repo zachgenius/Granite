@@ -202,6 +202,32 @@ const RawWeight* TransformerModel::get_raw_weight(const std::string& name) const
     return &it->second;
 }
 
+ModelMemoryStats TransformerModel::memory_stats() const {
+    ModelMemoryStats stats;
+    for (const auto& it : weights_) {
+        stats.weights_bytes += it.second.size_bytes();
+    }
+    for (const auto& it : raw_weights_) {
+        stats.raw_weights_bytes += it.second.size_bytes;
+    }
+#ifdef GRANITE_HAS_METAL
+    if (decode_pool_ && decode_pool_->initialized) {
+        stats.decode_pool_bytes = decode_pool_->tensor_bytes + decode_pool_->gpu_buffer_bytes;
+    }
+    if (prefill_pool_ && prefill_pool_->initialized) {
+        stats.prefill_pool_bytes = prefill_pool_->gpu_buffer_bytes;
+    }
+    if (gpu_kv_cache_ && gpu_kv_cache_->is_allocated()) {
+        size_t elems = static_cast<size_t>(model_config_.num_layers) *
+                       static_cast<size_t>(model_config_.num_kv_heads) *
+                       static_cast<size_t>(gpu_kv_cache_->max_seq_len) *
+                       static_cast<size_t>(model_config_.head_dim);
+        stats.gpu_kv_bytes = elems * sizeof(uint16_t) * 2;
+    }
+#endif
+    return stats;
+}
+
 // =============================================================================
 // SECTION 2: Embedding Lookup
 // =============================================================================
@@ -2880,6 +2906,14 @@ Result<void> TransformerModel::init_decode_pool() {
     decode_pool_->attn_layer_out = std::move(attn_layer_out).take();
     decode_pool_->norm_out = std::move(norm_out).take();
     decode_pool_->logits = std::move(logits).take();
+    decode_pool_->tensor_bytes =
+        decode_pool_->attn_input.size_bytes() +
+        decode_pool_->post_attn.size_bytes() +
+        decode_pool_->ffn_input.size_bytes() +
+        decode_pool_->block_output.size_bytes() +
+        decode_pool_->attn_layer_out.size_bytes() +
+        decode_pool_->norm_out.size_bytes() +
+        decode_pool_->logits.size_bytes();
 
     // Allocate GPU-specific buffers for attention and FFN
     auto* gpu = get_metal_compute();
@@ -2899,6 +2933,11 @@ Result<void> TransformerModel::init_decode_pool() {
             !decode_pool_->attn_out_buf || !decode_pool_->ffn_gate_buf || !decode_pool_->ffn_up_buf) {
             GRANITE_LOG_WARN("Failed to allocate some GPU buffers for decode pool");
         } else {
+            decode_pool_->gpu_buffer_bytes =
+                static_cast<size_t>(q_dim) * sizeof(float) +
+                static_cast<size_t>(kv_dim) * sizeof(float) * 2 +
+                static_cast<size_t>(q_dim) * sizeof(float) +
+                static_cast<size_t>(intermediate_dim) * sizeof(float) * 2;
         }
     }
 
@@ -3008,6 +3047,18 @@ Result<void> TransformerModel::ensure_prefill_pool(int num_tokens, int chunk_tok
 
     prefill_pool_->max_tokens = alloc_tokens;
     prefill_pool_->chunk_tokens = alloc_chunk;
+    prefill_pool_->gpu_buffer_bytes =
+        static_cast<size_t>(alloc_tokens) * sizeof(int32_t) +
+        static_cast<size_t>(alloc_tokens) * hidden_dim * sizeof(float) +
+        static_cast<size_t>(alloc_chunk) * hidden_dim * sizeof(float) * 3 +
+        static_cast<size_t>(alloc_chunk) * hidden_dim * sizeof(float) +
+        static_cast<size_t>(alloc_chunk) * q_dim * sizeof(float) +
+        static_cast<size_t>(alloc_chunk) * kv_dim * sizeof(float) * 2 +
+        static_cast<size_t>(alloc_chunk) * q_dim * sizeof(float) +
+        static_cast<size_t>(alloc_chunk) * intermediate_dim * sizeof(float) * 2 +
+        static_cast<size_t>(alloc_chunk) * max_dim * sizeof(uint16_t) +
+        static_cast<size_t>(alloc_tokens) * hidden_dim * sizeof(float) +
+        static_cast<size_t>(alloc_tokens) * vocab_size * sizeof(float);
     prefill_pool_->initialized = true;
 
     return {};

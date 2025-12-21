@@ -7,7 +7,7 @@
 // - First token latency
 //
 // Usage:
-//   ./granite_bench_vs_llamacpp <model.gguf> [--llama-bench <path>] [options]
+//   ./granite_bench_vs_llamacpp <model.gguf> [--llama-bench <path>] [--mlc-bench <path>] [options]
 //
 // Options:
 //   --prompt-len <n>   Prompt length in tokens (default: 128)
@@ -16,6 +16,8 @@
 //   --runs <n>         Number of benchmark runs (default: 3)
 //   --warmup <n>       Number of warmup runs (default: 1)
 //   --llama-bench <path>  Path to llama-bench binary
+//   --mlc-bench <path>    Path to MLC-LLM benchmark binary
+//   --mlc-args <args>     Extra args for MLC-LLM benchmark
 //   --compare-only     Only run comparison (skip Granite bench)
 
 #include <granite/granite.h>
@@ -31,6 +33,7 @@
 #include <numeric>
 #include <cmath>
 #include <cstdlib>
+#include <regex>
 #include <unistd.h>
 #include <sys/wait.h>
 
@@ -39,6 +42,8 @@ using namespace granite;
 struct BenchmarkConfig {
     std::string model_path;
     std::string llama_bench_path;
+    std::string mlc_bench_path;
+    std::string mlc_args;
     int prompt_len = 128;
     int gen_len = 128;
     int batch_size = 512;
@@ -73,7 +78,9 @@ BenchmarkConfig parse_args(int argc, char** argv) {
         std::cerr << "  --runs <n>            Number of benchmark runs (default: 3)\n";
         std::cerr << "  --warmup <n>          Number of warmup runs (default: 1)\n";
         std::cerr << "  --llama-bench <path>  Path to llama-bench binary\n";
-        std::cerr << "  --compare-only        Only run llama.cpp comparison\n";
+        std::cerr << "  --mlc-bench <path>    Path to MLC-LLM benchmark binary\n";
+        std::cerr << "  --mlc-args <args>     Extra args for MLC-LLM benchmark\n";
+        std::cerr << "  --compare-only        Only run external comparisons (skip Granite bench)\n";
         std::cerr << "  --verbose             Verbose output\n";
         exit(1);
     }
@@ -94,6 +101,10 @@ BenchmarkConfig parse_args(int argc, char** argv) {
             config.warmup = std::stoi(argv[++i]);
         } else if (arg == "--llama-bench" && i + 1 < argc) {
             config.llama_bench_path = argv[++i];
+        } else if (arg == "--mlc-bench" && i + 1 < argc) {
+            config.mlc_bench_path = argv[++i];
+        } else if (arg == "--mlc-args" && i + 1 < argc) {
+            config.mlc_args = argv[++i];
         } else if (arg == "--compare-only") {
             config.compare_only = true;
         } else if (arg == "--verbose") {
@@ -400,6 +411,32 @@ BenchmarkResult parse_llama_bench_output(const std::string& output, const Benchm
     return result;
 }
 
+BenchmarkResult parse_mlc_bench_output(const std::string& output, const BenchmarkConfig& config) {
+    BenchmarkResult result;
+    result.name = "MLC-LLM";
+    result.prompt_tokens = config.prompt_len;
+    result.generated_tokens = config.gen_len;
+
+    std::regex prefill_re(R"(prefill[^0-9]*([0-9]+(\.[0-9]+)?)\s*(tok/s|tokens/s|t/s))",
+                          std::regex::icase);
+    std::regex decode_re(R"((decode|gen|generation)[^0-9]*([0-9]+(\.[0-9]+)?)\s*(tok/s|tokens/s|t/s))",
+                         std::regex::icase);
+
+    std::istringstream iss(output);
+    std::string line;
+    while (std::getline(iss, line)) {
+        std::smatch match;
+        if (result.prefill_tok_per_sec == 0.0 && std::regex_search(line, match, prefill_re)) {
+            result.prefill_tok_per_sec = std::stod(match[1].str());
+        }
+        if (result.decode_tok_per_sec == 0.0 && std::regex_search(line, match, decode_re)) {
+            result.decode_tok_per_sec = std::stod(match[2].str());
+        }
+    }
+
+    return result;
+}
+
 // Run llama-bench
 BenchmarkResult run_llama_bench(const BenchmarkConfig& config) {
     BenchmarkResult result;
@@ -456,28 +493,89 @@ BenchmarkResult run_llama_bench(const BenchmarkConfig& config) {
     return result;
 }
 
+BenchmarkResult run_mlc_bench(const BenchmarkConfig& config) {
+    BenchmarkResult result;
+    result.name = "MLC-LLM";
+
+    if (config.mlc_bench_path.empty()) {
+        std::cout << "\n=== Skipping MLC-LLM benchmark (no --mlc-bench path) ===\n";
+        return result;
+    }
+
+    std::cout << "\n=== Running MLC-LLM Benchmark ===\n";
+    std::cout << "Binary: " << config.mlc_bench_path << "\n";
+
+    std::ostringstream cmd;
+    cmd << config.mlc_bench_path;
+    if (!config.mlc_args.empty()) {
+        std::string args = config.mlc_args;
+        const std::string placeholder = "{model}";
+        size_t pos = args.find(placeholder);
+        if (pos != std::string::npos) {
+            args.replace(pos, placeholder.size(), config.model_path);
+            cmd << " " << args;
+        } else {
+            cmd << " " << args << " --model " << config.model_path;
+        }
+    } else {
+        cmd << " --model " << config.model_path;
+    }
+    cmd << " 2>&1";
+
+    std::cout << "Command: " << cmd.str() << "\n\n";
+
+    FILE* pipe = popen(cmd.str().c_str(), "r");
+    if (!pipe) {
+        std::cerr << "Failed to run MLC-LLM benchmark\n";
+        return result;
+    }
+
+    std::string output;
+    char buffer[4096];
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        output += buffer;
+        std::cout << buffer;
+    }
+
+    int status = pclose(pipe);
+    if (status != 0) {
+        std::cerr << "MLC-LLM benchmark exited with status " << status << "\n";
+    }
+
+    result = parse_mlc_bench_output(output, config);
+
+    std::cout << "\nMLC-LLM Results:\n";
+    std::cout << "  Prefill: " << std::fixed << std::setprecision(2)
+              << result.prefill_tok_per_sec << " tok/s\n";
+    std::cout << "  Decode:  " << std::fixed << std::setprecision(2)
+              << result.decode_tok_per_sec << " tok/s\n";
+
+    return result;
+}
+
 // Print comparison table
-void print_comparison(const BenchmarkResult& granite, const BenchmarkResult& llama) {
+void print_comparison(const BenchmarkResult& granite, const BenchmarkResult& other) {
     std::cout << "\n";
     std::cout << "╔═════════════════════════════════════════════════════════════════════╗\n";
     std::cout << "║                     Performance Comparison                          ║\n";
     std::cout << "╠════════════════════╦═════════════════╦═════════════════╦════════════╣\n";
-    std::cout << "║     Metric         ║     Granite     ║    llama.cpp    ║    Ratio   ║\n";
+    std::cout << "║     Metric         ║     Granite     ║ " << std::setw(13) << std::left << other.name
+              << " ║    Ratio   ║\n";
     std::cout << "╠════════════════════╬═════════════════╬═════════════════╬════════════╣\n";
 
-    auto print_row = [](const char* name, double granite_val, double llama_val, const char* unit) {
-        double ratio = (llama_val > 0) ? granite_val / llama_val : 0;
+    auto print_row = [](const char* name, double granite_val, double other_val, const char* unit) {
+        double ratio = (other_val > 0) ? granite_val / other_val : 0;
         std::cout << "║ " << std::setw(18) << std::left << name << " ║ "
                   << std::setw(12) << std::right << std::fixed << std::setprecision(2) << granite_val
                   << " " << std::setw(2) << unit << " ║ "
-                  << std::setw(12) << std::right << std::fixed << std::setprecision(2) << llama_val
+                  << std::setw(12) << std::right << std::fixed << std::setprecision(2) << other_val
                   << " " << std::setw(2) << unit << " ║ "
                   << std::setw(8) << std::right << std::fixed << std::setprecision(2) << ratio << "x ║\n";
     };
 
-    print_row("Prefill (tok/s)", granite.prefill_tok_per_sec, llama.prefill_tok_per_sec, "");
-    print_row("Decode e2e (tok/s)", granite.decode_tok_per_sec, llama.decode_tok_per_sec, "");
-    print_row("Decode raw (tok/s)", granite.decode_raw_tok_per_sec, llama.decode_tok_per_sec, "");
+    print_row("Prefill (tok/s)", granite.prefill_tok_per_sec, other.prefill_tok_per_sec, "");
+    print_row("Decode e2e (tok/s)", granite.decode_tok_per_sec, other.decode_tok_per_sec, "");
+    print_row("Decode raw (tok/s)", granite.decode_raw_tok_per_sec, other.decode_tok_per_sec, "");
 
     std::cout << "╚════════════════════╩═════════════════╩═════════════════╩════════════╝\n";
     std::cout << "\nNote: 'Decode e2e' includes buffer map/unmap + CPU argmax overhead.\n";
@@ -485,11 +583,11 @@ void print_comparison(const BenchmarkResult& granite, const BenchmarkResult& lla
 
     // Summary using raw decode for fairer comparison
     double prefill_ratio = 0, decode_ratio = 0;
-    if (llama.prefill_tok_per_sec > 0 && granite.prefill_tok_per_sec > 0) {
-        prefill_ratio = granite.prefill_tok_per_sec / llama.prefill_tok_per_sec;
+    if (other.prefill_tok_per_sec > 0 && granite.prefill_tok_per_sec > 0) {
+        prefill_ratio = granite.prefill_tok_per_sec / other.prefill_tok_per_sec;
     }
-    if (llama.decode_tok_per_sec > 0 && granite.decode_raw_tok_per_sec > 0) {
-        decode_ratio = granite.decode_raw_tok_per_sec / llama.decode_tok_per_sec;
+    if (other.decode_tok_per_sec > 0 && granite.decode_raw_tok_per_sec > 0) {
+        decode_ratio = granite.decode_raw_tok_per_sec / other.decode_tok_per_sec;
     }
 
     if (prefill_ratio > 0 || decode_ratio > 0) {
@@ -501,7 +599,7 @@ void print_comparison(const BenchmarkResult& granite, const BenchmarkResult& lla
         if (decode_ratio > 0) {
             std::cout << "  Decode:  Granite is " << std::fixed << std::setprecision(2)
                       << decode_ratio << "x " << (decode_ratio >= 1.0 ? "faster" : "slower")
-                      << " (comparing raw forward to llama.cpp)\n";
+                      << " (comparing raw forward to " << other.name << ")\n";
         }
     }
 }
@@ -510,10 +608,10 @@ int main(int argc, char** argv) {
     auto config = parse_args(argc, argv);
 
     std::cout << "╔══════════════════════════════════════════════════════════════════╗\n";
-    std::cout << "║           Granite vs llama.cpp Performance Benchmark             ║\n";
+    std::cout << "║         Granite Performance Comparison Benchmark                 ║\n";
     std::cout << "╚══════════════════════════════════════════════════════════════════╝\n";
 
-    BenchmarkResult granite_result, llama_result;
+    BenchmarkResult granite_result, llama_result, mlc_result;
 
     // Run Granite benchmark
     if (!config.compare_only) {
@@ -523,9 +621,15 @@ int main(int argc, char** argv) {
     // Run llama.cpp benchmark
     llama_result = run_llama_bench(config);
 
+    // Run MLC-LLM benchmark
+    mlc_result = run_mlc_bench(config);
+
     // Print comparison
     if (!config.compare_only && !config.llama_bench_path.empty()) {
         print_comparison(granite_result, llama_result);
+    }
+    if (!config.compare_only && !config.mlc_bench_path.empty()) {
+        print_comparison(granite_result, mlc_result);
     }
 
     return 0;

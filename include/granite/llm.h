@@ -63,6 +63,23 @@ struct ModelConfig {
     }
 };
 
+#ifdef GRANITE_HAS_METAL
+struct ModelMemoryStats {
+    size_t weights_bytes = 0;
+    size_t raw_weights_bytes = 0;
+    size_t decode_pool_bytes = 0;
+    size_t prefill_pool_bytes = 0;
+    size_t gpu_kv_bytes = 0;
+};
+#else
+struct ModelMemoryStats {
+    size_t weights_bytes = 0;
+    size_t raw_weights_bytes = 0;
+    size_t decode_pool_bytes = 0;
+    size_t prefill_pool_bytes = 0;
+};
+#endif
+
 // =============================================================================
 // GPU KV Cache (Metal-native)
 // =============================================================================
@@ -425,6 +442,9 @@ public:
     /// Get the compute backend used by this model
     [[nodiscard]] IComputeBackend* backend() const { return backend_; }
 
+    /// Report model memory usage breakdown
+    [[nodiscard]] ModelMemoryStats memory_stats() const;
+
 #ifdef GRANITE_HAS_METAL
     /// Allocate GPU KV cache
     Result<void> allocate_gpu_kv_cache(int max_seq_len);
@@ -489,6 +509,8 @@ private:
         Tensor attn_layer_out;  // [1, 1, hidden_dim] - for attention layer output
         Tensor norm_out;        // [1, 1, hidden_dim]
         Tensor logits;          // [1, 1, vocab_size]
+        size_t tensor_bytes = 0;
+        size_t gpu_buffer_bytes = 0;
         // Attention-specific GPU buffers (raw Metal buffers)
         void* q_buf = nullptr;       // [num_heads * head_dim]
         void* k_buf = nullptr;       // [num_kv_heads * head_dim]
@@ -508,6 +530,7 @@ private:
         bool initialized = false;
         int max_tokens = 0;    // Full sequence capacity
         int chunk_tokens = 0;  // Intermediate buffer capacity
+        size_t gpu_buffer_bytes = 0;
         // Input buffers
         void* token_ids_buf = nullptr;   // [max_tokens] INT32 - token IDs
         void* hidden_buf = nullptr;      // [max_tokens * hidden_dim] - embedding output / layer input

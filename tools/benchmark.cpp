@@ -7,6 +7,17 @@
 #include <cstdlib>
 #include <sstream>
 #include <algorithm>
+#include <cstdio>
+#include <optional>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <unistd.h>
+#include <sys/resource.h>
+
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 
 #ifdef GRANITE_HAS_METAL
 #include <granite/metal_compute.h>
@@ -14,6 +25,42 @@
 
 using namespace granite;
 using Clock = std::chrono::high_resolution_clock;
+
+struct DeviceProfile {
+    const char* name;
+    std::vector<int64_t> seq_lens;
+    size_t kv_cache_max_seq = 0;
+    uint32_t prefill_chunk_size = 0;
+};
+
+const std::vector<DeviceProfile>& device_profiles() {
+    static const std::vector<DeviceProfile> profiles = {
+        {"ios-a14", {128, 256}, 2048, 128},
+        {"ios-a16", {128, 256, 512}, 4096, 128},
+        {"ios-a17", {128, 256, 512}, 4096, 128},
+        {"android-mali-g78", {128, 256}, 2048, 128},
+        {"android-adreno-740", {128, 256, 512}, 4096, 128},
+    };
+    return profiles;
+}
+
+const DeviceProfile* find_device_profile(const std::string& name) {
+    for (const auto& profile : device_profiles()) {
+        if (name == profile.name) {
+            return &profile;
+        }
+    }
+    return nullptr;
+}
+
+void print_device_profiles() {
+    std::cout << "  --device-profile <name>: Use a predefined mobile profile\n";
+    std::cout << "    Profiles:";
+    for (const auto& profile : device_profiles()) {
+        std::cout << " " << profile.name;
+    }
+    std::cout << "\n";
+}
 
 std::string format_bytes(size_t bytes) {
     const char* suffixes[] = {"B", "KB", "MB", "GB", "TB"};
@@ -27,6 +74,115 @@ std::string format_bytes(size_t bytes) {
     std::ostringstream out;
     out << std::fixed << std::setprecision(2) << value << " " << suffixes[suffix_index];
     return out.str();
+}
+
+void print_model_memory_stats(const TransformerModel& model, const char* label) {
+    auto stats = model.memory_stats();
+    std::cout << label << "\n";
+    std::cout << "  weights: " << format_bytes(stats.weights_bytes) << "\n";
+    if (stats.raw_weights_bytes > 0) {
+        std::cout << "  raw weights: " << format_bytes(stats.raw_weights_bytes) << "\n";
+    }
+    if (stats.decode_pool_bytes > 0) {
+        std::cout << "  decode pool: " << format_bytes(stats.decode_pool_bytes) << "\n";
+    }
+    if (stats.prefill_pool_bytes > 0) {
+        std::cout << "  prefill pool: " << format_bytes(stats.prefill_pool_bytes) << "\n";
+    }
+#ifdef GRANITE_HAS_METAL
+    if (stats.gpu_kv_bytes > 0) {
+        std::cout << "  gpu kv: " << format_bytes(stats.gpu_kv_bytes) << "\n";
+    }
+#endif
+}
+
+void print_kernel_timings(MetalCompute* gpu) {
+    if (!gpu) {
+        return;
+    }
+    auto timings = gpu->get_kernel_timing_stats();
+    if (timings.empty()) {
+        std::cout << "\nKernel timing: no data\n";
+        return;
+    }
+    std::sort(timings.begin(), timings.end(),
+              [](const MetalCompute::KernelTiming& a, const MetalCompute::KernelTiming& b) {
+                  return a.gpu_time_ms > b.gpu_time_ms;
+              });
+    double total_ms = 0.0;
+    for (const auto& entry : timings) {
+        total_ms += entry.gpu_time_ms;
+    }
+    std::cout << "\nKernel timing (top 15 by GPU time):\n";
+    size_t limit = std::min<size_t>(15, timings.size());
+    for (size_t i = 0; i < limit; i++) {
+        const auto& entry = timings[i];
+        std::cout << "  " << entry.name << ": " << std::fixed << std::setprecision(2)
+                  << entry.gpu_time_ms << " ms (" << entry.dispatches << " dispatches)\n";
+    }
+    std::cout << "  total gpu time: " << std::fixed << std::setprecision(2) << total_ms << " ms\n";
+}
+
+bool get_rss_bytes(size_t& out_bytes) {
+#if defined(__APPLE__)
+    mach_task_basic_info info{};
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS) {
+        out_bytes = static_cast<size_t>(info.resident_size);
+        return true;
+    }
+    return false;
+#elif defined(__linux__)
+    FILE* fp = std::fopen("/proc/self/statm", "r");
+    if (!fp) {
+        return false;
+    }
+    long pages = 0;
+    if (std::fscanf(fp, "%*s %ld", &pages) != 1) {
+        std::fclose(fp);
+        return false;
+    }
+    std::fclose(fp);
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        return false;
+    }
+    out_bytes = static_cast<size_t>(pages) * static_cast<size_t>(page_size);
+    return true;
+#else
+    (void)out_bytes;
+    return false;
+#endif
+}
+
+bool get_max_rss_bytes(size_t& out_bytes) {
+    struct rusage usage {};
+    if (getrusage(RUSAGE_SELF, &usage) != 0) {
+        return false;
+    }
+#if defined(__APPLE__)
+    out_bytes = static_cast<size_t>(usage.ru_maxrss);
+#else
+    out_bytes = static_cast<size_t>(usage.ru_maxrss) * 1024ull;
+#endif
+    return true;
+}
+
+void print_rss(const char* label) {
+    size_t rss = 0;
+    size_t max_rss = 0;
+    bool has_rss = get_rss_bytes(rss);
+    bool has_max = get_max_rss_bytes(max_rss);
+    std::cout << label;
+    if (has_rss) {
+        std::cout << " RSS: " << format_bytes(rss);
+    } else {
+        std::cout << " RSS: n/a";
+    }
+    if (has_max) {
+        std::cout << ", max RSS: " << format_bytes(max_rss);
+    }
+    std::cout << "\n";
 }
 
 // Benchmark helper
@@ -186,7 +342,8 @@ void benchmark_inference(
     bool prefill_chunk_set = false,
     size_t kv_cache_max_seq = 0,
     bool kv_cache_max_seq_set = false,
-    bool enable_profiling = false) {
+    bool enable_profiling = false,
+    bool kernel_timing = false) {
     print_header("LLM Inference Benchmark");
 
     Config runtime_config = Config::Balanced();
@@ -220,6 +377,11 @@ void benchmark_inference(
         runtime_config.enable_profiling = true;
         std::cout << "Profiling: enabled\n";
     }
+    if (kernel_timing) {
+        std::cout << "Kernel timing: enabled\n";
+    }
+
+    print_rss("Before load:");
 
     // Load model
     std::cout << "Loading model: " << model_path << "\n";
@@ -229,6 +391,8 @@ void benchmark_inference(
         return;
     }
     auto model = std::move(model_result).take();
+    print_rss("After load:");
+    print_model_memory_stats(model, "Model memory (after load):");
 
     auto& config = model.config();
     std::cout << "Model: " << config.num_layers << " layers, "
@@ -252,6 +416,7 @@ void benchmark_inference(
     }
     auto kv_cache = std::move(kv_result).take();
     std::cout << "KV cache (CPU): " << format_bytes(kv_cache.memory_bytes()) << "\n";
+    print_rss("After CPU KV:");
 
     // Enable GPU mode and allocate GPU KV cache
 #ifdef GRANITE_HAS_METAL
@@ -268,6 +433,7 @@ void benchmark_inference(
                        static_cast<size_t>(cfg.head_dim);
         size_t gpu_kv_bytes = elems * sizeof(uint16_t) * 2;
         std::cout << "KV cache (GPU): " << format_bytes(gpu_kv_bytes) << "\n";
+        print_rss("After GPU KV:");
     } else {
         std::cout << "GPU KV cache allocation failed, using CPU cache\n";
     }
@@ -277,6 +443,15 @@ void benchmark_inference(
     if (enable_profiling && backend->get_type() == BackendType::Metal) {
         if (auto* gpu = get_metal_compute()) {
             gpu->reset_profiling_stats();
+        }
+    }
+#endif
+
+#ifdef GRANITE_HAS_METAL
+    if (kernel_timing && backend->get_type() == BackendType::Metal) {
+        if (auto* gpu = get_metal_compute()) {
+            gpu->enable_kernel_timing(true);
+            gpu->reset_kernel_timing();
         }
     }
 #endif
@@ -323,6 +498,13 @@ void benchmark_inference(
             return result.ok();
         };
 
+#ifdef GRANITE_HAS_METAL
+        if (enable_profiling && backend->get_type() == BackendType::Metal) {
+            if (auto* gpu = get_metal_compute()) {
+                gpu->reset_profiling_stats();
+            }
+        }
+#endif
         std::vector<double> samples;
         double time_ms = benchmark_ms(prefill, 1, 3, enable_profiling ? &samples : nullptr);
         double tokens_per_sec = (seq_len / time_ms) * 1000.0;
@@ -331,6 +513,24 @@ void benchmark_inference(
                   << std::setw(15) << std::fixed << std::setprecision(2) << time_ms
                   << std::setw(15) << std::fixed << std::setprecision(1) << tokens_per_sec
                   << "\n";
+#ifdef GRANITE_HAS_METAL
+        if (enable_profiling && backend->get_type() == BackendType::Metal) {
+            if (auto* gpu = get_metal_compute()) {
+                uint64_t dispatches = 0;
+                uint64_t syncs = 0;
+                double sync_time_ms = 0.0;
+                uint64_t cmd_buffers = 0;
+                double gpu_time_ms = 0.0;
+                uint64_t gpu_timed_buffers = 0;
+                gpu->get_profiling_stats(dispatches, syncs, sync_time_ms, cmd_buffers,
+                                         gpu_time_ms, gpu_timed_buffers);
+                if (gpu_timed_buffers > 0) {
+                    std::cout << "  gpu time: " << std::fixed << std::setprecision(2)
+                              << gpu_time_ms << " ms (" << gpu_timed_buffers << " buffers)\n";
+                }
+            }
+        }
+#endif
         if (enable_profiling && !samples.empty()) {
             double sum = std::accumulate(samples.begin(), samples.end(), 0.0);
             double avg = sum / static_cast<double>(samples.size());
@@ -340,6 +540,8 @@ void benchmark_inference(
                       << " min=" << min << " max=" << max << "\n";
         }
     }
+
+    print_model_memory_stats(model, "Model memory (after prefill):");
 
     // Benchmark single-token generation (decode)
     std::cout << "\nDecode (token generation):\n";
@@ -394,6 +596,13 @@ void benchmark_inference(
         };
 
         int actual_len = get_cache_len();
+#ifdef GRANITE_HAS_METAL
+        if (enable_profiling && backend->get_type() == BackendType::Metal) {
+            if (auto* gpu = get_metal_compute()) {
+                gpu->reset_profiling_stats();
+            }
+        }
+#endif
         std::vector<double> samples;
         double time_ms = benchmark_ms(decode, 1, 3, enable_profiling ? &samples : nullptr);
         double tokens_per_sec = 1000.0 / time_ms;
@@ -401,6 +610,24 @@ void benchmark_inference(
         std::cout << std::setw(15) << actual_len
                   << std::setw(15) << std::fixed << std::setprecision(2) << time_ms
                   << std::setw(15) << std::fixed << std::setprecision(1) << tokens_per_sec << "\n";
+#ifdef GRANITE_HAS_METAL
+        if (enable_profiling && backend->get_type() == BackendType::Metal) {
+            if (auto* gpu = get_metal_compute()) {
+                uint64_t dispatches = 0;
+                uint64_t syncs = 0;
+                double sync_time_ms = 0.0;
+                uint64_t cmd_buffers = 0;
+                double gpu_time_ms = 0.0;
+                uint64_t gpu_timed_buffers = 0;
+                gpu->get_profiling_stats(dispatches, syncs, sync_time_ms, cmd_buffers,
+                                         gpu_time_ms, gpu_timed_buffers);
+                if (gpu_timed_buffers > 0) {
+                    std::cout << "  gpu time: " << std::fixed << std::setprecision(2)
+                              << gpu_time_ms << " ms (" << gpu_timed_buffers << " buffers)\n";
+                }
+            }
+        }
+#endif
         if (enable_profiling && !samples.empty()) {
             double sum = std::accumulate(samples.begin(), samples.end(), 0.0);
             double avg = sum / static_cast<double>(samples.size());
@@ -410,6 +637,8 @@ void benchmark_inference(
                       << " min=" << min << " max=" << max << "\n";
         }
     }
+
+    print_model_memory_stats(model, "Model memory (after decode):");
 
 #ifdef GRANITE_HAS_METAL
     if (enable_profiling && backend->get_type() == BackendType::Metal) {
@@ -434,6 +663,12 @@ void benchmark_inference(
                 std::cout << "  gpu time: unavailable (no timing data)\n";
             }
         }
+    }
+#endif
+
+#ifdef GRANITE_HAS_METAL
+    if (kernel_timing && backend->get_type() == BackendType::Metal) {
+        print_kernel_timings(get_metal_compute());
     }
 #endif
 }
@@ -580,11 +815,15 @@ int main(int argc, char* argv[]) {
         std::string model_path;
         bool full_logits = false;
         std::vector<int64_t> seq_lens = {32, 128, 256, 512};
+        bool seq_lens_set = false;
         uint32_t prefill_chunk_size = 0;
         bool prefill_chunk_set = false;
         size_t kv_cache_max_seq = 0;
         bool kv_cache_max_seq_set = false;
         bool enable_profiling = false;
+        bool kernel_timing = false;
+        std::string device_profile_name;
+        bool device_profile_set = false;
         BackendType run_backend = preferred_backend;
         bool run_backend_set = preferred_backend_set;
 
@@ -596,6 +835,7 @@ int main(int argc, char* argv[]) {
                 auto parsed = parse_seq_lens(argv[++i]);
                 if (!parsed.empty()) {
                     seq_lens = std::move(parsed);
+                    seq_lens_set = true;
                 } else {
                     std::cerr << "Invalid --seq-lens value, using defaults.\n";
                 }
@@ -619,6 +859,12 @@ int main(int argc, char* argv[]) {
                 }
             } else if (arg == "--profile") {
                 enable_profiling = true;
+            } else if (arg == "--kernel-timing") {
+                enable_profiling = true;
+                kernel_timing = true;
+            } else if (arg == "--device-profile" && i + 1 < argc) {
+                device_profile_name = argv[++i];
+                device_profile_set = true;
             } else if (arg == "--backend" && i + 1 < argc) {
                 BackendType parsed = BackendType::CPU;
                 if (parse_backend_arg(argv[++i], parsed)) {
@@ -636,11 +882,31 @@ int main(int argc, char* argv[]) {
             std::cerr << "Requested backend differs from active backend; using active backend.\n";
         }
 
+        if (device_profile_set) {
+            const auto* profile = find_device_profile(device_profile_name);
+            if (!profile) {
+                std::cerr << "Unknown device profile '" << device_profile_name << "'.\n";
+            } else {
+                if (!seq_lens_set) {
+                    seq_lens = profile->seq_lens;
+                }
+                if (!kv_cache_max_seq_set && profile->kv_cache_max_seq > 0) {
+                    kv_cache_max_seq = profile->kv_cache_max_seq;
+                    kv_cache_max_seq_set = true;
+                }
+                if (!prefill_chunk_set && profile->prefill_chunk_size > 0) {
+                    prefill_chunk_size = profile->prefill_chunk_size;
+                    prefill_chunk_set = true;
+                }
+                std::cout << "Device profile: " << profile->name << "\n";
+            }
+        }
+
         if (!model_path.empty()) {
             benchmark_inference(model_path, backend.get(), seq_lens, full_logits,
                                 prefill_chunk_size, prefill_chunk_set,
                                 kv_cache_max_seq, kv_cache_max_seq_set,
-                                enable_profiling);
+                                enable_profiling, kernel_timing);
         } else {
             std::cout << "\nUsage: " << argv[0] << " [model.gguf] [--full-logits]\n";
             std::cout << "Provide a GGUF model path to run inference benchmarks.\n";
@@ -649,6 +915,8 @@ int main(int argc, char* argv[]) {
             std::cout << "  --prefill-chunk-size <n>: Override prefill chunk size (0 disables)\n";
             std::cout << "  --kv-cache-max-seq <n>: Override KV cache max sequence length\n";
             std::cout << "  --profile: Print per-section timing stats\n";
+            std::cout << "  --kernel-timing: Collect per-kernel GPU timing stats (Metal only)\n";
+            print_device_profiles();
             std::cout << "  --backend <cpu|metal|vulkan>: Force backend for benchmarking\n";
             std::cout << "  GRANITE_BACKEND=cpu|metal|vulkan (env override)\n";
         }
@@ -660,6 +928,8 @@ int main(int argc, char* argv[]) {
         std::cout << "  --prefill-chunk-size <n>: Override prefill chunk size (0 disables)\n";
         std::cout << "  --kv-cache-max-seq <n>: Override KV cache max sequence length\n";
         std::cout << "  --profile: Print per-section timing stats\n";
+        std::cout << "  --kernel-timing: Collect per-kernel GPU timing stats (Metal only)\n";
+        print_device_profiles();
         std::cout << "  --backend <cpu|metal|vulkan>: Force backend for benchmarking\n";
         std::cout << "  GRANITE_BACKEND=cpu|metal|vulkan (env override)\n";
     }
