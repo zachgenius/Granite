@@ -29,6 +29,7 @@
 #include "granite/scheduler.h"
 #include "granite/optimization.h"
 #include "granite/gguf.h"
+#include "granite/onnx.h"
 #include "granite/llm.h"
 #include "granite/log.h"
 

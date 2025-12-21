@@ -16,6 +16,7 @@ option(GRANITE_BUILD_VULKAN "Build Vulkan backend (Linux/Android/Windows)" OFF)
 option(GRANITE_BUILD_CPU "Build CPU backend" ON)
 option(GRANITE_BUILD_TESTS "Build tests" ON)
 option(GRANITE_BUILD_EXAMPLES "Build examples" ON)
+option(GRANITE_ENABLE_ONNX "Enable ONNX model loader (requires Protobuf)" OFF)
 
 # =============================================================================
 # Dependencies
@@ -43,6 +44,14 @@ target_include_directories(metal-cpp INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/metal-cpp
 )
 
+# ONNX (optional, requires protoc + protobuf)
+if(GRANITE_ENABLE_ONNX)
+    find_package(Protobuf REQUIRED)
+    protobuf_generate_cpp(ONNX_PROTO_SRCS ONNX_PROTO_HDRS
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnx/onnx.proto
+    )
+endif()
+
 # =============================================================================
 # Granite Core Library
 # =============================================================================
@@ -65,6 +74,10 @@ set(GRANITE_GRAPH_SOURCES
 set(GRANITE_MODEL_SOURCES
     src/model/gguf.cpp
 )
+
+if(GRANITE_ENABLE_ONNX)
+    list(APPEND GRANITE_MODEL_SOURCES src/model/onnx.cpp)
+endif()
 
 set(GRANITE_LLM_SOURCES
     src/llm/math_ops.cpp
@@ -99,6 +112,8 @@ add_library(granite STATIC
     ${GRANITE_GRAPH_SOURCES}
     ${GRANITE_MODEL_SOURCES}
     ${GRANITE_LLM_SOURCES}
+    ${ONNX_PROTO_SRCS}
+    ${ONNX_PROTO_HDRS}
 )
 
 target_include_directories(granite
@@ -106,6 +121,7 @@ target_include_directories(granite
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_BINARY_DIR}
 )
 
 target_link_libraries(granite
@@ -116,11 +132,20 @@ target_link_libraries(granite
         fmt::fmt
 )
 
+if(GRANITE_ENABLE_ONNX)
+    target_include_directories(granite PRIVATE ${Protobuf_INCLUDE_DIRS})
+    target_link_libraries(granite PRIVATE ${Protobuf_LIBRARIES})
+endif()
+
 target_compile_definitions(granite PUBLIC
     GRANITE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
     GRANITE_VERSION_MINOR=${PROJECT_VERSION_MINOR}
     GRANITE_VERSION_PATCH=${PROJECT_VERSION_PATCH}
 )
+
+if(GRANITE_ENABLE_ONNX)
+    target_compile_definitions(granite PUBLIC GRANITE_HAS_ONNX=1)
+endif()
 
 # =============================================================================
 # Metal Backend (Apple only)
@@ -315,6 +340,11 @@ target_link_libraries(granite_tree_bench PRIVATE granite)
 add_executable(granite_bench_vs_llamacpp tools/benchmark_vs_llamacpp.cpp)
 target_link_libraries(granite_bench_vs_llamacpp PRIVATE granite)
 
+if(GRANITE_ENABLE_ONNX)
+    add_executable(granite_onnx_smoke tools/onnx_smoke.cpp)
+    target_link_libraries(granite_onnx_smoke PRIVATE granite)
+endif()
+
 add_executable(profile_q4k tools/profile_q4k.mm)
 set_source_files_properties(tools/profile_q4k.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 target_link_libraries(profile_q4k PRIVATE granite metal-cpp "-framework Metal" "-framework Foundation")
@@ -372,4 +402,3 @@ add_executable(profile_prefill_kernels tools/profile_prefill_kernels.mm)
 set_source_files_properties(tools/profile_prefill_kernels.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 target_link_libraries(profile_prefill_kernels PRIVATE granite metal-cpp "-framework Metal" "-framework Foundation")
 target_include_directories(profile_prefill_kernels PRIVATE ${CMAKE_SOURCE_DIR}/src)
-

@@ -15,9 +15,11 @@ enum class DataType : uint8_t {
     FP16,
     BF16,
     INT32,
+    INT64,
     INT16,
     INT8,
     UINT8,
+    BOOL,
     INT4,    // Packed 4-bit integers (2 per byte)
     UINT4,
 };
@@ -29,9 +31,11 @@ constexpr size_t dtype_size(DataType dtype) {
         case DataType::FP16:  return 2;
         case DataType::BF16:  return 2;
         case DataType::INT32: return 4;
+        case DataType::INT64: return 8;
         case DataType::INT16: return 2;
         case DataType::INT8:  return 1;
         case DataType::UINT8: return 1;
+        case DataType::BOOL:  return 1;
         case DataType::INT4:  return 1;  // 2 elements per byte
         case DataType::UINT4: return 1;  // 2 elements per byte
     }
@@ -59,9 +63,11 @@ constexpr const char* dtype_name(DataType dtype) {
         case DataType::FP16:  return "fp16";
         case DataType::BF16:  return "bf16";
         case DataType::INT32: return "int32";
+        case DataType::INT64: return "int64";
         case DataType::INT16: return "int16";
         case DataType::INT8:  return "int8";
         case DataType::UINT8: return "uint8";
+        case DataType::BOOL:  return "bool";
         case DataType::INT4:  return "int4";
         case DataType::UINT4: return "uint4";
     }
