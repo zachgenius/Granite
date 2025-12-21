@@ -28,6 +28,7 @@
 #include <chrono>
 #include <ctime>
 #include <cstdlib>
+#include <algorithm>
 
 namespace granite {
 
@@ -61,6 +62,8 @@ public:
     mutable std::mutex kernel_mutex_;
     std::unordered_map<std::string, KernelTimingStats> kernel_timings_;
     bool debug_markers_enabled_ = false;
+    uint32_t max_threads_per_threadgroup_ = 256;
+    uint32_t threadgroup_size_override_1d_ = 0;
 
     Impl() = default;
     ~Impl() { shutdown(); }
@@ -76,6 +79,29 @@ public:
         command_queue_ = device_->newCommandQueue();
         if (!command_queue_) {
             return Error(ErrorCode::InternalError, "Failed to create command queue");
+        }
+
+        auto max_threads = device_->maxThreadsPerThreadgroup();
+        max_threads_per_threadgroup_ = static_cast<uint32_t>(max_threads.width);
+        if (max_threads_per_threadgroup_ == 0) {
+            max_threads_per_threadgroup_ = 256;
+        }
+        max_threads_per_threadgroup_ = std::min(max_threads_per_threadgroup_, 256u);
+
+        if (const char* env = std::getenv("GRANITE_METAL_TG_SIZE_1D")) {
+            char* end = nullptr;
+            unsigned long value = std::strtoul(env, &end, 10);
+            if (end != env && *end == '\0' && value > 0) {
+                if (value > max_threads_per_threadgroup_) {
+                    GRANITE_LOG_WARN("GRANITE_METAL_TG_SIZE_1D={} exceeds max {}, clamping",
+                                     value, max_threads_per_threadgroup_);
+                    threadgroup_size_override_1d_ = max_threads_per_threadgroup_;
+                } else {
+                    threadgroup_size_override_1d_ = static_cast<uint32_t>(value);
+                }
+            } else {
+                GRANITE_LOG_WARN("Invalid GRANITE_METAL_TG_SIZE_1D value '{}'", env);
+            }
         }
 
         auto compile_result = compile_shaders();
@@ -104,6 +130,21 @@ public:
         }
 
         initialized_ = false;
+    }
+
+    uint32_t tuned_threadgroup_size_1d(uint32_t requested) const {
+        uint32_t size = threadgroup_size_override_1d_ ? threadgroup_size_override_1d_ : requested;
+        size = std::min(size, max_threads_per_threadgroup_);
+        if (max_threads_per_threadgroup_ >= 32) {
+            size = (size / 32) * 32;
+            if (size == 0) {
+                size = 32;
+            }
+        }
+        if (size == 0) {
+            size = max_threads_per_threadgroup_;
+        }
+        return size;
     }
 
     void sync() {
@@ -1486,7 +1527,8 @@ Result<void> MetalCompute::rms_norm(
     encoder->setBytes(&eps, sizeof(eps), 4);
 
     MTL::Size grid_size = MTL::Size::Make(size, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    uint32_t tg_size = impl_->tuned_threadgroup_size_1d(256);
+    MTL::Size threadgroup_size = MTL::Size::Make(tg_size, 1, 1);
     impl_->mark_kernel("rms_norm");
     encoder->dispatchThreads(grid_size, threadgroup_size);
     impl_->post_dispatch("rms_norm");
@@ -1512,7 +1554,8 @@ Result<void> MetalCompute::rms_norm_f16(
     encoder->setBytes(&eps, sizeof(eps), 4);
 
     MTL::Size grid_size = MTL::Size::Make(size, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    uint32_t tg_size = impl_->tuned_threadgroup_size_1d(256);
+    MTL::Size threadgroup_size = MTL::Size::Make(tg_size, 1, 1);
     impl_->mark_kernel("rms_norm_f16");
     encoder->dispatchThreads(grid_size, threadgroup_size);
     impl_->post_dispatch("rms_norm_f16");
@@ -1647,7 +1690,8 @@ Result<void> MetalCompute::silu(MTL::Buffer* x, uint32_t size) {
     encoder->setBytes(&size, sizeof(size), 1);
 
     MTL::Size grid_size = MTL::Size::Make(size, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    uint32_t tg_size = impl_->tuned_threadgroup_size_1d(256);
+    MTL::Size threadgroup_size = MTL::Size::Make(tg_size, 1, 1);
     impl_->mark_kernel("silu");
     encoder->dispatchThreads(grid_size, threadgroup_size);
     impl_->post_dispatch("silu");
@@ -1671,7 +1715,8 @@ Result<void> MetalCompute::elementwise_mul(
     encoder->setBytes(&size, sizeof(size), 3);
 
     MTL::Size grid_size = MTL::Size::Make(size, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    uint32_t tg_size = impl_->tuned_threadgroup_size_1d(256);
+    MTL::Size threadgroup_size = MTL::Size::Make(tg_size, 1, 1);
     impl_->mark_kernel("elementwise_mul");
     encoder->dispatchThreads(grid_size, threadgroup_size);
     impl_->post_dispatch("elementwise_mul");
@@ -1697,7 +1742,8 @@ Result<void> MetalCompute::rope(
     encoder->setBytes(&freq_base, sizeof(freq_base), 4);
 
     MTL::Size grid_size = MTL::Size::Make(head_dim / 2, seq_len, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(32, 1, 1);
+    uint32_t tg_size = impl_->tuned_threadgroup_size_1d(32);
+    MTL::Size threadgroup_size = MTL::Size::Make(tg_size, 1, 1);
     impl_->mark_kernel("rope");
     encoder->dispatchThreads(grid_size, threadgroup_size);
     impl_->post_dispatch("rope");
@@ -1721,7 +1767,8 @@ Result<void> MetalCompute::elementwise_add(
     encoder->setBytes(&size, sizeof(size), 3);
 
     MTL::Size grid_size = MTL::Size::Make(size, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    uint32_t tg_size = impl_->tuned_threadgroup_size_1d(256);
+    MTL::Size threadgroup_size = MTL::Size::Make(tg_size, 1, 1);
     impl_->mark_kernel("elementwise_add");
     encoder->dispatchThreads(grid_size, threadgroup_size);
     impl_->post_dispatch("elementwise_add");
@@ -1744,7 +1791,8 @@ Result<void> MetalCompute::convert_f32_to_f16(
     encoder->setBytes(&size, sizeof(size), 2);
 
     MTL::Size grid_size = MTL::Size::Make(size, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    uint32_t tg_size = impl_->tuned_threadgroup_size_1d(256);
+    MTL::Size threadgroup_size = MTL::Size::Make(tg_size, 1, 1);
     impl_->mark_kernel("convert_f32_to_f16");
     encoder->dispatchThreads(grid_size, threadgroup_size);
     impl_->post_dispatch("convert_f32_to_f16");
@@ -1776,7 +1824,8 @@ Result<void> MetalCompute::rope_multihead(
 
     // Grid: [head_dim/2, seq_len, num_heads_q + num_heads_k]
     MTL::Size grid_size = MTL::Size::Make(head_dim / 2, seq_len, num_heads_q + num_heads_k);
-    MTL::Size threadgroup_size = MTL::Size::Make(32, 1, 1);
+    uint32_t tg_size = impl_->tuned_threadgroup_size_1d(32);
+    MTL::Size threadgroup_size = MTL::Size::Make(tg_size, 1, 1);
     impl_->mark_kernel("rope_multihead");
     encoder->dispatchThreads(grid_size, threadgroup_size);
     impl_->post_dispatch("rope_multihead");
@@ -1798,7 +1847,8 @@ Result<void> MetalCompute::softmax(MTL::Buffer* x, uint32_t M, uint32_t N)
     encoder->setBytes(&N, sizeof(N), 2);
 
     MTL::Size grid_size = MTL::Size::Make(N, M, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    uint32_t tg_size = impl_->tuned_threadgroup_size_1d(256);
+    MTL::Size threadgroup_size = MTL::Size::Make(tg_size, 1, 1);
     impl_->mark_kernel("softmax_row");
     encoder->dispatchThreads(grid_size, threadgroup_size);
     impl_->post_dispatch("softmax_row");
@@ -1828,7 +1878,8 @@ Result<void> MetalCompute::silu_mul(
     encoder->setBytes(&size, sizeof(size), 3);
 
     MTL::Size grid_size = MTL::Size::Make(size, 1, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    uint32_t tg_size = impl_->tuned_threadgroup_size_1d(256);
+    MTL::Size threadgroup_size = MTL::Size::Make(tg_size, 1, 1);
     impl_->mark_kernel("silu_mul");
     encoder->dispatchThreads(grid_size, threadgroup_size);
     impl_->post_dispatch("silu_mul");
@@ -2332,7 +2383,8 @@ Result<void> MetalCompute::embedding_lookup(
     encoder->setBytes(&vocab_size, sizeof(vocab_size), 4);
 
     MTL::Size grid_size = MTL::Size::Make(hidden_dim, num_tokens, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    uint32_t tg_size = impl_->tuned_threadgroup_size_1d(256);
+    MTL::Size threadgroup_size = MTL::Size::Make(tg_size, 1, 1);
     impl_->mark_kernel("embedding_lookup");
     encoder->dispatchThreads(grid_size, threadgroup_size);
     impl_->post_dispatch("embedding_lookup");

@@ -14,6 +14,7 @@
 #include <unordered_map>
 #include <atomic>
 #include <string>
+#include <cstring>
 
 namespace granite {
 
@@ -262,6 +263,31 @@ public:
                                const void* data,
                                size_t size,
                                size_t offset) override {
+        auto it = buffers_.find(handle);
+        if (it == buffers_.end()) {
+            return Error(ErrorCode::InvalidArgument, "Invalid buffer handle");
+        }
+
+        MTL::Buffer* buffer = it->second;
+        if (buffer->storageMode() == MTL::StorageModePrivate) {
+            MTL::Buffer* staging = device_->newBuffer(size, MTL::ResourceStorageModeShared);
+            if (!staging) {
+                return Error(ErrorCode::AllocationFailed,
+                             fmt::format("Failed to allocate staging buffer of size {}", size));
+            }
+            std::memcpy(staging->contents(), data, size);
+
+            MTL::CommandBuffer* cmd = command_queue_->commandBuffer();
+            MTL::BlitCommandEncoder* blit = cmd->blitCommandEncoder();
+            blit->copyFromBuffer(staging, 0, buffer, offset, size);
+            blit->endEncoding();
+            cmd->commit();
+            cmd->waitUntilCompleted();
+
+            staging->release();
+            return {};
+        }
+
         auto map_result = map_buffer(handle);
         if (!map_result.ok()) {
             return map_result.error();

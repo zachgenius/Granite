@@ -32,6 +32,7 @@
 #include "granite/onnx.h"
 #include "granite/llm.h"
 #include "granite/log.h"
+#include "granite/crash.h"
 
 namespace granite {
 

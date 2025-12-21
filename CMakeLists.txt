@@ -63,6 +63,7 @@ set(GRANITE_CORE_SOURCES
     src/core/error.cpp
     src/core/backend_factory.cpp
     src/core/config.cpp
+    src/core/crash.cpp
 )
 
 set(GRANITE_GRAPH_SOURCES

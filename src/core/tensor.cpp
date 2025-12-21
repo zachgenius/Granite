@@ -2,6 +2,7 @@
 #include "granite/log.h"
 
 #include <algorithm>
+#include <limits>
 
 namespace granite {
 
@@ -41,14 +42,45 @@ Result<Tensor> Tensor::allocate(std::span<const int64_t> shape,
         return Error(ErrorCode::BackendNotInitialized, "Backend is not initialized");
     }
 
-    // Calculate buffer size
-    size_t numel = shape_numel(shape);
-    size_t size_bytes;
+    if (shape.empty()) {
+        return Error(ErrorCode::InvalidShape, "Tensor shape is empty");
+    }
+
+    // Calculate buffer size with validation
+    size_t numel = 1;
+    for (size_t i = 0; i < shape.size(); ++i) {
+        int64_t dim = shape[i];
+        if (dim <= 0) {
+            return Error(ErrorCode::InvalidShape,
+                         fmt::format("Invalid tensor dimension {} at index {}", dim, i));
+        }
+        size_t dim_size = static_cast<size_t>(dim);
+        if (numel > std::numeric_limits<size_t>::max() / dim_size) {
+            return Error(ErrorCode::InvalidShape, "Tensor shape overflows size limits");
+        }
+        numel *= dim_size;
+    }
+
+    size_t size_bytes = 0;
 
     if (dtype == DataType::INT4 || dtype == DataType::UINT4) {
+        if (numel == std::numeric_limits<size_t>::max()) {
+            return Error(ErrorCode::InvalidShape, "Tensor size overflows size limits");
+        }
         size_bytes = (numel + 1) / 2;  // 2 elements per byte
     } else {
-        size_bytes = numel * dtype_size(dtype);
+        size_t elem_size = dtype_size(dtype);
+        if (elem_size == 0 || numel > std::numeric_limits<size_t>::max() / elem_size) {
+            return Error(ErrorCode::InvalidShape, "Tensor size overflows size limits");
+        }
+        size_bytes = numel * elem_size;
+    }
+
+    auto caps = backend->get_capabilities();
+    if (caps.max_buffer_size > 0 && size_bytes > caps.max_buffer_size) {
+        return Error(ErrorCode::OutOfMemory,
+                     fmt::format("Tensor size {} exceeds backend max buffer size {}",
+                                 size_bytes, caps.max_buffer_size));
     }
 
     // Allocate buffer
@@ -74,6 +106,22 @@ Tensor Tensor::from_buffer(BufferHandle buffer,
                            DataType dtype,
                            IComputeBackend* backend,
                            std::span<const int64_t> strides) {
+    if (!backend) {
+        GRANITE_LOG_WARN("Tensor::from_buffer called with null backend");
+    }
+    if (!buffer.valid()) {
+        GRANITE_LOG_WARN("Tensor::from_buffer called with invalid buffer handle");
+    }
+    for (size_t i = 0; i < shape.size(); ++i) {
+        if (shape[i] <= 0) {
+            GRANITE_LOG_WARN("Tensor::from_buffer invalid dimension {} at index {}", shape[i], i);
+            break;
+        }
+    }
+    if (!strides.empty() && strides.size() != shape.size()) {
+        GRANITE_LOG_WARN("Tensor::from_buffer stride rank {} does not match shape rank {}",
+                         strides.size(), shape.size());
+    }
     Tensor tensor;
     tensor.buffer_ = buffer;
     tensor.offset_ = 0;
