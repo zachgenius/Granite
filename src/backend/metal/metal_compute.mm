@@ -2091,18 +2091,18 @@ Result<void> MetalCompute::multihead_attention(
         encoder->setBytes(&max_seq, sizeof(max_seq), 11);  // KV cache stride
 
         // Threadgroup memory layout (no V buffer, half scores):
-        // sq[Q_TILE * DK] = 8 * 64 = 512 halfs = 1024 bytes
-        // so[Q_TILE * DK] = 8 * 64 = 512 halfs = 1024 bytes
-        // ss[Q_TILE * K_TILE] = 8 * 64 = 512 halfs = 1024 bytes
-        // Total: 3072 bytes
-        constexpr uint32_t Q_TILE = 8;
+        // sq[Q_TILE * DK] = 16 * 64 = 1024 halfs = 2048 bytes
+        // so[Q_TILE * DK] = 16 * 64 = 1024 halfs = 2048 bytes
+        // ss[Q_TILE * K_TILE] = 16 * 64 = 1024 halfs = 2048 bytes
+        // Total: 6144 bytes
+        constexpr uint32_t Q_TILE = 16;
         constexpr uint32_t K_TILE = 64;  // Matches llama.cpp's NCPSG for optimal performance
         constexpr uint32_t DK = 64;
         constexpr uint32_t threadgroup_mem_size = (Q_TILE * DK * 2 + Q_TILE * DK * 2 + Q_TILE * K_TILE * 2);
         encoder->setThreadgroupMemoryLength(threadgroup_mem_size, 0);
 
         // One threadgroup per (head, query_block) pair
-        // Each threadgroup handles Q_TILE=8 query positions
+        // Each threadgroup handles Q_TILE=16 query positions
         uint32_t num_q_blocks = (seq_q + Q_TILE - 1) / Q_TILE;
         MTL::Size grid_size = MTL::Size::Make(num_heads, num_q_blocks, 1);
         MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
