@@ -467,7 +467,7 @@ private:
             // Core quantized kernels
             "matvec_q4k", "matmul_q4k", "matmul_q4k_vec", "matmul_q4k_tiled", "matmul_q4k_simd",
             // NOTE: matmul_q4k_simdgroup uses function constants and is compiled separately below
-            "matvec_f16", "matmul_f16",
+            "matvec_f16", "matmul_f16", "matmul_f16_tiled",
             "matvec_q8_0", "matmul_q8_0",
             "matvec_q4_0", "matmul_q4_0",
             "matvec_iq4_nl", "matmul_iq4_nl",
@@ -594,6 +594,40 @@ private:
             fc_values->setConstantValue(&v.bc_out, MTL::DataTypeBool, FC_MUL_MM + 1);
 
             MTL::Function* func = library->newFunction(sgmm_f16_func_name, fc_values, &error);
+            fc_values->release();
+
+            if (!func) {
+                GRANITE_LOG_WARN("Function '{}' not found with constants", v.name);
+                continue;
+            }
+
+            MTL::ComputePipelineState* pipeline = device_->newComputePipelineState(func, &error);
+            func->release();
+
+            if (!pipeline) {
+                GRANITE_LOG_WARN("Failed to create pipeline for '{}'", v.name);
+                continue;
+            }
+
+            pipelines_[v.name] = pipeline;
+        }
+
+        // Compile FP16 weight simdgroup matmul (for full logits output)
+        SgmmVariant sgmm_f16w_variants[] = {
+            {"matmul_f16_simdgroup_00", false, false},
+            {"matmul_f16_simdgroup_01", false, true},
+            {"matmul_f16_simdgroup_10", true, false},
+            {"matmul_f16_simdgroup_11", true, true},
+        };
+
+        NS::String* sgmm_f16w_func_name = NS::String::string("matmul_f16_simdgroup", NS::UTF8StringEncoding);
+
+        for (const auto& v : sgmm_f16w_variants) {
+            MTL::FunctionConstantValues* fc_values = MTL::FunctionConstantValues::alloc()->init();
+            fc_values->setConstantValue(&v.bc_inp, MTL::DataTypeBool, FC_MUL_MM + 0);
+            fc_values->setConstantValue(&v.bc_out, MTL::DataTypeBool, FC_MUL_MM + 1);
+
+            MTL::Function* func = library->newFunction(sgmm_f16w_func_name, fc_values, &error);
             fc_values->release();
 
             if (!func) {
@@ -999,14 +1033,67 @@ Result<void> MetalCompute::matvec_f16(
     MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N)
 {
-    return impl_->dispatch_matvec("matvec_f16", x, W, y, K, N);
+    auto* encoder = impl_->get_encoder();
+    auto* pipeline = impl_->get_pipeline("matvec_f16");
+    if (!pipeline) {
+        return Error(ErrorCode::InternalError, "matvec_f16 pipeline not found");
+    }
+
+    encoder->setComputePipelineState(pipeline);
+    encoder->setBuffer(x, 0, 0);
+    encoder->setBuffer(W, 0, 1);
+    encoder->setBuffer(y, 0, 2);
+    encoder->setBytes(&K, sizeof(K), 3);
+    encoder->setBytes(&N, sizeof(N), 4);
+
+    // One SIMD group per output row.
+    MTL::Size grid_size = MTL::Size::Make(N, 1, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(32, 1, 1);
+    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
+
+    return {};
 }
 
 Result<void> MetalCompute::matmul_f16(
     MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
     uint32_t M, uint32_t K, uint32_t N)
 {
-    // Use simple vectorized version with dispatchThreads - more efficient for large N
+    // Simdgroup matrix kernel for prefill batches (M >= 32)
+    // Uses simdgroup_half8x8 matrices and simdgroup_multiply_accumulate.
+    if (M >= 32 && (K % 32 == 0)) {
+        if (M % 32 == 0 && N % 64 == 0) {
+            return impl_->dispatch_matmul_simdgroup("matmul_f16_simdgroup_00", X, W, Y, M, K, N);
+        }
+        return impl_->dispatch_matmul_simdgroup("matmul_f16_simdgroup_11", X, W, Y, M, K, N);
+    }
+
+    auto* encoder = impl_->get_encoder();
+
+    if (M >= 16 && N >= 16) {
+        auto* pipeline = impl_->get_pipeline("matmul_f16_tiled");
+        if (!pipeline) {
+            return Error(ErrorCode::InternalError, "matmul_f16_tiled pipeline not found");
+        }
+
+        encoder->setComputePipelineState(pipeline);
+        encoder->setBuffer(X, 0, 0);
+        encoder->setBuffer(W, 0, 1);
+        encoder->setBuffer(Y, 0, 2);
+        encoder->setBytes(&M, sizeof(M), 3);
+        encoder->setBytes(&K, sizeof(K), 4);
+        encoder->setBytes(&N, sizeof(N), 5);
+
+        constexpr uint32_t tile = 16;
+        uint32_t grid_x = (N + tile - 1) / tile;
+        uint32_t grid_y = (M + tile - 1) / tile;
+        MTL::Size grid_size = MTL::Size::Make(grid_x, grid_y, 1);
+        MTL::Size threadgroup_size = MTL::Size::Make(tile, tile, 1);
+        encoder->dispatchThreadgroups(grid_size, threadgroup_size);
+
+        return {};
+    }
+
+    // Fallback for small batches
     return impl_->dispatch_matmul("matmul_f16", X, W, Y, M, K, N);
 }
 

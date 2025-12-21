@@ -1050,6 +1050,184 @@ kernel void matmul_q4k_simdgroup_f16(
 }
 
 // =============================================================================
+// SIMDGROUP MATRIX FP16 Matmul (Optimized for Full Logits)
+// =============================================================================
+// Computes: Y[M, N] = X[M, K] @ W[N, K]^T
+// Uses the same simdgroup tiling as the Q4_K kernel, but loads FP16 weights
+// directly (no dequantization). Input activations are FP32 and converted to FP16
+// in threadgroup memory to reduce bandwidth.
+//
+// Tile sizes: 64 output-N x 32 output-M per threadgroup
+// Each simdgroup handles 32x16 output elements
+// 4 simdgroups (128 threads) per threadgroup
+// =============================================================================
+
+inline half4x4 load_half4x4(device const half* src) {
+    half4x4 reg;
+    reg[0][0] = src[0];
+    reg[0][1] = src[1];
+    reg[0][2] = src[2];
+    reg[0][3] = src[3];
+    reg[1][0] = src[4];
+    reg[1][1] = src[5];
+    reg[1][2] = src[6];
+    reg[1][3] = src[7];
+    reg[2][0] = src[8];
+    reg[2][1] = src[9];
+    reg[2][2] = src[10];
+    reg[2][3] = src[11];
+    reg[3][0] = src[12];
+    reg[3][1] = src[13];
+    reg[3][2] = src[14];
+    reg[3][3] = src[15];
+    return reg;
+}
+
+kernel void matmul_f16_simdgroup(
+    device const float* X          [[buffer(0)]],
+    device const half* W           [[buffer(1)]],
+    device float* Y                [[buffer(2)]],
+    constant uint& M               [[buffer(3)]],
+    constant uint& K               [[buffer(4)]],
+    constant uint& N               [[buffer(5)]],
+    threadgroup char* shmem        [[threadgroup(0)]],
+    uint3 tgpig                    [[threadgroup_position_in_grid]],
+    ushort tiitg                   [[thread_index_in_threadgroup]],
+    ushort sgitg                   [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup half* sa = (threadgroup half*)(shmem);
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);
+    threadgroup float* sc = (threadgroup float*)(shmem);
+
+    const uint r0 = tgpig.y * SGMM_NR0;  // N tile
+    const uint r1 = tgpig.x * SGMM_NR1;  // M tile
+
+    const short nr0 = FC_mm_bc_inp ? min((uint)SGMM_NR0, N - r0) : SGMM_NR0;
+    const short nr1 = FC_mm_bc_inp ? min((uint)SGMM_NR1, M - r1) : SGMM_NR1;
+
+    constexpr short NL0 = SGMM_NK / 16;
+    constexpr short NL1 = SGMM_NK / 8;
+
+    const short lr0 = FC_mm_bc_inp ? min((short)(tiitg / NL0), (short)(nr0 - 1)) : (tiitg / NL0);
+    const short lr1 = FC_mm_bc_inp ? min((short)(tiitg / NL1), (short)(nr1 - 1)) : (tiitg / NL1);
+    const short il0 = tiitg % NL0;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    const short iy = 8 * (tiitg % NL1);
+
+    device const half* w_row = FC_mm_bc_inp
+        ? ((lr0 < nr0) ? W + (r0 + lr0) * K : nullptr)
+        : W + (r0 + lr0) * K;
+
+    device const float* x_row = FC_mm_bc_inp
+        ? ((lr1 < nr1) ? X + (r1 + lr1) * K + iy : nullptr)
+        : X + (r1 + lr1) * K + iy;
+
+    for (uint loop_k = 0; loop_k < K; loop_k += SGMM_NK) {
+        half4x4 temp_a;
+        if (FC_mm_bc_inp) {
+            if (w_row != nullptr) {
+                const uint k_base = loop_k + il0 * 16;
+                temp_a = load_half4x4(w_row + k_base);
+            } else {
+                temp_a = half4x4(0);
+            }
+        } else {
+            const uint k_base = loop_k + il0 * 16;
+            temp_a = load_half4x4(w_row + k_base);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 16; i++) {
+            const short sx = 2 * il0 + i / 8;
+            const short sy = (short)(tiitg / NL0) / 8;
+            const short lx = (short)(tiitg / NL0) % 8;
+            const short ly = i % 8;
+            const short ib = 8 * sx + sy;
+            *(sa + 64 * ib + 8 * ly + lx) = temp_a[i / 4][i % 4];
+        }
+
+        if (FC_mm_bc_inp) {
+            if (x_row != nullptr) {
+                const short sx = tiitg % NL1;
+                const short sy = lr1 / 8;
+                const short ly = lr1 % 8;
+                const short ib = 4 * sx + sy;
+                *(threadgroup half2x4*)(sb + 64 * ib + 8 * ly) = half2x4(*(device const float2x4*)(x_row + loop_k));
+            }
+        } else {
+            const short sx = tiitg % NL1;
+            const short sy = lr1 / 8;
+            const short ly = lr1 % 8;
+            const short ib = 4 * sx + sy;
+            *(threadgroup half2x4*)(sb + 64 * ib + 8 * ly) = half2x4(*(device const float2x4*)(x_row + loop_k));
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half* lsma = sa + 4 * 64 * (sgitg % 2);
+        threadgroup const half* lsmb = sb + 2 * 64 * (sgitg / 2);
+
+        #pragma clang loop unroll(full)
+        for (short ik = 0; ik < SGMM_NK / 8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            }
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+
+    const uint sg_n = r0 + 32 * (sgitg % 2);
+    const uint sg_m = r1 + 16 * (sgitg / 2);
+
+    if (!FC_mm_bc_out || (sg_m + 16 <= M && sg_n + 32 <= N)) {
+        device float* C = Y + sg_m * N + sg_n;
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], C + 8 * (i % 4) + 8 * N * (i / 4), N, 0, false);
+        }
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* temp_str = sc + 32 * (sgitg % 2) + 16 * (sgitg / 2) * SGMM_NR0;
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], temp_str + 8 * (i % 4) + 8 * SGMM_NR0 * (i / 4), SGMM_NR0, 0, false);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            for (int j = tiitg; j < (int)nr1; j += SGMM_NR1) {
+                device float* D = Y + (r1 + j) * N + r0;
+                threadgroup float* C = sc + j * SGMM_NR0;
+                for (int i = 0; i < nr0; i++) {
+                    D[i] = C[i];
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
 // Fused Gate+Up Simdgroup Matmul for FFN (saves 1 input read per layer)
 // =============================================================================
 // Computes both Y_gate = X @ W_gate and Y_up = X @ W_up in a single dispatch.
@@ -3606,6 +3784,60 @@ kernel void matmul_f16(
     }
 
     Y[row * N + col] = sum;
+}
+
+// =============================================================================
+// FP16 Weight MatMul - Tiled (threadgroup) Variant
+// =============================================================================
+kernel void matmul_f16_tiled(
+    device const float* X          [[buffer(0)]],
+    device const half* W           [[buffer(1)]],
+    device float* Y                [[buffer(2)]],
+    constant uint& M               [[buffer(3)]],
+    constant uint& K               [[buffer(4)]],
+    constant uint& N               [[buffer(5)]],
+    uint2 tgid                     [[threadgroup_position_in_grid]],
+    uint2 tid                      [[thread_position_in_threadgroup]]
+) {
+    constexpr uint TILE_M = 16;
+    constexpr uint TILE_N = 16;
+    constexpr uint TILE_K = 16;
+
+    threadgroup float Asub[TILE_M][TILE_K];
+    threadgroup half  Bsub[TILE_K][TILE_N];
+
+    uint row = tgid.y * TILE_M + tid.y;
+    uint col = tgid.x * TILE_N + tid.x;
+
+    float acc = 0.0f;
+
+    for (uint k0 = 0; k0 < K; k0 += TILE_K) {
+        uint k_a = k0 + tid.x;
+        if (row < M && k_a < K) {
+            Asub[tid.y][tid.x] = X[row * K + k_a];
+        } else {
+            Asub[tid.y][tid.x] = 0.0f;
+        }
+
+        uint k_b = k0 + tid.y;
+        if (col < N && k_b < K) {
+            Bsub[tid.y][tid.x] = W[col * K + k_b];
+        } else {
+            Bsub[tid.y][tid.x] = half(0.0f);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint k = 0; k < TILE_K; k++) {
+            acc += Asub[tid.y][k] * float(Bsub[k][tid.x]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (row < M && col < N) {
+        Y[row * N + col] = acc;
+    }
 }
 
 )";

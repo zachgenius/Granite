@@ -3225,6 +3225,9 @@ Result<void*> TransformerModel::forward_prefill_raw(
     auto* pipe_matmul_q4k_f16 = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("matmul_q4k_simdgroup_f16_11"));
     auto* pipe_matmul_q4k_f16_fast = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("matmul_q4k_simdgroup_f16_00"));
     auto* pipe_matmul_f16 = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("matmul_f16"));
+    auto* pipe_matvec_f16 = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("matvec_f16"));
+    auto* pipe_matmul_f16_sg = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("matmul_f16_simdgroup_11"));
+    auto* pipe_matmul_f16_sg_fast = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("matmul_f16_simdgroup_00"));
 
     // Helper to select fast kernel when dimensions are aligned
     // NR1=32 (M rows), NR0=64 (N cols) - function constants eliminate bounds checking
@@ -3239,6 +3242,12 @@ Result<void*> TransformerModel::forward_prefill_raw(
             return pipe_matmul_q4k_f16_fast;
         }
         return pipe_matmul_q4k_f16;
+    };
+    auto select_f16_sg_pipe = [&](uint32_t m, uint32_t /*k*/, uint32_t n) -> MTL::ComputePipelineState* {
+        if (pipe_matmul_f16_sg_fast && (m % 32 == 0) && (n % 64 == 0)) {
+            return pipe_matmul_f16_sg_fast;
+        }
+        return pipe_matmul_f16_sg;
     };
     auto* pipe_rope = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("rope_multihead"));
     auto* pipe_kv_append = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("kv_cache_append_f16"));
@@ -3702,14 +3711,35 @@ Result<void*> TransformerModel::forward_prefill_raw(
     // Output projection (FP16 matmul)
     uint32_t out_M = last_token_only ? 1 : M;
     size_t norm_offset = last_token_only ? static_cast<size_t>(M - 1) * hd * sizeof(float) : 0;
-    enc->setComputePipelineState(pipe_matmul_f16);
-    enc->setBuffer(norm_out_buf, norm_offset, 0);
-    enc->setBuffer(out_w_buf, 0, 1);
-    enc->setBuffer(logits_buf, 0, 2);
-    enc->setBytes(&out_M, 4, 3);
-    enc->setBytes(&hd, 4, 4);
-    enc->setBytes(&vs, 4, 5);
-    enc->dispatchThreads(MTL::Size::Make(vs, out_M, 1), MTL::Size::Make(16, 16, 1));
+    if (last_token_only && pipe_matvec_f16) {
+        enc->setComputePipelineState(pipe_matvec_f16);
+        enc->setBuffer(norm_out_buf, norm_offset, 0);
+        enc->setBuffer(out_w_buf, 0, 1);
+        enc->setBuffer(logits_buf, 0, 2);
+        enc->setBytes(&hd, 4, 3);
+        enc->setBytes(&vs, 4, 4);
+        enc->dispatchThreadgroups(MTL::Size::Make(vs, 1, 1), MTL::Size::Make(32, 1, 1));
+    } else if (!last_token_only && pipe_matmul_f16_sg && (hd % 32 == 0)) {
+        enc->setComputePipelineState(select_f16_sg_pipe(out_M, hd, vs));
+        enc->setBuffer(norm_out_buf, norm_offset, 0);
+        enc->setBuffer(out_w_buf, 0, 1);
+        enc->setBuffer(logits_buf, 0, 2);
+        enc->setBytes(&out_M, 4, 3);
+        enc->setBytes(&hd, 4, 4);
+        enc->setBytes(&vs, 4, 5);
+        enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
+        enc->dispatchThreadgroups(MTL::Size::Make((out_M + NR1 - 1) / NR1, (vs + NR0 - 1) / NR0, 1),
+                                  MTL::Size::Make(128, 1, 1));
+    } else {
+        enc->setComputePipelineState(pipe_matmul_f16);
+        enc->setBuffer(norm_out_buf, norm_offset, 0);
+        enc->setBuffer(out_w_buf, 0, 1);
+        enc->setBuffer(logits_buf, 0, 2);
+        enc->setBytes(&out_M, 4, 3);
+        enc->setBytes(&hd, 4, 4);
+        enc->setBytes(&vs, 4, 5);
+        enc->dispatchThreads(MTL::Size::Make(vs, out_M, 1), MTL::Size::Make(16, 16, 1));
+    }
 
     // =========================================================================
     // SYNC AND RETURN

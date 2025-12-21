@@ -32,3 +32,7 @@ inline void set_log_level(spdlog::level::level_enum level) {
 
 // Convenience macros
 #define GRANITE_LOG_TRACE(...)    SPDLOG_LOGGER_TRACE(::granite::get_logger(), __VA_ARGS__)
+#define GRANITE_LOG_DEBUG(...)    SPDLOG_LOGGER_DEBUG(::granite::get_logger(), __VA_ARGS__)
+#define GRANITE_LOG_INFO(...)     SPDLOG_LOGGER_INFO(::granite::get_logger(), __VA_ARGS__)
+#define GRANITE_LOG_WARN(...)     SPDLOG_LOGGER_WARN(::granite::get_logger(), __VA_ARGS__)
+#define GRANITE_LOG_ERROR(...)    SPDLOG_LOGGER_ERROR(::granite::get_logger(), __VA_ARGS__)
