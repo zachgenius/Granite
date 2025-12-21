@@ -499,7 +499,8 @@ private:
     // Prefill buffer pool - preallocated buffers for batched prefill
     struct PrefillBufferPool {
         bool initialized = false;
-        int max_tokens = 0;  // Current capacity
+        int max_tokens = 0;    // Full sequence capacity
+        int chunk_tokens = 0;  // Intermediate buffer capacity
         // Input buffers
         void* token_ids_buf = nullptr;   // [max_tokens] INT32 - token IDs
         void* hidden_buf = nullptr;      // [max_tokens * hidden_dim] - embedding output / layer input
@@ -525,7 +526,7 @@ private:
     std::unique_ptr<PrefillBufferPool> prefill_pool_;
 
     // Initialize or resize prefill buffer pool
-    Result<void> ensure_prefill_pool(int num_tokens);
+    Result<void> ensure_prefill_pool(int num_tokens, int chunk_tokens);
 
     // Pre-cached layer weight buffers for zero-overhead prefill
     // Eliminates hash table lookups and string formatting during layer loop

@@ -144,9 +144,19 @@ void benchmark_inference(
     bool full_logits = false) {
     print_header("LLM Inference Benchmark");
 
+    Config runtime_config = Config::Balanced();
+    if (const char* chunk_env = std::getenv("GRANITE_PREFILL_CHUNK_SIZE")) {
+        char* end = nullptr;
+        long chunk = std::strtol(chunk_env, &end, 10);
+        if (end && *end == '\0' && chunk > 0) {
+            runtime_config.prefill_chunk_size = static_cast<uint32_t>(chunk);
+            std::cout << "Prefill chunk size: " << runtime_config.prefill_chunk_size << "\n";
+        }
+    }
+
     // Load model
     std::cout << "Loading model: " << model_path << "\n";
-    auto model_result = TransformerModel::load(model_path, backend);
+    auto model_result = TransformerModel::load(model_path, backend, runtime_config);
     if (!model_result.ok()) {
         std::cerr << "Failed to load model: " << model_result.error().message() << "\n";
         return;

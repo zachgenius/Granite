@@ -89,6 +89,7 @@ struct Config {
     // === Attention Configuration ===
     AttentionBackend attention_backend = AttentionBackend::Auto;
     bool allow_attention_fallback = true;  ///< Fall back if preferred unavailable
+    uint32_t prefill_chunk_size = 0;       ///< 0 = no chunking (memory-efficient prefill)
 
     // === Memory Configuration ===
     size_t max_memory_mb = 0;              ///< 0 = auto (based on device)
