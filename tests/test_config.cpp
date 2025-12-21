@@ -48,6 +48,8 @@ TEST_CASE("ConfigBuilder fluent API", "[Config]") {
             .attention_backend(AttentionBackend::MetalLegacy)
             .max_memory_mb(512)
             .kv_cache_max_seq(1024)
+            .kv_cache_gpu_max_seq(256)
+            .kv_cache_offload(true)
             .power_mode(PowerMode::LowPower)
             .enable_profiling(true)
             .build();
@@ -55,6 +57,8 @@ TEST_CASE("ConfigBuilder fluent API", "[Config]") {
         REQUIRE(config.attention_backend == AttentionBackend::MetalLegacy);
         REQUIRE(config.max_memory_mb == 512);
         REQUIRE(config.kv_cache_max_seq == 1024);
+        REQUIRE(config.kv_cache_gpu_max_seq == 256);
+        REQUIRE(config.kv_cache_offload == true);
         REQUIRE(config.power_mode == PowerMode::LowPower);
         REQUIRE(config.enable_profiling == true);
     }

@@ -245,6 +245,13 @@ struct GenerationConfig {
     bool do_sample = true;  // false = greedy decoding
 };
 
+struct GenerationProgress {
+    int prompt_tokens = 0;
+    int generated_tokens = 0;
+    int max_tokens = 0;
+    bool is_prefill = false;
+};
+
 // =============================================================================
 // Speculative Decoding Config
 // =============================================================================
@@ -653,6 +660,7 @@ private:
 // =============================================================================
 
 using TokenCallback = std::function<bool(const std::string& token)>;
+using ProgressCallback = std::function<void(const GenerationProgress& progress)>;
 
 class LLMRunner {
 public:
@@ -662,6 +670,9 @@ public:
     /// Load model from GGUF file
     [[nodiscard]] static Result<std::unique_ptr<LLMRunner>> load(
         const std::string& path);
+    [[nodiscard]] static Result<std::unique_ptr<LLMRunner>> load(
+        const std::string& path,
+        const Config& config);
 
     /// Generate text (blocking)
     [[nodiscard]] Result<std::string> generate(
@@ -674,6 +685,13 @@ public:
         const std::string& prompt,
         const GenerationConfig& config,
         TokenCallback callback);
+
+    /// Generate text with streaming callback and progress updates
+    [[nodiscard]] Result<void> generate_streaming(
+        const std::string& prompt,
+        const GenerationConfig& config,
+        TokenCallback callback,
+        ProgressCallback progress_callback);
 
     /// Cancel ongoing generation
     void cancel();
@@ -716,6 +734,10 @@ public:
     [[nodiscard]] static Result<std::unique_ptr<SpeculativeRunner>> load(
         const std::string& target_path,
         const std::string& draft_path);
+    [[nodiscard]] static Result<std::unique_ptr<SpeculativeRunner>> load(
+        const std::string& target_path,
+        const std::string& draft_path,
+        const Config& config);
 
     /// Generate text (blocking)
     [[nodiscard]] Result<std::string> generate(
@@ -729,6 +751,7 @@ public:
         const std::string& prompt,
         const GenerationConfig& config,
         TokenCallback callback,
+        ProgressCallback progress_callback,
         const SpeculativeConfig& spec_config = {});
 
     /// Cancel ongoing generation

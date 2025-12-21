@@ -6,6 +6,10 @@ namespace granite {
 thread_local std::mt19937 g_rng{std::random_device{}()};
 
 Result<std::unique_ptr<LLMRunner>> LLMRunner::load(const std::string& path) {
+    return load(path, Config::Balanced());
+}
+
+Result<std::unique_ptr<LLMRunner>> LLMRunner::load(const std::string& path, const Config& config) {
     auto runner = std::make_unique<LLMRunner>();
 
     // Create backend
@@ -20,7 +24,7 @@ Result<std::unique_ptr<LLMRunner>> LLMRunner::load(const std::string& path) {
     }
 
     // Load model
-    auto model_result = TransformerModel::load(path, runner->backend_.get());
+    auto model_result = TransformerModel::load(path, runner->backend_.get(), config);
     if (!model_result.ok()) {
         return model_result.error();
     }
@@ -51,8 +55,13 @@ Result<std::unique_ptr<LLMRunner>> LLMRunner::load(const std::string& path) {
 
 #ifdef GRANITE_HAS_METAL
     // Allocate GPU KV cache for faster decode
-    auto gpu_cache_result = runner->model_.allocate_gpu_kv_cache(
-        runner->model_.config().max_seq_len);
+    int gpu_max_seq = runner->model_.config().max_seq_len;
+    if (config.kv_cache_gpu_max_seq > 0) {
+        gpu_max_seq = static_cast<int>(
+            std::min(config.kv_cache_gpu_max_seq,
+                     static_cast<size_t>(runner->model_.config().max_seq_len)));
+    }
+    auto gpu_cache_result = runner->model_.allocate_gpu_kv_cache(gpu_max_seq);
     if (!gpu_cache_result.ok()) {
         GRANITE_LOG_WARN("Failed to allocate GPU KV cache: {}",
                          gpu_cache_result.error().message());
@@ -83,6 +92,15 @@ Result<void> LLMRunner::generate_streaming(
     const std::string& prompt,
     const GenerationConfig& config,
     TokenCallback callback)
+{
+    return generate_streaming(prompt, config, std::move(callback), nullptr);
+}
+
+Result<void> LLMRunner::generate_streaming(
+    const std::string& prompt,
+    const GenerationConfig& config,
+    TokenCallback callback,
+    ProgressCallback progress_callback)
 {
     cancelled_ = false;
 
@@ -119,6 +137,19 @@ Result<void> LLMRunner::generate_streaming(
     }
     auto logits = std::move(logits_result).take();
 
+    if (progress_callback) {
+        GenerationProgress progress;
+        progress.prompt_tokens = static_cast<int>(prompt_tokens.size());
+        progress.generated_tokens = 0;
+        progress.max_tokens = config.max_tokens;
+        progress.is_prefill = true;
+        progress_callback(progress);
+    }
+
+    if (cancelled_) {
+        return {};
+    }
+
     // Get last position logits and sample
     std::vector<int32_t> generated_tokens = prompt_tokens;
 
@@ -146,6 +177,15 @@ Result<void> LLMRunner::generate_streaming(
         }
 
         generated_tokens.push_back(next_token);
+
+        if (progress_callback) {
+            GenerationProgress progress;
+            progress.prompt_tokens = static_cast<int>(prompt_tokens.size());
+            progress.generated_tokens = static_cast<int>(generated_tokens.size() - prompt_tokens.size());
+            progress.max_tokens = config.max_tokens;
+            progress.is_prefill = false;
+            progress_callback(progress);
+        }
 
         // Generate next logits
         logits_result = model_.forward_single(next_token, kv_cache_);

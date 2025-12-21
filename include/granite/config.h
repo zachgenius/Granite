@@ -94,6 +94,8 @@ struct Config {
     // === Memory Configuration ===
     size_t max_memory_mb = 0;              ///< 0 = auto (based on device)
     size_t kv_cache_max_seq = 2048;        ///< Maximum sequence length for KV cache
+    size_t kv_cache_gpu_max_seq = 0;       ///< 0 = use kv_cache_max_seq
+    bool kv_cache_offload = false;         ///< Allow CPU KV fallback when GPU cache is smaller
     CachePolicy weight_cache_policy = CachePolicy::Lazy;
     bool use_memory_mapping = true;        ///< mmap for weights
 
@@ -217,6 +219,16 @@ public:
 
     ConfigBuilder& kv_cache_max_seq(size_t seq) {
         config_.kv_cache_max_seq = seq;
+        return *this;
+    }
+
+    ConfigBuilder& kv_cache_gpu_max_seq(size_t seq) {
+        config_.kv_cache_gpu_max_seq = seq;
+        return *this;
+    }
+
+    ConfigBuilder& kv_cache_offload(bool enable) {
+        config_.kv_cache_offload = enable;
         return *this;
     }
 

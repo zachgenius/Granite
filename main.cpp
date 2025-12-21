@@ -118,7 +118,7 @@ int main(int argc, char* argv[]) {
             std::cout << token << std::flush;
             token_count++;
             return true;
-        }, spec_config);
+        }, nullptr, spec_config);
 
         auto end = std::chrono::high_resolution_clock::now();
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();

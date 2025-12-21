@@ -56,6 +56,11 @@ Result<TransformerModel> TransformerModel::load(
     }
     model.model_config_ = std::move(config_result).take();
 
+    if (model.runtime_config_.kv_cache_max_seq > 0 &&
+        model.runtime_config_.kv_cache_max_seq < static_cast<size_t>(model.model_config_.max_seq_len)) {
+        model.model_config_.max_seq_len = static_cast<int>(model.runtime_config_.kv_cache_max_seq);
+    }
+
     // Initialize RoPE cache
     model.rope_cache_.initialize(
         model.model_config_.max_seq_len,
@@ -280,6 +285,9 @@ Result<Tensor> TransformerModel::forward(
     // Note: Requires M >= 32 for simdgroup matmul kernel to work correctly
     constexpr bool use_raw_prefill = true;  // Re-enabled after fixing KV cache stride bug
     if (use_raw_prefill && use_gpu_ && total_tokens >= 32 && start_pos == 0 && gpu_kv_cache_ && gpu_kv_cache_->is_allocated()) {
+        if (runtime_config_.kv_cache_offload && total_tokens > gpu_kv_cache_->max_seq_len) {
+            // GPU cache too small; fall back to CPU prefill.
+        } else {
         auto* gpu = get_metal_compute();
         if (gpu && gpu->is_initialized()) {
             // Extract tokens from input tensor
@@ -323,6 +331,7 @@ Result<Tensor> TransformerModel::forward(
                 }
                 // Fall through to regular path on failure
             }
+        }
         }
     }
 #endif
@@ -4483,6 +4492,12 @@ Result<Tensor> TransformerModel::attention_gpu(
 
     // Check if GPU cache exists and is allocated
     bool has_gpu_cache = gpu_kv_cache_ && gpu_kv_cache_->is_allocated();
+    if (has_gpu_cache && runtime_config_.kv_cache_offload) {
+        int needed_len = start_pos + total_tokens;
+        if (needed_len > gpu_kv_cache_->max_seq_len) {
+            return attention(hidden, layer, kv_cache, start_pos);
+        }
+    }
 
     // If decode mode and GPU cache exists
     if (is_decode && has_gpu_cache) {

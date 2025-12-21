@@ -18,6 +18,14 @@ Result<std::unique_ptr<SpeculativeRunner>> SpeculativeRunner::load(
     const std::string& target_path,
     const std::string& draft_path)
 {
+    return load(target_path, draft_path, Config::Balanced());
+}
+
+Result<std::unique_ptr<SpeculativeRunner>> SpeculativeRunner::load(
+    const std::string& target_path,
+    const std::string& draft_path,
+    const Config& config)
+{
     auto runner = std::make_unique<SpeculativeRunner>();
 
     // Create backends for both models
@@ -40,7 +48,7 @@ Result<std::unique_ptr<SpeculativeRunner>> SpeculativeRunner::load(
 
     // Load target model
     GRANITE_LOG_INFO("Loading target model: {}", target_path);
-    auto target_result = TransformerModel::load(target_path, runner->target_backend_.get());
+    auto target_result = TransformerModel::load(target_path, runner->target_backend_.get(), config);
     if (!target_result.ok()) {
         return target_result.error();
     }
@@ -48,7 +56,7 @@ Result<std::unique_ptr<SpeculativeRunner>> SpeculativeRunner::load(
 
     // Load draft model
     GRANITE_LOG_INFO("Loading draft model: {}", draft_path);
-    auto draft_result = TransformerModel::load(draft_path, runner->draft_backend_.get());
+    auto draft_result = TransformerModel::load(draft_path, runner->draft_backend_.get(), config);
     if (!draft_result.ok()) {
         return draft_result.error();
     }
@@ -106,7 +114,7 @@ Result<std::string> SpeculativeRunner::generate(
     auto status = generate_streaming(prompt, config, [&](const std::string& token) {
         result += token;
         return true;
-    }, spec_config);
+    }, nullptr, spec_config);
 
     if (!status.ok()) {
         return status.error();
@@ -118,6 +126,7 @@ Result<void> SpeculativeRunner::generate_streaming(
     const std::string& prompt,
     const GenerationConfig& config,
     TokenCallback callback,
+    ProgressCallback progress_callback,
     const SpeculativeConfig& spec_config)
 {
     cancelled_ = false;
@@ -125,6 +134,10 @@ Result<void> SpeculativeRunner::generate_streaming(
 
     if (!tokenizer_.is_loaded()) {
         GRANITE_FAIL(ErrorCode::InvalidState, "Tokenizer not loaded");
+    }
+
+    if (cancelled_) {
+        return {};
     }
 
     // Tokenize prompt
@@ -173,6 +186,15 @@ Result<void> SpeculativeRunner::generate_streaming(
     }
     auto draft_logits = std::move(draft_logits_result).take();
 
+    if (progress_callback) {
+        GenerationProgress progress;
+        progress.prompt_tokens = static_cast<int>(prompt_tokens.size());
+        progress.generated_tokens = 0;
+        progress.max_tokens = config.max_tokens;
+        progress.is_prefill = true;
+        progress_callback(progress);
+    }
+
     // Sample first token from target model
     int32_t last_token = argmax(target_logits);
 
@@ -185,6 +207,14 @@ Result<void> SpeculativeRunner::generate_streaming(
     std::string token_str = tokenizer_.decode_token(last_token);
     if (!callback(token_str)) {
         return {};
+    }
+    if (progress_callback) {
+        GenerationProgress progress;
+        progress.prompt_tokens = static_cast<int>(prompt_tokens.size());
+        progress.generated_tokens = 1;
+        progress.max_tokens = config.max_tokens;
+        progress.is_prefill = false;
+        progress_callback(progress);
     }
 
     // Speculative decoding loop
@@ -227,6 +257,14 @@ Result<void> SpeculativeRunner::generate_streaming(
             }
 
             generated++;
+            if (progress_callback) {
+                GenerationProgress progress;
+                progress.prompt_tokens = static_cast<int>(prompt_tokens.size());
+                progress.generated_tokens = generated;
+                progress.max_tokens = config.max_tokens;
+                progress.is_prefill = false;
+                progress_callback(progress);
+            }
             if (generated >= config.max_tokens) {
                 should_stop = true;
                 break;
