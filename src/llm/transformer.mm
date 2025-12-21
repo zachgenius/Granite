@@ -2476,8 +2476,16 @@ Result<Tensor> TransformerModel::feed_forward_gpu(const Tensor& hidden, int laye
             }
         };
 
-        dispatch_matmul(h_buf, wg_buf, gate_buf, w_gate->quant_type, total_tokens, hidden_dim, intermediate_dim);
-        dispatch_matmul(h_buf, wu_buf, up_buf, w_up->quant_type, total_tokens, hidden_dim, intermediate_dim);
+        if (w_gate->quant_type == GGMLType::Q8_0 && w_up->quant_type == GGMLType::Q8_0) {
+            gpu->fused_gate_up_q8_0(h_buf, wg_buf, wu_buf, gate_buf, up_buf,
+                                    total_tokens, hidden_dim, intermediate_dim);
+        } else if (w_gate->quant_type == GGMLType::Q4_0 && w_up->quant_type == GGMLType::Q4_0) {
+            gpu->fused_gate_up_q4_0(h_buf, wg_buf, wu_buf, gate_buf, up_buf,
+                                    total_tokens, hidden_dim, intermediate_dim);
+        } else {
+            dispatch_matmul(h_buf, wg_buf, gate_buf, w_gate->quant_type, total_tokens, hidden_dim, intermediate_dim);
+            dispatch_matmul(h_buf, wu_buf, up_buf, w_up->quant_type, total_tokens, hidden_dim, intermediate_dim);
+        }
         gpu->silu_mul(gate_buf, up_buf, gate_buf, total_tokens * intermediate_dim);
         dispatch_matmul(gate_buf, wd_buf, o_buf, w_down->quant_type, total_tokens, intermediate_dim, hidden_dim);
     }
@@ -3171,6 +3179,12 @@ Result<void> TransformerModel::transformer_block_prefill_raw(
         if (use_ffn_f32_fused) {
             gpu->fused_gate_up_q4k_f32(ffn_input_buf, wgate_buf, wup_buf, gate_buf, up_buf,
                                        num_tokens, hidden_dim, intermediate_dim);
+        } else if (raw_wgate->quant_type == GGMLType::Q8_0 && raw_wup->quant_type == GGMLType::Q8_0) {
+            gpu->fused_gate_up_q8_0(ffn_input_buf, wgate_buf, wup_buf, gate_buf, up_buf,
+                                    num_tokens, hidden_dim, intermediate_dim);
+        } else if (raw_wgate->quant_type == GGMLType::Q4_0 && raw_wup->quant_type == GGMLType::Q4_0) {
+            gpu->fused_gate_up_q4_0(ffn_input_buf, wgate_buf, wup_buf, gate_buf, up_buf,
+                                    num_tokens, hidden_dim, intermediate_dim);
         } else {
             dispatch_matmul(ffn_input_buf, wgate_buf, gate_buf, raw_wgate->quant_type, num_tokens, hidden_dim, intermediate_dim);
             dispatch_matmul(ffn_input_buf, wup_buf, up_buf, raw_wup->quant_type, num_tokens, hidden_dim, intermediate_dim);

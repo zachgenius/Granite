@@ -1826,6 +1826,49 @@ kernel void matmul_q8_0(
     Y[row * N + col] = sum;
 }
 
+// Fused Gate+Up Q8_0 Matmul (Batched - Prefill)
+kernel void fused_gate_up_q8_0(
+    device const float* X          [[buffer(0)]],
+    device const void* W_gate      [[buffer(1)]],
+    device const void* W_up        [[buffer(2)]],
+    device float* Y_gate           [[buffer(3)]],
+    device float* Y_up             [[buffer(4)]],
+    constant uint& M               [[buffer(5)]],
+    constant uint& K               [[buffer(6)]],
+    constant uint& N               [[buffer(7)]],
+    uint2 gid                      [[thread_position_in_grid]]
+) {
+    uint row = gid.y;
+    uint col = gid.x;
+
+    if (row >= M || col >= N) return;
+
+    const uint num_blocks_k = K / QK8_0;
+    const device block_q8_0* wg = (const device block_q8_0*)W_gate;
+    const device block_q8_0* wu = (const device block_q8_0*)W_up;
+
+    float sum_g = 0.0f;
+    float sum_u = 0.0f;
+
+    for (uint kb = 0; kb < num_blocks_k; kb++) {
+        const device block_q8_0* block_g = &wg[col * num_blocks_k + kb];
+        const device block_q8_0* block_u = &wu[col * num_blocks_k + kb];
+        float d_g = float(block_g->d);
+        float d_u = float(block_u->d);
+
+        uint base_idx = kb * QK8_0;
+
+        for (int i = 0; i < 32; i++) {
+            float x = X[row * K + base_idx + i];
+            sum_g += x * (d_g * float(block_g->qs[i]));
+            sum_u += x * (d_u * float(block_u->qs[i]));
+        }
+    }
+
+    Y_gate[row * N + col] = sum_g;
+    Y_up[row * N + col] = sum_u;
+}
+
 // Fused RMSNorm + Q8_0 MatVec
 // Computes: y = RMSNorm(x, weight) @ W^T (Q8_0)
 kernel void rms_norm_matvec_q8_0(
@@ -2008,6 +2051,58 @@ kernel void matmul_q4_0(
     }
 
     Y[row * N + col] = sum;
+}
+
+// Fused Gate+Up Q4_0 Matmul (Batched - Prefill)
+kernel void fused_gate_up_q4_0(
+    device const float* X          [[buffer(0)]],
+    device const void* W_gate      [[buffer(1)]],
+    device const void* W_up        [[buffer(2)]],
+    device float* Y_gate           [[buffer(3)]],
+    device float* Y_up             [[buffer(4)]],
+    constant uint& M               [[buffer(5)]],
+    constant uint& K               [[buffer(6)]],
+    constant uint& N               [[buffer(7)]],
+    uint2 gid                      [[thread_position_in_grid]]
+) {
+    uint row = gid.y;
+    uint col = gid.x;
+
+    if (row >= M || col >= N) return;
+
+    const uint num_blocks_k = K / QK4_0;
+    const device block_q4_0* wg = (const device block_q4_0*)W_gate;
+    const device block_q4_0* wu = (const device block_q4_0*)W_up;
+
+    float sum_g = 0.0f;
+    float sum_u = 0.0f;
+
+    for (uint kb = 0; kb < num_blocks_k; kb++) {
+        const device block_q4_0* block_g = &wg[col * num_blocks_k + kb];
+        const device block_q4_0* block_u = &wu[col * num_blocks_k + kb];
+        float d_g = float(block_g->d);
+        float d_u = float(block_u->d);
+
+        uint base_idx = kb * QK4_0;
+
+        for (int i = 0; i < 16; i++) {
+            uint8_t qbyte_g = block_g->qs[i];
+            uint8_t qbyte_u = block_u->qs[i];
+            int qg0 = (qbyte_g & 0xF) - 8;
+            int qg1 = (qbyte_g >> 4) - 8;
+            int qu0 = (qbyte_u & 0xF) - 8;
+            int qu1 = (qbyte_u >> 4) - 8;
+            float x0 = X[row * K + base_idx + i*2 + 0];
+            float x1 = X[row * K + base_idx + i*2 + 1];
+            sum_g += d_g * float(qg0) * x0;
+            sum_g += d_g * float(qg1) * x1;
+            sum_u += d_u * float(qu0) * x0;
+            sum_u += d_u * float(qu1) * x1;
+        }
+    }
+
+    Y_gate[row * N + col] = sum_g;
+    Y_up[row * N + col] = sum_u;
 }
 
 // Fused RMSNorm + Q4_0 MatVec

@@ -107,6 +107,28 @@ public:
         uint32_t N               // Output dimension (intermediate_size)
     );
 
+    // Fused gate+up projections for FFN (Q8_0/Q4_0)
+    Result<void> fused_gate_up_q8_0(
+        MTL::Buffer* X,
+        MTL::Buffer* W_gate,
+        MTL::Buffer* W_up,
+        MTL::Buffer* Y_gate,
+        MTL::Buffer* Y_up,
+        uint32_t M,
+        uint32_t K,
+        uint32_t N
+    );
+    Result<void> fused_gate_up_q4_0(
+        MTL::Buffer* X,
+        MTL::Buffer* W_gate,
+        MTL::Buffer* W_up,
+        MTL::Buffer* Y_gate,
+        MTL::Buffer* Y_up,
+        uint32_t M,
+        uint32_t K,
+        uint32_t N
+    );
+
     // =============================================================================
     // LLM Operations - Q8_0 Quantized Matrix Multiply
     // =============================================================================
@@ -411,6 +433,7 @@ public:
         uint32_t hidden_dim,
         float eps
     );
+
 
     // SiLU activation (in-place)
     Result<void> silu(MTL::Buffer* x, uint32_t size);

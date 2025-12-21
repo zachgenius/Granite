@@ -340,6 +340,7 @@ public:
         return {};
     }
 
+
     // Fused gate+up simdgroup matmul dispatch
     // Computes both gate and up projections in a single kernel launch
     // Grid z=0 for gate, z=1 for up - both share the same input X loading
@@ -500,6 +501,8 @@ private:
             "matvec_residual_q4k", "matvec_residual_q3k", "matvec_residual_q2k",
             // Fused QKV
             "fused_qkv_matvec_q4k",
+            // Fused gate+up (non-Q4_K)
+            "fused_gate_up_q8_0", "fused_gate_up_q4_0",
             // Simdgroup Flash Attention (high performance decode)
             "simdgroup_flash_attention_decode_f16kv_d64", "simdgroup_flash_attention_decode_f16kv_d128",
             // llama.cpp-style Flash Attention (highest performance)
@@ -973,6 +976,34 @@ Result<void> MetalCompute::matmul_q8_0(
     return impl_->dispatch_matmul("matmul_q8_0", X, W, Y, M, K, N);
 }
 
+Result<void> MetalCompute::fused_gate_up_q8_0(
+    MTL::Buffer* X, MTL::Buffer* W_gate, MTL::Buffer* W_up,
+    MTL::Buffer* Y_gate, MTL::Buffer* Y_up,
+    uint32_t M, uint32_t K, uint32_t N)
+{
+    auto* encoder = impl_->get_encoder();
+    auto* pipeline = impl_->get_pipeline("fused_gate_up_q8_0");
+    if (!pipeline) {
+        return Error(ErrorCode::InternalError, "fused_gate_up_q8_0 pipeline not found");
+    }
+
+    encoder->setComputePipelineState(pipeline);
+    encoder->setBuffer(X, 0, 0);
+    encoder->setBuffer(W_gate, 0, 1);
+    encoder->setBuffer(W_up, 0, 2);
+    encoder->setBuffer(Y_gate, 0, 3);
+    encoder->setBuffer(Y_up, 0, 4);
+    encoder->setBytes(&M, sizeof(M), 5);
+    encoder->setBytes(&K, sizeof(K), 6);
+    encoder->setBytes(&N, sizeof(N), 7);
+
+    MTL::Size grid_size = MTL::Size::Make(N, M, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    encoder->dispatchThreads(grid_size, threadgroup_size);
+
+    return {};
+}
+
 // -----------------------------------------------------------------------------
 // Q4_0 Quantized Operations
 // -----------------------------------------------------------------------------
@@ -989,6 +1020,34 @@ Result<void> MetalCompute::matmul_q4_0(
     uint32_t M, uint32_t K, uint32_t N)
 {
     return impl_->dispatch_matmul("matmul_q4_0", X, W, Y, M, K, N);
+}
+
+Result<void> MetalCompute::fused_gate_up_q4_0(
+    MTL::Buffer* X, MTL::Buffer* W_gate, MTL::Buffer* W_up,
+    MTL::Buffer* Y_gate, MTL::Buffer* Y_up,
+    uint32_t M, uint32_t K, uint32_t N)
+{
+    auto* encoder = impl_->get_encoder();
+    auto* pipeline = impl_->get_pipeline("fused_gate_up_q4_0");
+    if (!pipeline) {
+        return Error(ErrorCode::InternalError, "fused_gate_up_q4_0 pipeline not found");
+    }
+
+    encoder->setComputePipelineState(pipeline);
+    encoder->setBuffer(X, 0, 0);
+    encoder->setBuffer(W_gate, 0, 1);
+    encoder->setBuffer(W_up, 0, 2);
+    encoder->setBuffer(Y_gate, 0, 3);
+    encoder->setBuffer(Y_up, 0, 4);
+    encoder->setBytes(&M, sizeof(M), 5);
+    encoder->setBytes(&K, sizeof(K), 6);
+    encoder->setBytes(&N, sizeof(N), 7);
+
+    MTL::Size grid_size = MTL::Size::Make(N, M, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    encoder->dispatchThreads(grid_size, threadgroup_size);
+
+    return {};
 }
 
 // -----------------------------------------------------------------------------
