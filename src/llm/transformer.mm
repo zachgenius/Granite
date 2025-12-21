@@ -68,7 +68,7 @@ Result<TransformerModel> TransformerModel::load(
         model.model_config_.rope_theta);
 
     // Load weights (dequantized for CPU path)
-    ModelLoader loader(backend);
+    ModelLoader loader(backend, config.use_memory_mapping);
     auto weights_result = loader.load_weights(*model.gguf_);
     if (!weights_result.ok()) {
         return weights_result.error();
@@ -100,21 +100,41 @@ Result<TransformerModel> TransformerModel::load(
         desc.size = info.size_bytes();
         desc.memory_type = MemoryType::Shared;
 
-        auto buf_result = backend->create_buffer(desc);
-        if (!buf_result.ok()) {
-            GRANITE_LOG_WARN("Failed to create raw weight buffer for {}", info.name);
-            continue;
+        Result<BufferHandle> buf_result;
+        bool needs_write = true;
+        const void* tensor_data = model.gguf_->tensor_data(info);
+
+        if (model.runtime_config_.use_memory_mapping) {
+            buf_result = backend->create_buffer_from_host(tensor_data, desc);
+            if (buf_result.ok()) {
+                needs_write = false;
+            } else {
+                auto fallback_result = backend->create_buffer(desc);
+                if (!fallback_result.ok()) {
+                    GRANITE_LOG_WARN("Failed to create raw weight buffer for {}", info.name);
+                    continue;
+                }
+                buf_result = fallback_result;
+                needs_write = true;
+            }
+        } else {
+            buf_result = backend->create_buffer(desc);
+            if (!buf_result.ok()) {
+                GRANITE_LOG_WARN("Failed to create raw weight buffer for {}", info.name);
+                continue;
+            }
         }
 
-        // Copy raw data to buffer
-        auto write_result = backend->write_buffer(
-            buf_result.value(),
-            model.gguf_->tensor_data(info),
-            info.size_bytes());
+        if (needs_write) {
+            auto write_result = backend->write_buffer(
+                buf_result.value(),
+                tensor_data,
+                info.size_bytes());
 
-        if (!write_result.ok()) {
-            backend->destroy_buffer(buf_result.value());
-            continue;
+            if (!write_result.ok()) {
+                backend->destroy_buffer(buf_result.value());
+                continue;
+            }
         }
 
         // Store raw weight info

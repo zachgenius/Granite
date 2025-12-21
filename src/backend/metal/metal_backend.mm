@@ -119,6 +119,69 @@ public:
         return BackendType::Metal;
     }
 
+    Result<BufferHandle> create_buffer_from_host(const void* data,
+                                                 const BufferDesc& desc) override {
+        if (!initialized_) {
+            return Error(ErrorCode::BackendNotInitialized);
+        }
+        if (!data) {
+            return Error(ErrorCode::InvalidArgument, "Null host buffer");
+        }
+
+        MTL::ResourceOptions options;
+        bool can_no_copy = false;
+        switch (desc.memory_type) {
+            case MemoryType::Device:
+                options = MTL::ResourceStorageModePrivate;
+                break;
+            case MemoryType::Shared:
+                options = MTL::ResourceStorageModeShared;
+                can_no_copy = true;
+                break;
+            case MemoryType::Managed:
+#if TARGET_OS_OSX
+                if (device_->hasUnifiedMemory()) {
+                    options = MTL::ResourceStorageModeShared;
+                    can_no_copy = true;
+                } else {
+                    options = MTL::ResourceStorageModeManaged;
+                }
+#else
+                options = MTL::ResourceStorageModeShared;
+                can_no_copy = true;
+#endif
+                break;
+        }
+
+        if (!can_no_copy) {
+            auto buffer_result = create_buffer(desc);
+            if (!buffer_result.ok()) {
+                return buffer_result.error();
+            }
+            auto write_result = write_buffer(buffer_result.value(), data, desc.size);
+            if (!write_result.ok()) {
+                destroy_buffer(buffer_result.value());
+                return write_result.error();
+            }
+            return buffer_result;
+        }
+
+        MTL::Buffer* buffer = device_->newBuffer(
+            data,
+            desc.size,
+            options,
+            nullptr);
+        if (!buffer) {
+            return Error(ErrorCode::AllocationFailed,
+                         fmt::format("Failed to allocate Metal buffer of size {}", desc.size));
+        }
+
+        BufferHandle handle{next_handle_++};
+        buffers_[handle] = buffer;
+
+        return handle;
+    }
+
     Result<BufferHandle> create_buffer(const BufferDesc& desc) override {
         if (!initialized_) {
             return Error(ErrorCode::BackendNotInitialized);
@@ -134,7 +197,11 @@ public:
                 break;
             case MemoryType::Managed:
 #if TARGET_OS_OSX
-                options = MTL::ResourceStorageModeManaged;
+                if (device_->hasUnifiedMemory()) {
+                    options = MTL::ResourceStorageModeShared;
+                } else {
+                    options = MTL::ResourceStorageModeManaged;
+                }
 #else
                 // iOS doesn't have managed mode, use shared
                 options = MTL::ResourceStorageModeShared;

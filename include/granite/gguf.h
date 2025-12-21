@@ -282,7 +282,7 @@ struct ModelInfo {
 
 class ModelLoader {
 public:
-    explicit ModelLoader(IComputeBackend* backend);
+    explicit ModelLoader(IComputeBackend* backend, bool use_memory_mapping = true);
 
     /// Load model info from GGUF file
     [[nodiscard]] Result<ModelInfo> load_info(const std::string& path);
@@ -299,6 +299,7 @@ public:
 
 private:
     IComputeBackend* backend_;
+    bool use_memory_mapping_ = true;
 
     // Dequantize weights to FP16/FP32 if needed
     Result<Tensor> dequantize_tensor(

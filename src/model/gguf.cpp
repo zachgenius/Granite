@@ -727,8 +727,9 @@ inline uint16_t fp32_to_fp16(float f) {
 // ModelLoader Implementation
 // =============================================================================
 
-ModelLoader::ModelLoader(IComputeBackend* backend)
+ModelLoader::ModelLoader(IComputeBackend* backend, bool use_memory_mapping)
     : backend_(backend)
+    , use_memory_mapping_(use_memory_mapping)
 {
 }
 
@@ -824,19 +825,38 @@ Result<Tensor> ModelLoader::load_tensor(
     auto dtype = ggml_type_to_dtype(info->type);
     if (dtype) {
         // Direct copy for non-quantized types
-        auto tensor_result = Tensor::allocate(shape, *dtype, backend_);
-        if (!tensor_result.ok()) {
-            return tensor_result.error();
+        BufferDesc desc = BufferDesc::managed(info->size_bytes());
+        Result<BufferHandle> buffer_result;
+        bool needs_write = !use_memory_mapping_;
+
+        if (use_memory_mapping_) {
+            buffer_result = backend_->create_buffer_from_host(data, desc);
+        } else {
+            buffer_result = backend_->create_buffer(desc);
         }
 
-        auto tensor = std::move(tensor_result).take();
+        if (!buffer_result.ok()) {
+            if (!use_memory_mapping_) {
+                return buffer_result.error();
+            }
 
-        // Copy data to tensor
-        auto write_result = backend_->write_buffer(
-            tensor.buffer(), data, info->size_bytes());
+            auto fallback_result = backend_->create_buffer(desc);
+            if (!fallback_result.ok()) {
+                return fallback_result.error();
+            }
+            buffer_result = fallback_result;
+            needs_write = true;
+        }
 
-        if (!write_result.ok()) {
-            return write_result.error();
+        auto tensor = Tensor::from_buffer(buffer_result.value(), shape, *dtype, backend_);
+
+        if (needs_write) {
+            auto write_result = backend_->write_buffer(
+                tensor.buffer(), data, info->size_bytes());
+
+            if (!write_result.ok()) {
+                return write_result.error();
+            }
         }
 
         return tensor;

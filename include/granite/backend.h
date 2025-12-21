@@ -61,6 +61,27 @@ public:
     /// Create a buffer with the given description
     virtual Result<BufferHandle> create_buffer(const BufferDesc& desc) = 0;
 
+    /// Create a buffer from existing host memory (best-effort zero-copy)
+    virtual Result<BufferHandle> create_buffer_from_host(const void* data,
+                                                         const BufferDesc& desc) {
+        if (!data) {
+            return Error(ErrorCode::InvalidArgument, "Null host buffer");
+        }
+
+        auto buffer_result = create_buffer(desc);
+        if (!buffer_result.ok()) {
+            return buffer_result.error();
+        }
+
+        auto write_result = write_buffer(buffer_result.value(), data, desc.size);
+        if (!write_result.ok()) {
+            destroy_buffer(buffer_result.value());
+            return write_result.error();
+        }
+
+        return buffer_result;
+    }
+
     /// Destroy a buffer
     virtual void destroy_buffer(BufferHandle handle) = 0;
 
