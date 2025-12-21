@@ -440,7 +440,7 @@ public:
 #ifdef GRANITE_HAS_SHADERC
         shaderc::Compiler compiler;
         shaderc::CompileOptions options;
-        options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_0);
+        options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_1);
         options.SetOptimizationLevel(shaderc_optimization_level_performance);
 
         auto result = compiler.CompileGlslToSpv(
@@ -1372,12 +1372,19 @@ VulkanCompute* get_vulkan_compute() {
 
         g_vulkan_compute = std::make_unique<VulkanCompute>();
 
+        const char* shader_dir =
+#ifdef GRANITE_VULKAN_SHADER_DIR
+            GRANITE_VULKAN_SHADER_DIR;
+#else
+            "shaders/vulkan";
+#endif
+
         bool ok = g_vulkan_compute->initialize(
             device,
             physical_device,
             queue,
             queue_family,
-            "shaders/vulkan");
+            shader_dir);
 
         if (!ok) {
             GRANITE_LOG_ERROR("Failed to initialize VulkanCompute");

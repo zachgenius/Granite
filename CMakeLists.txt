@@ -228,6 +228,7 @@ if(GRANITE_BUILD_VULKAN)
     )
 
     target_compile_definitions(granite PUBLIC GRANITE_HAS_VULKAN=1)
+    target_compile_definitions(granite PRIVATE GRANITE_VULKAN_SHADER_DIR="${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan")
 
     # Optional: Link shaderc for runtime shader compilation
     if(GRANITE_WITH_SHADERC)

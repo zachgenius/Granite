@@ -156,11 +156,126 @@ public:
 
 // Shaders: rms_norm.comp, layer_norm.comp from llama.cpp
 
+class VulkanRMSNormOp : public VulkanOperator {
+public:
+    OpType type() const override { return OpType::RMSNorm; }
+
+    Result<void> validate(const OpContext& ctx) const override {
+        if (ctx.num_inputs() != 2) {
+            return Error(ErrorCode::InvalidArgument, "RMSNorm requires 2 inputs");
+        }
+        if (ctx.inputs[0].dtype() != DataType::FP32 ||
+            ctx.inputs[1].dtype() != DataType::FP32) {
+            return Error(ErrorCode::NotImplemented, "Vulkan RMSNorm only supports FP32");
+        }
+        return {};
+    }
+
+    Result<std::vector<std::vector<int64_t>>> infer_shapes(const OpContext& ctx) const override {
+        return std::vector<std::vector<int64_t>>{
+            std::vector<int64_t>(ctx.inputs[0].shape().begin(), ctx.inputs[0].shape().end())
+        };
+    }
+
+    Result<void> execute(OpContext& ctx) override {
+        const auto& x = ctx.inputs[0];
+        const auto& w = ctx.inputs[1];
+        auto& out = ctx.outputs[0];
+
+        if (x.ndim() != 1) {
+            return Error(ErrorCode::NotImplemented, "Vulkan RMSNorm supports 1D tensors only");
+        }
+        if (w.ndim() != 1 || w.numel() != x.numel()) {
+            return Error(ErrorCode::InvalidShape, "RMSNorm weight shape mismatch");
+        }
+
+        auto* compute = get_vulkan_compute();
+        if (!compute || !compute->is_initialized()) {
+            return Error(ErrorCode::BackendNotInitialized, "VulkanCompute not initialized");
+        }
+
+        auto* buf_x = static_cast<VkBuffer>(ctx.backend->get_native_buffer(x.buffer()));
+        auto* buf_w = static_cast<VkBuffer>(ctx.backend->get_native_buffer(w.buffer()));
+        auto* buf_out = static_cast<VkBuffer>(ctx.backend->get_native_buffer(out.buffer()));
+        if (!buf_x || !buf_w || !buf_out) {
+            return Error(ErrorCode::InvalidHandle, "Invalid Vulkan buffer handle");
+        }
+
+        double eps = ctx.attrs.get<double>("eps", 1e-5);
+        return compute->rms_norm(buf_x, buf_w, buf_out,
+                                 static_cast<uint32_t>(x.numel()),
+                                 static_cast<float>(eps));
+    }
+};
+
 // =============================================================================
 // TODO: Vulkan Attention Operators
 // =============================================================================
 
 // Shaders: flash_attn.comp, soft_max.comp from llama.cpp
+
+class VulkanSoftmaxOp : public VulkanOperator {
+public:
+    OpType type() const override { return OpType::Softmax; }
+
+    Result<void> validate(const OpContext& ctx) const override {
+        if (ctx.num_inputs() != 1) {
+            return Error(ErrorCode::InvalidArgument, "Softmax requires 1 input");
+        }
+        if (ctx.inputs[0].dtype() != DataType::FP32) {
+            return Error(ErrorCode::NotImplemented, "Vulkan Softmax only supports FP32");
+        }
+        return {};
+    }
+
+    Result<std::vector<std::vector<int64_t>>> infer_shapes(const OpContext& ctx) const override {
+        return std::vector<std::vector<int64_t>>{
+            std::vector<int64_t>(ctx.inputs[0].shape().begin(), ctx.inputs[0].shape().end())
+        };
+    }
+
+    Result<void> execute(OpContext& ctx) override {
+        const auto& x = ctx.inputs[0];
+        auto& out = ctx.outputs[0];
+
+        int axis = static_cast<int>(ctx.attrs.get<int64_t>("axis", -1));
+        if (axis < 0) {
+            axis += static_cast<int>(x.ndim());
+        }
+        if (axis != static_cast<int>(x.ndim()) - 1) {
+            return Error(ErrorCode::NotImplemented, "Vulkan Softmax supports last-axis only");
+        }
+
+        size_t rows = 1;
+        for (int i = 0; i < axis; i++) {
+            rows *= static_cast<size_t>(x.size(i));
+        }
+        size_t cols = static_cast<size_t>(x.size(axis));
+
+        if (rows > std::numeric_limits<uint32_t>::max() ||
+            cols > std::numeric_limits<uint32_t>::max()) {
+            return Error(ErrorCode::InvalidArgument, "Softmax size exceeds Vulkan limits");
+        }
+
+        auto* compute = get_vulkan_compute();
+        if (!compute || !compute->is_initialized()) {
+            return Error(ErrorCode::BackendNotInitialized, "VulkanCompute not initialized");
+        }
+
+        auto* buf_x = static_cast<VkBuffer>(ctx.backend->get_native_buffer(x.buffer()));
+        auto* buf_out = static_cast<VkBuffer>(ctx.backend->get_native_buffer(out.buffer()));
+        if (!buf_x || !buf_out) {
+            return Error(ErrorCode::InvalidHandle, "Invalid Vulkan buffer handle");
+        }
+
+        return compute->softmax_rows(
+            buf_x,
+            buf_out,
+            static_cast<uint32_t>(rows),
+            static_cast<uint32_t>(cols),
+            1.0f);
+    }
+};
 
 // =============================================================================
 // Register Vulkan Operators
@@ -177,6 +292,10 @@ void register_vulkan_operators() {
                         []() { return std::make_unique<VulkanUnaryOp<OpType::SiLU>>(); });
     registry.register_op(OpType::GELU, BackendType::Vulkan,
                         []() { return std::make_unique<VulkanUnaryOp<OpType::GELU>>(); });
+    registry.register_op(OpType::RMSNorm, BackendType::Vulkan,
+                        []() { return std::make_unique<VulkanRMSNormOp>(); });
+    registry.register_op(OpType::Softmax, BackendType::Vulkan,
+                        []() { return std::make_unique<VulkanSoftmaxOp>(); });
 
 }
 
