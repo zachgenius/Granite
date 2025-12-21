@@ -1,0 +1,2 @@
+rootProject.name = "GraniteDemo"
+include(":app")

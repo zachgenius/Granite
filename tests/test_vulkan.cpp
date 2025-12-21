@@ -183,6 +183,37 @@ TEST_CASE("Vulkan buffer operations", "[vulkan]") {
 
         backend->destroy_buffer(handle);
     }
+
+    SECTION("Device-local staging upload/readback") {
+        const size_t size = 128;
+        std::vector<float> input(size);
+        for (size_t i = 0; i < size; i++) {
+            input[i] = static_cast<float>(i * 2);
+        }
+
+        BufferDesc desc{};
+        desc.size = size * sizeof(float);
+        desc.memory_type = MemoryType::Device;
+
+        auto buffer_result = backend->create_buffer(desc);
+        REQUIRE(buffer_result.ok());
+        BufferHandle handle = buffer_result.value();
+
+        auto write_result = backend->write_buffer(handle, input.data(),
+                                                  size * sizeof(float), 0);
+        REQUIRE(write_result.ok());
+
+        std::vector<float> output(size);
+        auto read_result = backend->read_buffer(handle, output.data(),
+                                                size * sizeof(float), 0);
+        REQUIRE(read_result.ok());
+
+        for (size_t i = 0; i < size; i++) {
+            REQUIRE(output[i] == input[i]);
+        }
+
+        backend->destroy_buffer(handle);
+    }
 }
 
 // Note: The following tests require shaderc for runtime shader compilation.

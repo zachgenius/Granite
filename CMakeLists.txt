@@ -211,6 +211,7 @@ endif()
 
 option(GRANITE_WITH_SHADERC "Enable runtime shader compilation with shaderc" OFF)
 set(GRANITE_VULKAN_PRECOMPILED_DIR "" CACHE PATH "Directory for precompiled Vulkan SPIR-V shaders")
+option(GRANITE_BUILD_ANDROID_JNI "Build Android JNI shared library" OFF)
 
 if(GRANITE_BUILD_VULKAN)
     find_package(Vulkan REQUIRED)
@@ -256,6 +257,16 @@ if(GRANITE_BUILD_VULKAN)
             endif()
         endif()
     endif()
+endif()
+
+# =============================================================================
+# Android JNI Library
+# =============================================================================
+
+if(ANDROID AND GRANITE_BUILD_ANDROID_JNI)
+    add_library(granite_jni SHARED src/android/granite_jni.cpp)
+    target_link_libraries(granite_jni PRIVATE granite android log)
+    target_include_directories(granite_jni PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 endif()
 
 # =============================================================================
