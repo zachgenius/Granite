@@ -5,10 +5,12 @@
 
 #include "granite/operators.h"
 #include "granite/log.h"
+#include "vulkan_compute.h"
 
 #ifdef GRANITE_HAS_VULKAN
 
 #include <vulkan/vulkan.h>
+#include <limits>
 
 namespace granite {
 
@@ -24,16 +26,122 @@ protected:
 };
 
 // =============================================================================
-// TODO: Vulkan Binary Operators (Add, Sub, Mul, Div)
+// Vulkan Binary Operators (Add, Mul)
 // =============================================================================
 
-// These will use shaders adapted from llama.cpp
+template<OpType Op>
+class VulkanBinaryOp : public VulkanOperator {
+public:
+    OpType type() const override { return Op; }
+
+    Result<void> validate(const OpContext& ctx) const override {
+        if (ctx.num_inputs() != 2) {
+            return Error(ErrorCode::InvalidArgument, "Binary op requires 2 inputs");
+        }
+        if (ctx.inputs[0].dtype() != DataType::FP32 ||
+            ctx.inputs[1].dtype() != DataType::FP32) {
+            return Error(ErrorCode::NotImplemented, "Vulkan ops only support FP32");
+        }
+        if (ctx.inputs[0].shape() != ctx.inputs[1].shape()) {
+            return Error(ErrorCode::InvalidShape, "Vulkan ops require matching shapes");
+        }
+        return {};
+    }
+
+    Result<std::vector<std::vector<int64_t>>> infer_shapes(const OpContext& ctx) const override {
+        return std::vector<std::vector<int64_t>>{
+            std::vector<int64_t>(ctx.inputs[0].shape().begin(), ctx.inputs[0].shape().end())
+        };
+    }
+
+    Result<void> execute(OpContext& ctx) override {
+        const auto& a = ctx.inputs[0];
+        const auto& b = ctx.inputs[1];
+        auto& out = ctx.outputs[0];
+
+        size_t n = out.numel();
+        if (n > std::numeric_limits<uint32_t>::max()) {
+            return Error(ErrorCode::InvalidArgument, "Tensor too large for Vulkan op");
+        }
+
+        auto* compute = get_vulkan_compute();
+        if (!compute || !compute->is_initialized()) {
+            return Error(ErrorCode::BackendNotInitialized, "VulkanCompute not initialized");
+        }
+
+        auto* buf_a = static_cast<VkBuffer>(ctx.backend->get_native_buffer(a.buffer()));
+        auto* buf_b = static_cast<VkBuffer>(ctx.backend->get_native_buffer(b.buffer()));
+        auto* buf_out = static_cast<VkBuffer>(ctx.backend->get_native_buffer(out.buffer()));
+        if (!buf_a || !buf_b || !buf_out) {
+            return Error(ErrorCode::InvalidHandle, "Invalid Vulkan buffer handle");
+        }
+
+        if constexpr (Op == OpType::Add) {
+            return compute->add(buf_a, buf_b, buf_out, static_cast<uint32_t>(n));
+        }
+        if constexpr (Op == OpType::Mul) {
+            return compute->mul(buf_a, buf_b, buf_out, static_cast<uint32_t>(n));
+        }
+
+        return Error(ErrorCode::NotImplemented, "Unsupported Vulkan binary op");
+    }
+};
 
 // =============================================================================
-// TODO: Vulkan Unary Operators (ReLU, GELU, SiLU)
+// Vulkan Unary Operators (SiLU, GELU)
 // =============================================================================
 
-// Shaders: silu.comp, gelu.comp from llama.cpp
+template<OpType Op>
+class VulkanUnaryOp : public VulkanOperator {
+public:
+    OpType type() const override { return Op; }
+
+    Result<void> validate(const OpContext& ctx) const override {
+        if (ctx.num_inputs() != 1) {
+            return Error(ErrorCode::InvalidArgument, "Unary op requires 1 input");
+        }
+        if (ctx.inputs[0].dtype() != DataType::FP32) {
+            return Error(ErrorCode::NotImplemented, "Vulkan ops only support FP32");
+        }
+        return {};
+    }
+
+    Result<std::vector<std::vector<int64_t>>> infer_shapes(const OpContext& ctx) const override {
+        return std::vector<std::vector<int64_t>>{
+            std::vector<int64_t>(ctx.inputs[0].shape().begin(), ctx.inputs[0].shape().end())
+        };
+    }
+
+    Result<void> execute(OpContext& ctx) override {
+        const auto& x = ctx.inputs[0];
+        auto& out = ctx.outputs[0];
+
+        size_t n = out.numel();
+        if (n > std::numeric_limits<uint32_t>::max()) {
+            return Error(ErrorCode::InvalidArgument, "Tensor too large for Vulkan op");
+        }
+
+        auto* compute = get_vulkan_compute();
+        if (!compute || !compute->is_initialized()) {
+            return Error(ErrorCode::BackendNotInitialized, "VulkanCompute not initialized");
+        }
+
+        auto* buf_x = static_cast<VkBuffer>(ctx.backend->get_native_buffer(x.buffer()));
+        auto* buf_out = static_cast<VkBuffer>(ctx.backend->get_native_buffer(out.buffer()));
+        if (!buf_x || !buf_out) {
+            return Error(ErrorCode::InvalidHandle, "Invalid Vulkan buffer handle");
+        }
+
+        if constexpr (Op == OpType::SiLU) {
+            return compute->silu(buf_x, buf_out, static_cast<uint32_t>(n));
+        }
+        if constexpr (Op == OpType::GELU) {
+            return compute->gelu(buf_x, buf_out, static_cast<uint32_t>(n));
+        }
+
+        return Error(ErrorCode::NotImplemented, "Unsupported Vulkan unary op");
+    }
+};
 
 // =============================================================================
 // TODO: Vulkan MatMul Operators
@@ -59,12 +167,16 @@ protected:
 // =============================================================================
 
 void register_vulkan_operators() {
-    // auto& registry = OperatorRegistry::instance();
+    auto& registry = OperatorRegistry::instance();
 
-    // TODO: Register operators as they are implemented
-    // Example:
-    // registry.register_op(OpType::Add, BackendType::Vulkan,
-    //                     []() { return std::make_unique<VulkanAddOp>(); });
+    registry.register_op(OpType::Add, BackendType::Vulkan,
+                        []() { return std::make_unique<VulkanBinaryOp<OpType::Add>>(); });
+    registry.register_op(OpType::Mul, BackendType::Vulkan,
+                        []() { return std::make_unique<VulkanBinaryOp<OpType::Mul>>(); });
+    registry.register_op(OpType::SiLU, BackendType::Vulkan,
+                        []() { return std::make_unique<VulkanUnaryOp<OpType::SiLU>>(); });
+    registry.register_op(OpType::GELU, BackendType::Vulkan,
+                        []() { return std::make_unique<VulkanUnaryOp<OpType::GELU>>(); });
 
 }
 
