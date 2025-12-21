@@ -6,6 +6,7 @@
 
 #include "onnx.pb.h"
 
+#include <array>
 #include <filesystem>
 #include <fstream>
 
@@ -97,6 +98,51 @@ size_t shape_numel_checked(const std::vector<int64_t>& shape) {
         total *= static_cast<size_t>(dim);
     }
     return total;
+}
+
+MemoryLayout default_layout_for_shape(const std::vector<int64_t>& shape) {
+    if (shape.size() == 4) {
+        return MemoryLayout::NCHW;
+    }
+    return MemoryLayout::RowMajor;
+}
+
+bool apply_layout_from_transpose(const std::vector<int64_t>& perm,
+                                 TensorDesc& input_desc,
+                                 TensorDesc& output_desc) {
+    if (perm.size() != 4) {
+        return false;
+    }
+    const std::array<int64_t, 4> nchw_to_nhwc = {0, 2, 3, 1};
+    const std::array<int64_t, 4> nhwc_to_nchw = {0, 3, 1, 2};
+    bool is_nchw_to_nhwc = std::equal(perm.begin(), perm.end(), nchw_to_nhwc.begin());
+    bool is_nhwc_to_nchw = std::equal(perm.begin(), perm.end(), nhwc_to_nchw.begin());
+
+    if (is_nchw_to_nhwc) {
+        if (input_desc.layout == MemoryLayout::RowMajor ||
+            input_desc.layout == MemoryLayout::NCHW) {
+            input_desc.layout = MemoryLayout::NCHW;
+        }
+        if (input_desc.layout == MemoryLayout::NCHW &&
+            (output_desc.layout == MemoryLayout::RowMajor ||
+             output_desc.layout == MemoryLayout::NCHW)) {
+            output_desc.layout = MemoryLayout::NHWC;
+        }
+        return true;
+    }
+    if (is_nhwc_to_nchw) {
+        if (input_desc.layout == MemoryLayout::RowMajor ||
+            input_desc.layout == MemoryLayout::NCHW) {
+            input_desc.layout = MemoryLayout::NHWC;
+        }
+        if (input_desc.layout == MemoryLayout::NHWC &&
+            (output_desc.layout == MemoryLayout::RowMajor ||
+             output_desc.layout == MemoryLayout::NHWC)) {
+            output_desc.layout = MemoryLayout::NCHW;
+        }
+        return true;
+    }
+    return false;
 }
 
 Result<std::vector<uint8_t>> tensor_data_from_proto(const onnx::TensorProto& tensor,
@@ -319,7 +365,24 @@ TensorId ensure_tensor(Graph& graph,
                        std::unordered_map<std::string, TensorId>& tensor_ids,
                        const std::string& name,
                        const std::vector<int64_t>& shape,
-                       DataType dtype) {
+                       DataType dtype,
+                       MemoryLayout layout = MemoryLayout::RowMajor,
+                       bool layout_set = false) {
+    auto apply_layout = [&](TensorDesc& desc) {
+        if (layout_set) {
+            if (desc.layout == MemoryLayout::RowMajor) {
+                desc.layout = layout;
+            }
+            return;
+        }
+        if (desc.layout == MemoryLayout::RowMajor) {
+            MemoryLayout default_layout = default_layout_for_shape(shape);
+            if (default_layout != MemoryLayout::RowMajor) {
+                desc.layout = default_layout;
+            }
+        }
+    };
+
     auto it = tensor_ids.find(name);
     if (it != tensor_ids.end()) {
         auto& desc = graph.tensor(it->second);
@@ -329,9 +392,11 @@ TensorId ensure_tensor(Graph& graph,
         if (desc.dtype == DataType::FP32 && dtype != DataType::FP32) {
             desc.dtype = dtype;
         }
+        apply_layout(desc);
         return it->second;
     }
     TensorDesc desc = TensorDesc::create(name, shape, dtype);
+    apply_layout(desc);
     TensorId id = graph.add_tensor(std::move(desc));
     tensor_ids.emplace(name, id);
     return id;
@@ -471,7 +536,19 @@ Result<OnnxModel> load_onnx_model(const std::string& path) {
             outputs.push_back(ensure_tensor(graph, tensor_ids, name, {}, DataType::FP32));
         }
 
-        (void)graph.add_node(op, std::move(inputs), std::move(outputs), std::move(attrs));
+        NodeId node_id = graph.add_node(op, std::move(inputs), std::move(outputs), std::move(attrs));
+
+        if (op == OpType::Transpose) {
+            const auto& node = graph.node(node_id);
+            if (!node.inputs.empty() && !node.outputs.empty()) {
+                auto perm = node.attrs.get<std::vector<int64_t>>("perm", {});
+                if (!perm.empty()) {
+                    auto& input_desc = graph.tensor(node.inputs[0]);
+                    auto& output_desc = graph.tensor(node.outputs[0]);
+                    (void)apply_layout_from_transpose(perm, input_desc, output_desc);
+                }
+            }
+        }
     }
 
     graph.set_inputs(std::move(input_ids));

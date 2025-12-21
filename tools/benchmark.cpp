@@ -141,11 +141,16 @@ void benchmark_inference(
     const std::string& model_path,
     IComputeBackend* backend,
     const std::vector<int64_t>& seq_lens,
-    bool full_logits = false) {
+    bool full_logits = false,
+    uint32_t prefill_chunk_size = 0,
+    bool prefill_chunk_set = false) {
     print_header("LLM Inference Benchmark");
 
     Config runtime_config = Config::Balanced();
-    if (const char* chunk_env = std::getenv("GRANITE_PREFILL_CHUNK_SIZE")) {
+    if (prefill_chunk_set) {
+        runtime_config.prefill_chunk_size = prefill_chunk_size;
+        std::cout << "Prefill chunk size: " << runtime_config.prefill_chunk_size << "\n";
+    } else if (const char* chunk_env = std::getenv("GRANITE_PREFILL_CHUNK_SIZE")) {
         char* end = nullptr;
         long chunk = std::strtol(chunk_env, &end, 10);
         if (end && *end == '\0' && chunk > 0) {
@@ -412,6 +417,8 @@ int main(int argc, char* argv[]) {
         std::string model_path;
         bool full_logits = false;
         std::vector<int64_t> seq_lens = {32, 128, 256, 512};
+        uint32_t prefill_chunk_size = 0;
+        bool prefill_chunk_set = false;
 
         for (int i = 1; i < argc; i++) {
             std::string arg = argv[i];
@@ -424,24 +431,36 @@ int main(int argc, char* argv[]) {
                 } else {
                     std::cerr << "Invalid --seq-lens value, using defaults.\n";
                 }
+            } else if (arg == "--prefill-chunk-size" && i + 1 < argc) {
+                char* end = nullptr;
+                long chunk = std::strtol(argv[++i], &end, 10);
+                if (end && *end == '\0' && chunk >= 0) {
+                    prefill_chunk_size = static_cast<uint32_t>(chunk);
+                    prefill_chunk_set = true;
+                } else {
+                    std::cerr << "Invalid --prefill-chunk-size value, ignoring.\n";
+                }
             } else if (arg[0] != '-') {
                 model_path = arg;
             }
         }
 
         if (!model_path.empty()) {
-            benchmark_inference(model_path, backend.get(), seq_lens, full_logits);
+            benchmark_inference(model_path, backend.get(), seq_lens, full_logits,
+                                prefill_chunk_size, prefill_chunk_set);
         } else {
             std::cout << "\nUsage: " << argv[0] << " [model.gguf] [--full-logits]\n";
             std::cout << "Provide a GGUF model path to run inference benchmarks.\n";
             std::cout << "  --full-logits: Compute logits for all tokens (default: last token only)\n";
             std::cout << "  --seq-lens <a,b,c>: Override prefill prompt lengths\n";
+            std::cout << "  --prefill-chunk-size <n>: Override prefill chunk size (0 disables)\n";
         }
     } else {
         std::cout << "\nUsage: " << argv[0] << " [model.gguf] [--full-logits]\n";
         std::cout << "Provide a GGUF model path to run inference benchmarks.\n";
         std::cout << "  --full-logits: Compute logits for all tokens (default: last token only)\n";
         std::cout << "  --seq-lens <a,b,c>: Override prefill prompt lengths\n";
+        std::cout << "  --prefill-chunk-size <n>: Override prefill chunk size (0 disables)\n";
     }
 
     backend->shutdown();

@@ -302,6 +302,7 @@ if(GRANITE_BUILD_TESTS)
         tests/test_gguf.cpp
         tests/test_llm.cpp
         tests/test_config.cpp
+        tests/test_onnx.cpp
         tests/test_vulkan.cpp
     )
 
@@ -310,6 +311,11 @@ if(GRANITE_BUILD_TESTS)
             granite
             Catch2::Catch2WithMain
     )
+
+    if(GRANITE_ENABLE_ONNX)
+        target_include_directories(granite_tests PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+        target_include_directories(granite_tests PRIVATE ${Protobuf_INCLUDE_DIRS})
+    endif()
 
     catch_discover_tests(granite_tests)
 endif()
