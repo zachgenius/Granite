@@ -125,11 +125,9 @@ fi
 
 if [[ -n "$powermetrics_file" ]]; then
   echo "powermetrics output: $powermetrics_file"
-  if [[ -n "$out_path" ]]; then
-    cp "$powermetrics_file" "$out_path"
-    echo "Saved power trace to: $out_path"
-  fi
-elif [[ -n "$out_path" ]]; then
+fi
+
+if [[ -n "$out_path" ]]; then
   {
     echo "Label: $label"
     echo "Start: $start_ts"
@@ -138,6 +136,15 @@ elif [[ -n "$out_path" ]]; then
     if [[ -n "$start_batt" && -n "$end_batt" ]]; then
       echo "Battery: ${start_batt}% -> ${end_batt}%"
     fi
+    if [[ -n "$powermetrics_file" ]]; then
+      echo ""
+      echo "--- powermetrics ---"
+      if [[ -s "$powermetrics_file" ]]; then
+        cat "$powermetrics_file"
+      else
+        echo "powermetrics output file is empty"
+      fi
+    fi
   } > "$out_path"
-  echo "Saved summary to: $out_path"
+  echo "Saved power trace to: $out_path"
 fi

@@ -27,6 +27,7 @@
 #include <mutex>
 #include <chrono>
 #include <ctime>
+#include <cstdlib>
 
 namespace granite {
 
@@ -59,6 +60,7 @@ public:
     bool kernel_timing_enabled_ = false;
     mutable std::mutex kernel_mutex_;
     std::unordered_map<std::string, KernelTimingStats> kernel_timings_;
+    bool debug_markers_enabled_ = false;
 
     Impl() = default;
     ~Impl() { shutdown(); }
@@ -179,6 +181,10 @@ public:
         }
     }
 
+    void enable_debug_markers(bool enable) {
+        debug_markers_enabled_ = enable;
+    }
+
     void reset_kernel_timing() {
         std::lock_guard<std::mutex> lock(kernel_mutex_);
         kernel_timings_.clear();
@@ -222,6 +228,14 @@ public:
             stats_.gpu_time_ms += (end - start) * 1000.0;
             stats_.gpu_timed_buffers++;
         }
+    }
+
+    void mark_kernel(const char* kernel_name) {
+        if (!debug_markers_enabled_ || !current_encoder_ || !kernel_name) {
+            return;
+        }
+        auto* marker = NS::String::string(kernel_name, NS::UTF8StringEncoding);
+        current_encoder_->insertDebugSignpost(marker);
     }
 
     void post_dispatch(const char* kernel_name) {
@@ -282,6 +296,7 @@ public:
         uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
         MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
         MTL::Size threadgroup_size = MTL::Size::Make(32 * simd_groups, 1, 1);
+        mark_kernel(kernel_name);
         encoder->dispatchThreadgroups(grid_size, threadgroup_size);
         post_dispatch(kernel_name);
 
@@ -311,6 +326,7 @@ public:
 
         MTL::Size grid_size = MTL::Size::Make(N, M, 1);
         MTL::Size threadgroup_size = MTL::Size::Make(16, 16, 1);
+        mark_kernel(kernel_name);
         encoder->dispatchThreads(grid_size, threadgroup_size);
         post_dispatch(kernel_name);
 
@@ -342,6 +358,7 @@ public:
         uint32_t grid_M = (M + 1) / 2;
         MTL::Size grid_size = MTL::Size::Make(N, grid_M, 1);
         MTL::Size threadgroup_size = MTL::Size::Make(16, 16, 1);
+        mark_kernel(kernel_name);
         encoder->dispatchThreads(grid_size, threadgroup_size);
         post_dispatch(kernel_name);
 
@@ -376,6 +393,7 @@ public:
         uint32_t grid_M = (M + 3) / 4;
         MTL::Size grid_size = MTL::Size::Make(N, grid_M, 1);
         MTL::Size threadgroup_size = MTL::Size::Make(32, 1, 1);  // 1 simdgroup
+        mark_kernel(kernel_name);
         encoder->dispatchThreadgroups(grid_size, threadgroup_size);
         post_dispatch(kernel_name);
 
@@ -422,6 +440,7 @@ public:
 
         // 128 threads per threadgroup (4 simdgroups of 32 threads)
         MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
+        mark_kernel(kernel_name);
         encoder->dispatchThreadgroups(grid_size, threadgroup_size);
         post_dispatch(kernel_name);
 
@@ -468,6 +487,7 @@ public:
         MTL::Size grid_size = MTL::Size::Make(num_m_tiles, num_n_tiles, 2);
 
         MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
+        mark_kernel(kernel_name);
         encoder->dispatchThreadgroups(grid_size, threadgroup_size);
         post_dispatch(kernel_name);
 
@@ -501,6 +521,7 @@ public:
         uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
         MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
         MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+        mark_kernel(kernel_name);
         encoder->dispatchThreadgroups(grid_size, threadgroup_size);
         post_dispatch(kernel_name);
 
@@ -531,6 +552,7 @@ public:
         uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
         MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
         MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+        mark_kernel(kernel_name);
         encoder->dispatchThreadgroups(grid_size, threadgroup_size);
         post_dispatch(kernel_name);
 
@@ -948,6 +970,8 @@ std::vector<MetalCompute::KernelTiming> MetalCompute::get_kernel_timing_stats() 
     return entries;
 }
 
+void MetalCompute::enable_debug_markers(bool enable) { impl_->enable_debug_markers(enable); }
+
 // GPU Capture API for Xcode profiler
 bool MetalCompute::begin_capture(const char* capture_path) {
     auto* capture_manager = MTL::CaptureManager::sharedCaptureManager();
@@ -1353,6 +1377,7 @@ Result<void> MetalCompute::matvec_f16(
     // One SIMD group per output row.
     MTL::Size grid_size = MTL::Size::Make(N, 1, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(32, 1, 1);
+    impl_->mark_kernel("matvec_f16");
     encoder->dispatchThreadgroups(grid_size, threadgroup_size);
     impl_->post_dispatch("matvec_f16");
 
@@ -1393,6 +1418,7 @@ Result<void> MetalCompute::matmul_f16(
             uint32_t num_n_tiles = (N + NR0 - 1) / NR0;
             MTL::Size grid_size = MTL::Size::Make(num_m_tiles, num_n_tiles, 1);
             MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
+            impl_->mark_kernel(kernel_name);
             encoder->dispatchThreadgroups(grid_size, threadgroup_size);
             impl_->post_dispatch(kernel_name);
 
@@ -1426,6 +1452,7 @@ Result<void> MetalCompute::matmul_f16(
         uint32_t grid_y = (M + tile - 1) / tile;
         MTL::Size grid_size = MTL::Size::Make(grid_x, grid_y, 1);
         MTL::Size threadgroup_size = MTL::Size::Make(tile, tile, 1);
+        impl_->mark_kernel("matmul_f16_tiled");
         encoder->dispatchThreadgroups(grid_size, threadgroup_size);
         impl_->post_dispatch("matmul_f16_tiled");
 
@@ -1460,6 +1487,7 @@ Result<void> MetalCompute::rms_norm(
 
     MTL::Size grid_size = MTL::Size::Make(size, 1, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    impl_->mark_kernel("rms_norm");
     encoder->dispatchThreads(grid_size, threadgroup_size);
     impl_->post_dispatch("rms_norm");
 
@@ -1485,6 +1513,7 @@ Result<void> MetalCompute::rms_norm_f16(
 
     MTL::Size grid_size = MTL::Size::Make(size, 1, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    impl_->mark_kernel("rms_norm_f16");
     encoder->dispatchThreads(grid_size, threadgroup_size);
     impl_->post_dispatch("rms_norm_f16");
 
@@ -1512,6 +1541,7 @@ Result<void> MetalCompute::rms_norm_batch(
     // One threadgroup per token
     MTL::Size grid_size = MTL::Size::Make(batch_size, 1, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    impl_->mark_kernel("rms_norm_batch");
     encoder->dispatchThreadgroups(grid_size, threadgroup_size);
     impl_->post_dispatch("rms_norm_batch");
 
@@ -1539,6 +1569,7 @@ Result<void> MetalCompute::rms_norm_batch_f16(
     // One threadgroup per token
     MTL::Size grid_size = MTL::Size::Make(batch_size, 1, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    impl_->mark_kernel("rms_norm_batch_f16");
     encoder->dispatchThreadgroups(grid_size, threadgroup_size);
     impl_->post_dispatch("rms_norm_batch_f16");
 
@@ -1565,6 +1596,7 @@ Result<void> MetalCompute::rms_norm_batch_f32_to_f16(
 
     MTL::Size grid_size = MTL::Size::Make(batch_size, 1, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    impl_->mark_kernel("rms_norm_batch_f32_to_f16");
     encoder->dispatchThreadgroups(grid_size, threadgroup_size);
     impl_->post_dispatch("rms_norm_batch_f32_to_f16");
 
@@ -1591,6 +1623,7 @@ Result<void> MetalCompute::rms_norm_batch_f16w_to_f16(
 
     MTL::Size grid_size = MTL::Size::Make(batch_size, 1, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    impl_->mark_kernel("rms_norm_batch_f16w_to_f16");
     encoder->dispatchThreadgroups(grid_size, threadgroup_size);
     impl_->post_dispatch("rms_norm_batch_f16w_to_f16");
 
@@ -1615,6 +1648,7 @@ Result<void> MetalCompute::silu(MTL::Buffer* x, uint32_t size) {
 
     MTL::Size grid_size = MTL::Size::Make(size, 1, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    impl_->mark_kernel("silu");
     encoder->dispatchThreads(grid_size, threadgroup_size);
     impl_->post_dispatch("silu");
 
@@ -1638,6 +1672,7 @@ Result<void> MetalCompute::elementwise_mul(
 
     MTL::Size grid_size = MTL::Size::Make(size, 1, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    impl_->mark_kernel("elementwise_mul");
     encoder->dispatchThreads(grid_size, threadgroup_size);
     impl_->post_dispatch("elementwise_mul");
 
@@ -1663,6 +1698,7 @@ Result<void> MetalCompute::rope(
 
     MTL::Size grid_size = MTL::Size::Make(head_dim / 2, seq_len, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(32, 1, 1);
+    impl_->mark_kernel("rope");
     encoder->dispatchThreads(grid_size, threadgroup_size);
     impl_->post_dispatch("rope");
 
@@ -1686,6 +1722,7 @@ Result<void> MetalCompute::elementwise_add(
 
     MTL::Size grid_size = MTL::Size::Make(size, 1, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    impl_->mark_kernel("elementwise_add");
     encoder->dispatchThreads(grid_size, threadgroup_size);
     impl_->post_dispatch("elementwise_add");
 
@@ -1708,6 +1745,7 @@ Result<void> MetalCompute::convert_f32_to_f16(
 
     MTL::Size grid_size = MTL::Size::Make(size, 1, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    impl_->mark_kernel("convert_f32_to_f16");
     encoder->dispatchThreads(grid_size, threadgroup_size);
     impl_->post_dispatch("convert_f32_to_f16");
 
@@ -1739,6 +1777,7 @@ Result<void> MetalCompute::rope_multihead(
     // Grid: [head_dim/2, seq_len, num_heads_q + num_heads_k]
     MTL::Size grid_size = MTL::Size::Make(head_dim / 2, seq_len, num_heads_q + num_heads_k);
     MTL::Size threadgroup_size = MTL::Size::Make(32, 1, 1);
+    impl_->mark_kernel("rope_multihead");
     encoder->dispatchThreads(grid_size, threadgroup_size);
     impl_->post_dispatch("rope_multihead");
 
@@ -1760,6 +1799,7 @@ Result<void> MetalCompute::softmax(MTL::Buffer* x, uint32_t M, uint32_t N)
 
     MTL::Size grid_size = MTL::Size::Make(N, M, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    impl_->mark_kernel("softmax_row");
     encoder->dispatchThreads(grid_size, threadgroup_size);
     impl_->post_dispatch("softmax_row");
 
@@ -1789,6 +1829,7 @@ Result<void> MetalCompute::silu_mul(
 
     MTL::Size grid_size = MTL::Size::Make(size, 1, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    impl_->mark_kernel("silu_mul");
     encoder->dispatchThreads(grid_size, threadgroup_size);
     impl_->post_dispatch("silu_mul");
 
@@ -1908,6 +1949,7 @@ Result<void> MetalCompute::rms_norm_dual_matvec_q4k(
     uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
     MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    impl_->mark_kernel("rms_norm_dual_matvec_q4k");
     encoder->dispatchThreadgroups(grid_size, threadgroup_size);
     impl_->post_dispatch("rms_norm_dual_matvec_q4k");
 
@@ -1941,6 +1983,7 @@ Result<void> MetalCompute::rms_norm_dual_matvec_q3k(
     uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
     MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    impl_->mark_kernel("rms_norm_dual_matvec_q3k");
     encoder->dispatchThreadgroups(grid_size, threadgroup_size);
     impl_->post_dispatch("rms_norm_dual_matvec_q3k");
 
@@ -1974,6 +2017,7 @@ Result<void> MetalCompute::rms_norm_dual_matvec_q2k(
     uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
     MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    impl_->mark_kernel("rms_norm_dual_matvec_q2k");
     encoder->dispatchThreadgroups(grid_size, threadgroup_size);
     impl_->post_dispatch("rms_norm_dual_matvec_q2k");
 
@@ -2040,12 +2084,14 @@ Result<void> MetalCompute::attention_single_head(
         // Decode mode: single query token
         MTL::Size grid_size = MTL::Size::Make(head_dim, 1, 1);
         MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
+        impl_->mark_kernel("attention_decode");
         encoder->dispatchThreads(grid_size, threadgroup_size);
         impl_->post_dispatch("attention_decode");
     } else {
         // Prefill mode: multiple query tokens
         MTL::Size grid_size = MTL::Size::Make(head_dim, seq_q, 1);
         MTL::Size threadgroup_size = MTL::Size::Make(32, 4, 1);
+        impl_->mark_kernel("attention_decode");
         encoder->dispatchThreads(grid_size, threadgroup_size);
         impl_->post_dispatch("attention_decode");
     }
@@ -2111,6 +2157,7 @@ Result<void> MetalCompute::kv_cache_append(
     encoder->setBytes(&current_len, sizeof(current_len), 4);
     encoder->setBytes(&new_len, sizeof(new_len), 5);
     encoder->setBytes(&max_seq_len, sizeof(max_seq_len), 6);
+    impl_->mark_kernel(kernel_name);
     encoder->dispatchThreads(grid_size, threadgroup_size);
     impl_->post_dispatch(kernel_name);
 
@@ -2123,6 +2170,7 @@ Result<void> MetalCompute::kv_cache_append(
     encoder->setBytes(&current_len, sizeof(current_len), 4);
     encoder->setBytes(&new_len, sizeof(new_len), 5);
     encoder->setBytes(&max_seq_len, sizeof(max_seq_len), 6);
+    impl_->mark_kernel(kernel_name);
     encoder->dispatchThreads(grid_size, threadgroup_size);
     impl_->post_dispatch(kernel_name);
 
@@ -2211,6 +2259,7 @@ Result<void> MetalCompute::multihead_attention(
         // One threadgroup per head
         MTL::Size grid_size = MTL::Size::Make(num_heads, 1, 1);
         MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
+        impl_->mark_kernel(kernel_name);
         encoder->dispatchThreadgroups(grid_size, threadgroup_size);
         impl_->post_dispatch(kernel_name);
     } else {
@@ -2251,6 +2300,7 @@ Result<void> MetalCompute::multihead_attention(
         uint32_t num_q_blocks = (seq_q + Q_TILE - 1) / Q_TILE;
         MTL::Size grid_size = MTL::Size::Make(num_heads, num_q_blocks, 1);
         MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
+        impl_->mark_kernel("flash_attention_prefill");
         encoder->dispatchThreadgroups(grid_size, threadgroup_size);
         impl_->post_dispatch("flash_attention_prefill");
     }
@@ -2283,6 +2333,7 @@ Result<void> MetalCompute::embedding_lookup(
 
     MTL::Size grid_size = MTL::Size::Make(hidden_dim, num_tokens, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
+    impl_->mark_kernel("embedding_lookup");
     encoder->dispatchThreads(grid_size, threadgroup_size);
     impl_->post_dispatch("embedding_lookup");
 
@@ -2328,6 +2379,7 @@ Result<void> MetalCompute::fused_qkv_matvec_q4k(
 
     MTL::Size grid_size = MTL::Size::Make(total_threadgroups, 1, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(64, 1, 1);  // 2 SIMD groups * 32 threads
+    impl_->mark_kernel("fused_qkv_matvec_q4k");
     encoder->dispatchThreadgroups(grid_size, threadgroup_size);
     impl_->post_dispatch("fused_qkv_matvec_q4k");
 
@@ -2374,6 +2426,7 @@ Result<void> MetalCompute::attention_tree(
         // Each threadgroup handles one (head, node) pair
         MTL::Size grid_size = MTL::Size::Make(num_heads, num_nodes, 1);
         MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
+        impl_->mark_kernel("attention_tree_f16kv");
         encoder->dispatchThreadgroups(grid_size, threadgroup_size);
         impl_->post_dispatch("attention_tree_f16kv");
     } else {
@@ -2397,6 +2450,7 @@ Result<void> MetalCompute::attention_tree(
 
         MTL::Size grid_size = MTL::Size::Make(num_heads, num_nodes, 1);
         MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
+        impl_->mark_kernel("attention_tree_nocontext_f16kv");
         encoder->dispatchThreadgroups(grid_size, threadgroup_size);
         impl_->post_dispatch("attention_tree_nocontext_f16kv");
     }
@@ -2466,6 +2520,7 @@ Result<void> MetalCompute::paged_attention_decode(
 
         MTL::Size grid_size = MTL::Size::Make(num_heads, 1, 1);
         MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
+        impl_->mark_kernel("paged_attention_decode");
         encoder->dispatchThreadgroups(grid_size, threadgroup_size);
         impl_->post_dispatch("paged_attention_decode");
         return {};
@@ -2488,6 +2543,7 @@ Result<void> MetalCompute::paged_attention_decode(
     // One threadgroup per head, 128 threads (4 simdgroups)
     MTL::Size grid_size = MTL::Size::Make(num_heads, 1, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
+    impl_->mark_kernel(kernel_name);
     encoder->dispatchThreadgroups(grid_size, threadgroup_size);
     impl_->post_dispatch(kernel_name);
 
@@ -2522,6 +2578,7 @@ Result<void> MetalCompute::paged_kv_cache_append(
     // Grid: [head_dim, new_len, num_kv_heads]
     MTL::Size grid_size = MTL::Size::Make(head_dim, new_len, num_kv_heads);
     MTL::Size threadgroup_size = MTL::Size::Make(32, 1, 1);
+    impl_->mark_kernel("paged_kv_cache_append");
     encoder->dispatchThreads(grid_size, threadgroup_size);
     impl_->post_dispatch("paged_kv_cache_append");
 
@@ -2561,6 +2618,7 @@ Result<void> MetalCompute::batched_paged_attention_decode(
     // Grid: [num_heads, batch_size]
     MTL::Size grid_size = MTL::Size::Make(num_heads, batch_size, 1);
     MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
+    impl_->mark_kernel("batched_paged_attention_decode");
     encoder->dispatchThreadgroups(grid_size, threadgroup_size);
     impl_->post_dispatch("batched_paged_attention_decode");
 
@@ -2604,6 +2662,11 @@ MetalCompute* get_metal_compute() {
                 GRANITE_LOG_ERROR("Failed to initialize MetalCompute: {}",
                                  result.error().message());
                 g_metal_compute.reset();
+            } else {
+                const char* env = std::getenv("GRANITE_METAL_DEBUG_MARKERS");
+                if (env && *env && std::atoi(env) != 0) {
+                    g_metal_compute->enable_debug_markers(true);
+                }
             }
         }
     });

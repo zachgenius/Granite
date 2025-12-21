@@ -21,6 +21,42 @@
 
 namespace granite {
 
+namespace {
+
+Result<void> validate_token_ids(const Tensor& token_ids,
+                                IComputeBackend* backend,
+                                const ModelConfig& config,
+                                int start_pos,
+                                const char* context) {
+    if (token_ids.ndim() != 2) {
+        return Error(ErrorCode::InvalidShape,
+                     std::string(context) + ": token_ids must be 2D [batch, seq]");
+    }
+    if (token_ids.dtype() != DataType::INT32) {
+        return Error(ErrorCode::DTypeMismatch,
+                     std::string(context) + ": token_ids must be INT32");
+    }
+    if (token_ids.size(0) <= 0 || token_ids.size(1) <= 0) {
+        return Error(ErrorCode::InvalidShape,
+                     std::string(context) + ": token_ids has empty dimensions");
+    }
+    if (backend && token_ids.backend() && token_ids.backend() != backend) {
+        return Error(ErrorCode::InvalidArgument,
+                     std::string(context) + ": token_ids backend mismatch");
+    }
+    if (start_pos < 0) {
+        return Error(ErrorCode::InvalidArgument,
+                     std::string(context) + ": start_pos must be non-negative");
+    }
+    if (config.vocab_size <= 0) {
+        return Error(ErrorCode::InvalidState,
+                     std::string(context) + ": model vocab_size is invalid");
+    }
+    return {};
+}
+
+}  // namespace
+
 // =============================================================================
 // SECTION 1: Model Loading & Initialization
 // =============================================================================
@@ -326,9 +362,18 @@ Result<Tensor> TransformerModel::forward(
     KVCache* kv_cache,
     int start_pos)
 {
+    auto validate_result = validate_token_ids(token_ids, backend_, model_config_, start_pos, "forward");
+    if (!validate_result.ok()) {
+        return validate_result.error();
+    }
+
     int batch = static_cast<int>(token_ids.size(0));
     int seq_len = static_cast<int>(token_ids.size(1));
     int total_tokens = batch * seq_len;
+    if (kv_cache && start_pos + seq_len > kv_cache->max_seq_len()) {
+        GRANITE_FAIL(ErrorCode::InvalidArgument,
+                     "forward: kv_cache too small for requested sequence");
+    }
 
 #ifdef GRANITE_HAS_METAL
     // =========================================================================
@@ -604,6 +649,10 @@ Result<Tensor> TransformerModel::forward(
 }
 
 Result<Tensor> TransformerModel::forward_single(int32_t token_id, KVCache& kv_cache) {
+    if (token_id < 0 || token_id >= model_config_.vocab_size) {
+        GRANITE_LOG_WARN("forward_single: token_id {} out of range [0, {})",
+                         token_id, model_config_.vocab_size);
+    }
     // Create single-token tensor
     std::vector<int64_t> ids_shape = {1, 1};
     auto ids_result = Tensor::allocate(ids_shape, DataType::INT32, backend_);
@@ -630,6 +679,9 @@ Result<Tensor> TransformerModel::forward_batch(
 {
     if (tokens.empty()) {
         GRANITE_FAIL(ErrorCode::InvalidArgument, "Empty token batch");
+    }
+    if (start_pos < 0) {
+        GRANITE_FAIL(ErrorCode::InvalidArgument, "forward_batch: start_pos must be non-negative");
     }
 
     int num_tokens = static_cast<int>(tokens.size());
@@ -670,8 +722,18 @@ Result<Tensor> TransformerModel::forward_tree(
         GRANITE_FAIL(ErrorCode::InvalidArgument,
                      "Tokens and parent_indices must have same size");
     }
+    if (start_pos < 0) {
+        GRANITE_FAIL(ErrorCode::InvalidArgument, "forward_tree: start_pos must be non-negative");
+    }
 
     int num_nodes = static_cast<int>(tokens.size());
+    for (int i = 0; i < num_nodes; i++) {
+        int parent = parent_indices[i];
+        if (parent < -1 || parent >= num_nodes) {
+            GRANITE_FAIL(ErrorCode::InvalidArgument,
+                         "forward_tree: parent index out of range");
+        }
+    }
 
     // Check if GPU path is available
     bool use_gpu = false;

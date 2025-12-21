@@ -58,6 +58,8 @@ public:
     void reset_kernel_timing();
     std::vector<KernelTiming> get_kernel_timing_stats() const;
 
+    void enable_debug_markers(bool enable);
+
     // GPU Capture API (for Xcode GPU profiler)
     // Captures a GPU trace that can be opened in Xcode for detailed analysis
     bool begin_capture(const char* capture_path = nullptr);  // nullptr = default path

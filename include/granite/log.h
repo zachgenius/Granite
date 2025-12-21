@@ -3,7 +3,32 @@
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
+#include <algorithm>
+#include <cstdlib>
+#include <string>
+
 namespace granite {
+
+inline spdlog::level::level_enum parse_log_level(std::string level) {
+    std::transform(level.begin(), level.end(), level.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (level == "trace") return spdlog::level::trace;
+    if (level == "debug") return spdlog::level::debug;
+    if (level == "info") return spdlog::level::info;
+    if (level == "warn" || level == "warning") return spdlog::level::warn;
+    if (level == "error") return spdlog::level::err;
+    if (level == "critical") return spdlog::level::critical;
+    if (level == "off") return spdlog::level::off;
+    return spdlog::level::info;
+}
+
+inline spdlog::level::level_enum log_level_from_env() {
+    const char* env = std::getenv("GRANITE_LOG_LEVEL");
+    if (env && *env) {
+        return parse_log_level(env);
+    }
+    return spdlog::level::info;
+}
 
 /// Initialize the logging system
 inline void init_logging(spdlog::level::level_enum level = spdlog::level::info) {
@@ -17,7 +42,7 @@ inline void init_logging(spdlog::level::level_enum level = spdlog::level::info) 
 inline std::shared_ptr<spdlog::logger> get_logger() {
     auto logger = spdlog::get("granite");
     if (!logger) {
-        init_logging();
+        init_logging(log_level_from_env());
         logger = spdlog::get("granite");
     }
     return logger;
