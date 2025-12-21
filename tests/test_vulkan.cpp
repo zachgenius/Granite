@@ -118,7 +118,8 @@ TEST_CASE("Vulkan backend initialization", "[vulkan]") {
     REQUIRE(fixture.backend()->is_initialized());
 
     auto caps = fixture.backend()->get_capabilities();
-    REQUIRE(!caps.name.empty());
+    REQUIRE(caps.name != nullptr);
+    REQUIRE(std::strlen(caps.name) > 0);
 
     INFO("Vulkan device: " << caps.name);
     INFO("Max buffer size: " << caps.max_buffer_size);
@@ -143,7 +144,7 @@ TEST_CASE("Vulkan buffer operations", "[vulkan]") {
         REQUIRE(result.ok());
 
         BufferHandle handle = result.value();
-        REQUIRE(handle != 0);
+        REQUIRE(handle.valid());
 
         backend->destroy_buffer(handle);
     }

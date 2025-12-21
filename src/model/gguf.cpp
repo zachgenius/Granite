@@ -826,7 +826,8 @@ Result<Tensor> ModelLoader::load_tensor(
     if (dtype) {
         // Direct copy for non-quantized types
         BufferDesc desc = BufferDesc::managed(info->size_bytes());
-        Result<BufferHandle> buffer_result;
+        Result<BufferHandle> buffer_result = Error(ErrorCode::InternalError,
+                                                   "Uninitialized buffer result");
         bool needs_write = !use_memory_mapping_;
 
         if (use_memory_mapping_) {

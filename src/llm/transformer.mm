@@ -100,7 +100,8 @@ Result<TransformerModel> TransformerModel::load(
         desc.size = info.size_bytes();
         desc.memory_type = MemoryType::Shared;
 
-        Result<BufferHandle> buf_result;
+        Result<BufferHandle> buf_result = Error(ErrorCode::InternalError,
+                                                "Uninitialized buffer result");
         bool needs_write = true;
         const void* tensor_data = model.gguf_->tensor_data(info);
 

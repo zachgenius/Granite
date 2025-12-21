@@ -158,7 +158,7 @@ public:
             if (!buffer_result.ok()) {
                 return buffer_result.error();
             }
-            auto write_result = write_buffer(buffer_result.value(), data, desc.size);
+            auto write_result = write_buffer(buffer_result.value(), data, desc.size, 0);
             if (!write_result.ok()) {
                 destroy_buffer(buffer_result.value());
                 return write_result.error();

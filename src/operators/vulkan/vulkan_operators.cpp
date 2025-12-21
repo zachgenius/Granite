@@ -5,12 +5,13 @@
 
 #include "granite/operators.h"
 #include "granite/log.h"
-#include "vulkan_compute.h"
+#include "backend/vulkan/vulkan_compute.h"
 
 #ifdef GRANITE_HAS_VULKAN
 
 #include <vulkan/vulkan.h>
 #include <limits>
+#include <algorithm>
 
 namespace granite {
 
@@ -42,7 +43,10 @@ public:
             ctx.inputs[1].dtype() != DataType::FP32) {
             return Error(ErrorCode::NotImplemented, "Vulkan ops only support FP32");
         }
-        if (ctx.inputs[0].shape() != ctx.inputs[1].shape()) {
+        auto shape_a = ctx.inputs[0].shape();
+        auto shape_b = ctx.inputs[1].shape();
+        if (shape_a.size() != shape_b.size() ||
+            !std::equal(shape_a.begin(), shape_a.end(), shape_b.begin())) {
             return Error(ErrorCode::InvalidShape, "Vulkan ops require matching shapes");
         }
         return {};
@@ -73,7 +77,7 @@ public:
         auto* buf_b = static_cast<VkBuffer>(ctx.backend->get_native_buffer(b.buffer()));
         auto* buf_out = static_cast<VkBuffer>(ctx.backend->get_native_buffer(out.buffer()));
         if (!buf_a || !buf_b || !buf_out) {
-            return Error(ErrorCode::InvalidHandle, "Invalid Vulkan buffer handle");
+            return Error(ErrorCode::InvalidArgument, "Invalid Vulkan buffer handle");
         }
 
         if constexpr (Op == OpType::Add) {
@@ -129,7 +133,7 @@ public:
         auto* buf_x = static_cast<VkBuffer>(ctx.backend->get_native_buffer(x.buffer()));
         auto* buf_out = static_cast<VkBuffer>(ctx.backend->get_native_buffer(out.buffer()));
         if (!buf_x || !buf_out) {
-            return Error(ErrorCode::InvalidHandle, "Invalid Vulkan buffer handle");
+            return Error(ErrorCode::InvalidArgument, "Invalid Vulkan buffer handle");
         }
 
         if constexpr (Op == OpType::SiLU) {
@@ -198,7 +202,7 @@ public:
         auto* buf_w = static_cast<VkBuffer>(ctx.backend->get_native_buffer(w.buffer()));
         auto* buf_out = static_cast<VkBuffer>(ctx.backend->get_native_buffer(out.buffer()));
         if (!buf_x || !buf_w || !buf_out) {
-            return Error(ErrorCode::InvalidHandle, "Invalid Vulkan buffer handle");
+            return Error(ErrorCode::InvalidArgument, "Invalid Vulkan buffer handle");
         }
 
         double eps = ctx.attrs.get<double>("eps", 1e-5);
@@ -265,7 +269,7 @@ public:
         auto* buf_x = static_cast<VkBuffer>(ctx.backend->get_native_buffer(x.buffer()));
         auto* buf_out = static_cast<VkBuffer>(ctx.backend->get_native_buffer(out.buffer()));
         if (!buf_x || !buf_out) {
-            return Error(ErrorCode::InvalidHandle, "Invalid Vulkan buffer handle");
+            return Error(ErrorCode::InvalidArgument, "Invalid Vulkan buffer handle");
         }
 
         return compute->softmax_rows(

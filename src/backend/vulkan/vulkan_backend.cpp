@@ -118,11 +118,32 @@ public:
         app_info.applicationVersion = VK_MAKE_VERSION(0, 1, 0);
         app_info.pEngineName = "Granite";
         app_info.engineVersion = VK_MAKE_VERSION(0, 1, 0);
-        app_info.apiVersion = VK_API_VERSION_1_0;
+        app_info.apiVersion = VK_API_VERSION_1_1;
 
         VkInstanceCreateInfo create_info{};
         create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
         create_info.pApplicationInfo = &app_info;
+
+        // Enable portability enumeration when available (required for MoltenVK)
+        std::vector<const char*> instance_extensions;
+        uint32_t extension_count = 0;
+        if (vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, nullptr) == VK_SUCCESS &&
+            extension_count > 0) {
+            std::vector<VkExtensionProperties> extensions(extension_count);
+            if (vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, extensions.data()) == VK_SUCCESS) {
+                for (const auto& ext : extensions) {
+                    if (std::strcmp(ext.extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0) {
+                        instance_extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+                        create_info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+                    }
+                }
+            }
+        }
+
+        if (!instance_extensions.empty()) {
+            create_info.enabledExtensionCount = static_cast<uint32_t>(instance_extensions.size());
+            create_info.ppEnabledExtensionNames = instance_extensions.data();
+        }
 
         // Enable validation layers in debug builds
 #ifndef NDEBUG
@@ -326,7 +347,7 @@ public:
 
         vkBindBufferMemory(device_, buffer, memory, 0);
 
-        BufferHandle handle = next_handle_++;
+        BufferHandle handle{next_handle_++};
         buffers_[handle] = buffer;
         buffer_memory_[handle] = memory;
         buffer_sizes_[handle] = desc.size;
@@ -354,18 +375,18 @@ public:
     Result<void*> map_buffer(BufferHandle handle) override {
         auto memory_it = buffer_memory_.find(handle);
         if (memory_it == buffer_memory_.end()) {
-            return Error(ErrorCode::InvalidHandle, "Buffer not found");
+            return Error(ErrorCode::InvalidArgument, "Buffer not found");
         }
 
         auto size_it = buffer_sizes_.find(handle);
         if (size_it == buffer_sizes_.end()) {
-            return Error(ErrorCode::InvalidHandle, "Buffer size not found");
+            return Error(ErrorCode::InvalidArgument, "Buffer size not found");
         }
 
         void* data;
         VkResult result = vkMapMemory(device_, memory_it->second, 0, size_it->second, 0, &data);
         if (result != VK_SUCCESS) {
-            return Error(ErrorCode::MapFailed, "Failed to map buffer memory");
+            return Error(ErrorCode::InternalError, "Failed to map buffer memory");
         }
 
         return data;
@@ -405,7 +426,7 @@ public:
         auto dst_it = buffers_.find(dst);
 
         if (src_it == buffers_.end() || dst_it == buffers_.end()) {
-            return Error(ErrorCode::InvalidHandle, "Buffer not found");
+            return Error(ErrorCode::InvalidArgument, "Buffer not found");
         }
 
         // Create one-time command buffer
@@ -608,7 +629,7 @@ public:
     Result<void> bind_pipeline(PipelineHandle handle) override {
         auto it = pipelines_.find(handle);
         if (it == pipelines_.end()) {
-            return Error(ErrorCode::InvalidHandle, "Pipeline not found");
+            return Error(ErrorCode::InvalidArgument, "Pipeline not found");
         }
 
         current_pipeline_ = it->second;
@@ -616,7 +637,7 @@ public:
 
         auto layout_it = pipeline_layouts_.find(handle);
         if (layout_it == pipeline_layouts_.end()) {
-            return Error(ErrorCode::InvalidHandle, "Pipeline layout not found");
+            return Error(ErrorCode::InvalidArgument, "Pipeline layout not found");
         }
         current_pipeline_layout_ = layout_it->second;
 
@@ -647,12 +668,12 @@ public:
 
         auto buffer_it = buffers_.find(handle);
         if (buffer_it == buffers_.end()) {
-            return Error(ErrorCode::InvalidHandle, "Buffer not found");
+            return Error(ErrorCode::InvalidArgument, "Buffer not found");
         }
 
         auto size_it = buffer_sizes_.find(handle);
         if (size_it == buffer_sizes_.end()) {
-            return Error(ErrorCode::InvalidHandle, "Buffer size not found");
+            return Error(ErrorCode::InvalidArgument, "Buffer size not found");
         }
 
         VkDescriptorBufferInfo buffer_info{};
@@ -759,7 +780,7 @@ public:
             return Error(ErrorCode::InternalError, "Failed to create fence");
         }
 
-        FenceHandle handle = next_handle_++;
+        FenceHandle handle{next_handle_++};
         fences_[handle] = fence;
         return handle;
     }
@@ -767,7 +788,7 @@ public:
     Result<void> wait_fence(FenceHandle handle, uint64_t timeout_ns) override {
         auto it = fences_.find(handle);
         if (it == fences_.end()) {
-            return Error(ErrorCode::InvalidHandle, "Fence not found");
+            return Error(ErrorCode::InvalidArgument, "Fence not found");
         }
 
         VkResult result = vkWaitForFences(device_, 1, &it->second, VK_TRUE, timeout_ns);
