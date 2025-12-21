@@ -9,6 +9,7 @@
 #   ./scripts/build_android.sh                    # Uses $ANDROID_NDK
 #   ./scripts/build_android.sh /path/to/ndk      # Explicit NDK path
 #   ./scripts/build_android.sh --abi=x86_64      # Build for x86_64 emulator
+#   ./scripts/build_android.sh --precompile-shaders  # Precompile SPIR-V shaders
 
 set -e
 
@@ -20,6 +21,9 @@ BUILD_TYPE="Release"
 ANDROID_ABI="arm64-v8a"
 ANDROID_PLATFORM="android-26"  # Vulkan 1.0 requires API 24+, use 26 for better support
 BUILD_DIR="build-android"
+PRECOMPILE_SHADERS=0
+SPIRV_OUT_DIR="$PROJECT_ROOT/shaders/vulkan/spv"
+EXTRA_CMAKE_ARGS=()
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -44,6 +48,14 @@ while [[ $# -gt 0 ]]; do
             CLEAN_BUILD=1
             shift
             ;;
+        --precompile-shaders)
+            PRECOMPILE_SHADERS=1
+            shift
+            ;;
+        --spirv-dir=*)
+            SPIRV_OUT_DIR="${1#*=}"
+            shift
+            ;;
         --help|-h)
             echo "Usage: $0 [OPTIONS] [NDK_PATH]"
             echo ""
@@ -56,6 +68,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --build-dir=DIR    Build directory name"
             echo "                     Default: build-android"
             echo "  --clean            Clean build directory before building"
+            echo "  --precompile-shaders  Precompile Vulkan shaders to SPIR-V"
+            echo "  --spirv-dir=DIR    Output directory for SPIR-V (default: shaders/vulkan/spv)"
             echo "  --help, -h         Show this help message"
             echo ""
             echo "Environment:"
@@ -114,7 +128,16 @@ echo "Target ABI:      $ANDROID_ABI"
 echo "API Level:       $ANDROID_PLATFORM"
 echo "Build Type:      $BUILD_TYPE"
 echo "Build Directory: $PROJECT_ROOT/$BUILD_DIR"
+echo "Precompile SPIR-V: $PRECOMPILE_SHADERS"
+echo "SPIR-V Output:  $SPIRV_OUT_DIR"
 echo "========================================"
+
+if [[ "$PRECOMPILE_SHADERS" -eq 1 ]]; then
+    echo ""
+    echo "Precompiling Vulkan shaders..."
+    "$SCRIPT_DIR/precompile_vulkan_shaders.sh" --out-dir="$SPIRV_OUT_DIR"
+    EXTRA_CMAKE_ARGS+=("-DGRANITE_VULKAN_PRECOMPILED_DIR=$SPIRV_OUT_DIR")
+fi
 
 cd "$PROJECT_ROOT"
 
@@ -137,7 +160,8 @@ cmake -B "$BUILD_DIR" \
     -DGRANITE_BUILD_CPU=ON \
     -DGRANITE_BUILD_COREML=OFF \
     -DGRANITE_BUILD_TESTS=OFF \
-    -DGRANITE_BUILD_EXAMPLES=ON
+    -DGRANITE_BUILD_EXAMPLES=ON \
+    "${EXTRA_CMAKE_ARGS[@]}"
 
 # Build
 echo ""
@@ -158,3 +182,7 @@ echo "To run on device:"
 echo "  adb push $BUILD_DIR/granite_main /data/local/tmp/"
 echo "  adb push /path/to/model.gguf /data/local/tmp/"
 echo "  adb shell /data/local/tmp/granite_main /data/local/tmp/model.gguf"
+if [[ "$PRECOMPILE_SHADERS" -eq 1 ]]; then
+    echo "  adb push $SPIRV_OUT_DIR /data/local/tmp/granite_spv"
+    echo "  adb shell 'export GRANITE_VULKAN_PRECOMPILED_DIR=/data/local/tmp/granite_spv; /data/local/tmp/granite_main /data/local/tmp/model.gguf'"
+fi

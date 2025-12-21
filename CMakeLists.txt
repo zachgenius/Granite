@@ -210,6 +210,7 @@ endif()
 # =============================================================================
 
 option(GRANITE_WITH_SHADERC "Enable runtime shader compilation with shaderc" OFF)
+set(GRANITE_VULKAN_PRECOMPILED_DIR "" CACHE PATH "Directory for precompiled Vulkan SPIR-V shaders")
 
 if(GRANITE_BUILD_VULKAN)
     find_package(Vulkan REQUIRED)
@@ -229,6 +230,9 @@ if(GRANITE_BUILD_VULKAN)
 
     target_compile_definitions(granite PUBLIC GRANITE_HAS_VULKAN=1)
     target_compile_definitions(granite PRIVATE GRANITE_VULKAN_SHADER_DIR="${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan")
+    if(GRANITE_VULKAN_PRECOMPILED_DIR)
+        target_compile_definitions(granite PRIVATE GRANITE_VULKAN_PRECOMPILED_DIR="${GRANITE_VULKAN_PRECOMPILED_DIR}")
+    endif()
 
     # Optional: Link shaderc for runtime shader compilation
     if(GRANITE_WITH_SHADERC)

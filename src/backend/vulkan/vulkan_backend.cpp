@@ -15,6 +15,7 @@
 #include <atomic>
 #include <string>
 #include <vector>
+#include <optional>
 #include <cstring>
 #include <fstream>
 #include <filesystem>
@@ -167,6 +168,8 @@ public:
             return device_result.error();
         }
 
+        detect_memory_properties();
+
         // Create logical device with compute queue
         auto logical_result = create_logical_device();
         if (!logical_result.ok()) {
@@ -317,20 +320,30 @@ public:
         VkMemoryRequirements mem_requirements;
         vkGetBufferMemoryRequirements(device_, buffer, &mem_requirements);
 
-        VkMemoryPropertyFlags memory_flags;
+        VkMemoryPropertyFlags required_flags;
+        VkMemoryPropertyFlags preferred_flags = 0;
         switch (desc.memory_type) {
             case MemoryType::Device:
-                memory_flags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+                required_flags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+                if (supports_unified_memory_) {
+                    preferred_flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+                }
                 break;
             case MemoryType::Shared:
             case MemoryType::Managed:
             default:
-                memory_flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+                required_flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+                if (supports_unified_memory_) {
+                    preferred_flags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+                }
                 break;
         }
 
-        uint32_t memory_type_index = find_memory_type(mem_requirements.memoryTypeBits, memory_flags);
+        uint32_t memory_type_index = find_memory_type(mem_requirements.memoryTypeBits,
+                                                      required_flags,
+                                                      preferred_flags);
         if (memory_type_index == UINT32_MAX) {
             vkDestroyBuffer(device_, buffer, nullptr);
             return Error(ErrorCode::AllocationFailed, "No suitable memory type found");
@@ -354,6 +367,7 @@ public:
         buffers_[handle] = buffer;
         buffer_memory_[handle] = memory;
         buffer_sizes_[handle] = desc.size;
+        buffer_memory_props_[handle] = get_memory_properties(memory_type_index);
 
         return handle;
     }
@@ -373,6 +387,7 @@ public:
         }
 
         buffer_sizes_.erase(handle);
+        buffer_memory_props_.erase(handle);
     }
 
     Result<void*> map_buffer(BufferHandle handle) override {
@@ -384,6 +399,12 @@ public:
         auto size_it = buffer_sizes_.find(handle);
         if (size_it == buffer_sizes_.end()) {
             return Error(ErrorCode::InvalidArgument, "Buffer size not found");
+        }
+
+        auto props_it = buffer_memory_props_.find(handle);
+        if (props_it == buffer_memory_props_.end() ||
+            (props_it->second & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) {
+            return Error(ErrorCode::InvalidArgument, "Buffer is not host-visible");
         }
 
         void* data;
@@ -403,6 +424,31 @@ public:
     }
 
     Result<void> write_buffer(BufferHandle handle, const void* data, size_t size, size_t offset) override {
+        if (!is_host_visible(handle)) {
+            BufferDesc staging_desc{};
+            staging_desc.size = size;
+            staging_desc.memory_type = MemoryType::Shared;
+
+            auto staging_result = create_buffer(staging_desc);
+            if (!staging_result.ok()) {
+                return staging_result.error();
+            }
+            BufferHandle staging = staging_result.value();
+
+            auto map_result = map_buffer(staging);
+            if (!map_result.ok()) {
+                destroy_buffer(staging);
+                return map_result.error();
+            }
+
+            std::memcpy(static_cast<char*>(map_result.value()), data, size);
+            unmap_buffer(staging);
+
+            auto copy_result = copy_buffer(staging, handle, size, 0, offset);
+            destroy_buffer(staging);
+            return copy_result;
+        }
+
         auto map_result = map_buffer(handle);
         if (!map_result.ok()) {
             return map_result.error();
@@ -414,6 +460,35 @@ public:
     }
 
     Result<void> read_buffer(BufferHandle handle, void* data, size_t size, size_t offset) override {
+        if (!is_host_visible(handle)) {
+            BufferDesc staging_desc{};
+            staging_desc.size = size;
+            staging_desc.memory_type = MemoryType::Shared;
+
+            auto staging_result = create_buffer(staging_desc);
+            if (!staging_result.ok()) {
+                return staging_result.error();
+            }
+            BufferHandle staging = staging_result.value();
+
+            auto copy_result = copy_buffer(handle, staging, size, offset, 0);
+            if (!copy_result.ok()) {
+                destroy_buffer(staging);
+                return copy_result;
+            }
+
+            auto map_result = map_buffer(staging);
+            if (!map_result.ok()) {
+                destroy_buffer(staging);
+                return map_result.error();
+            }
+
+            std::memcpy(data, static_cast<const char*>(map_result.value()), size);
+            unmap_buffer(staging);
+            destroy_buffer(staging);
+            return {};
+        }
+
         auto map_result = map_buffer(handle);
         if (!map_result.ok()) {
             return map_result.error();
@@ -422,6 +497,26 @@ public:
         std::memcpy(data, static_cast<const char*>(map_result.value()) + offset, size);
         unmap_buffer(handle);
         return {};
+    }
+
+    Result<BufferHandle> create_buffer_from_host(const void* data,
+                                                 const BufferDesc& desc) override {
+        if (!data) {
+            return Error(ErrorCode::InvalidArgument, "Null host buffer");
+        }
+
+        auto buffer_result = create_buffer(desc);
+        if (!buffer_result.ok()) {
+            return buffer_result.error();
+        }
+
+        auto write_result = write_buffer(buffer_result.value(), data, desc.size, 0);
+        if (!write_result.ok()) {
+            destroy_buffer(buffer_result.value());
+            return write_result.error();
+        }
+
+        return buffer_result;
     }
 
     Result<void> copy_buffer(BufferHandle src, BufferHandle dst, size_t size, size_t src_offset, size_t dst_offset) override {
@@ -478,60 +573,53 @@ public:
         std::string extension = shader_path.extension().string();
 
         if (extension == ".comp" || extension == ".glsl") {
+            if (auto precompiled = find_precompiled_spirv(shader_path)) {
+                auto spirv_result = load_spirv_file(*precompiled);
+                if (!spirv_result.ok()) {
+                    return spirv_result.error();
+                }
+                spirv = std::move(spirv_result).take();
+            } else {
 #ifdef GRANITE_HAS_SHADERC
-            std::ifstream file(desc.shader_source);
-            if (!file.is_open()) {
-                return Error(ErrorCode::FileNotFound,
-                             fmt::format("GLSL shader not found: {}", desc.shader_source));
-            }
-            std::string source((std::istreambuf_iterator<char>(file)),
-                               std::istreambuf_iterator<char>());
+                std::ifstream file(desc.shader_source);
+                if (!file.is_open()) {
+                    return Error(ErrorCode::FileNotFound,
+                                 fmt::format("GLSL shader not found: {}", desc.shader_source));
+                }
+                std::string source((std::istreambuf_iterator<char>(file)),
+                                   std::istreambuf_iterator<char>());
 
-            shaderc::Compiler compiler;
-            shaderc::CompileOptions options;
-            options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_1);
-            options.SetIncluder(std::make_unique<ShadercIncluder>(shader_path.parent_path()));
+                shaderc::Compiler compiler;
+                shaderc::CompileOptions options;
+                options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_1);
+                options.SetIncluder(std::make_unique<ShadercIncluder>(shader_path.parent_path()));
 
-            auto result = compiler.CompileGlslToSpv(
-                source,
-                shaderc_compute_shader,
-                desc.shader_source.c_str(),
-                desc.entry_point.c_str(),
-                options);
+                auto result = compiler.CompileGlslToSpv(
+                    source,
+                    shaderc_compute_shader,
+                    desc.shader_source.c_str(),
+                    desc.entry_point.c_str(),
+                    options);
 
-            if (result.GetCompilationStatus() != shaderc_compilation_status_success) {
-                return Error(ErrorCode::ShaderCompilationFailed,
-                             fmt::format("GLSL compile failed: {}", result.GetErrorMessage()));
-            }
+                if (result.GetCompilationStatus() != shaderc_compilation_status_success) {
+                    return Error(ErrorCode::ShaderCompilationFailed,
+                                 fmt::format("GLSL compile failed: {}", result.GetErrorMessage()));
+                }
 
-            spirv.assign(result.cbegin(), result.cend());
+                spirv.assign(result.cbegin(), result.cend());
+                write_spirv_cache(shader_path, spirv);
 #else
-            return Error(ErrorCode::NotImplemented,
-                         "GLSL compilation requires GRANITE_WITH_SHADERC");
+                return Error(ErrorCode::NotImplemented,
+                             "GLSL compilation requires GRANITE_WITH_SHADERC");
 #endif
+            }
         } else {
             // shader_source is expected to be a SPIR-V path for Vulkan
-            std::ifstream file(desc.shader_source, std::ios::binary | std::ios::ate);
-            if (file.is_open()) {
-                std::streamsize size = file.tellg();
-                if (size <= 0) {
-                    return Error(ErrorCode::InvalidArgument,
-                                 fmt::format("Empty SPIR-V file: {}", desc.shader_source));
-                }
-                file.seekg(0, std::ios::beg);
-                if (size % 4 != 0) {
-                    return Error(ErrorCode::InvalidArgument,
-                                 fmt::format("Invalid SPIR-V size: {}", desc.shader_source));
-                }
-                spirv.resize(static_cast<size_t>(size / 4));
-                if (!file.read(reinterpret_cast<char*>(spirv.data()), size)) {
-                    return Error(ErrorCode::IOError,
-                                 fmt::format("Failed to read SPIR-V: {}", desc.shader_source));
-                }
-            } else {
-                return Error(ErrorCode::FileNotFound,
-                             fmt::format("SPIR-V not found: {}", desc.shader_source));
+            auto spirv_result = load_spirv_file(desc.shader_source);
+            if (!spirv_result.ok()) {
+                return spirv_result.error();
             }
+            spirv = std::move(spirv_result).take();
         }
 
         VkShaderModuleCreateInfo module_info{};
@@ -970,18 +1058,150 @@ private:
         return {};
     }
 
-    uint32_t find_memory_type(uint32_t type_filter, VkMemoryPropertyFlags properties) {
+    uint32_t find_memory_type(uint32_t type_filter, VkMemoryPropertyFlags required,
+                              VkMemoryPropertyFlags preferred) {
         VkPhysicalDeviceMemoryProperties mem_properties;
         vkGetPhysicalDeviceMemoryProperties(physical_device_, &mem_properties);
 
+        uint32_t fallback = UINT32_MAX;
         for (uint32_t i = 0; i < mem_properties.memoryTypeCount; i++) {
             if ((type_filter & (1 << i)) &&
-                (mem_properties.memoryTypes[i].propertyFlags & properties) == properties) {
-                return i;
+                (mem_properties.memoryTypes[i].propertyFlags & required) == required) {
+                if ((mem_properties.memoryTypes[i].propertyFlags & preferred) == preferred) {
+                    return i;
+                }
+                if (fallback == UINT32_MAX) {
+                    fallback = i;
+                }
             }
         }
 
-        return UINT32_MAX;
+        return fallback;
+    }
+
+    VkMemoryPropertyFlags get_memory_properties(uint32_t memory_type_index) const {
+        VkPhysicalDeviceMemoryProperties mem_properties;
+        vkGetPhysicalDeviceMemoryProperties(physical_device_, &mem_properties);
+        if (memory_type_index >= mem_properties.memoryTypeCount) {
+            return 0;
+        }
+        return mem_properties.memoryTypes[memory_type_index].propertyFlags;
+    }
+
+    void detect_memory_properties() {
+        VkPhysicalDeviceMemoryProperties mem_properties;
+        vkGetPhysicalDeviceMemoryProperties(physical_device_, &mem_properties);
+
+        supports_unified_memory_ = false;
+        for (uint32_t i = 0; i < mem_properties.memoryTypeCount; i++) {
+            auto flags = mem_properties.memoryTypes[i].propertyFlags;
+            if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+                (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+                supports_unified_memory_ = true;
+                break;
+            }
+        }
+
+        GRANITE_LOG_INFO("Vulkan unified memory: {}", supports_unified_memory_ ? "yes" : "no");
+    }
+
+    bool is_host_visible(BufferHandle handle) const {
+        auto it = buffer_memory_props_.find(handle);
+        if (it == buffer_memory_props_.end()) {
+            return false;
+        }
+        return (it->second & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+    }
+
+    static std::optional<std::filesystem::path> get_precompiled_dir() {
+        if (const char* dir = std::getenv("GRANITE_VULKAN_PRECOMPILED_DIR")) {
+            if (dir[0] != '\0') {
+                return std::filesystem::path(dir);
+            }
+        }
+#ifdef GRANITE_VULKAN_PRECOMPILED_DIR
+        return std::filesystem::path(GRANITE_VULKAN_PRECOMPILED_DIR);
+#endif
+        return std::nullopt;
+    }
+
+    static std::optional<std::filesystem::path> get_spirv_cache_dir() {
+        if (const char* dir = std::getenv("GRANITE_VULKAN_SPIRV_CACHE_DIR")) {
+            if (dir[0] != '\0') {
+                return std::filesystem::path(dir);
+            }
+        }
+        return std::nullopt;
+    }
+
+    static std::optional<std::filesystem::path> find_precompiled_spirv(
+        const std::filesystem::path& shader_path) {
+        std::vector<std::filesystem::path> search_dirs;
+        if (auto pre_dir = get_precompiled_dir()) {
+            search_dirs.push_back(*pre_dir);
+        }
+        search_dirs.push_back(shader_path.parent_path());
+
+        const std::string filename = shader_path.filename().string();
+        const std::string stem = shader_path.stem().string();
+
+        for (const auto& dir : search_dirs) {
+            std::filesystem::path candidate1 = dir / (filename + ".spv");
+            if (std::filesystem::exists(candidate1)) {
+                return candidate1;
+            }
+            std::filesystem::path candidate2 = dir / (stem + ".spv");
+            if (std::filesystem::exists(candidate2)) {
+                return candidate2;
+            }
+        }
+
+        return std::nullopt;
+    }
+
+    static Result<std::vector<uint32_t>> load_spirv_file(const std::filesystem::path& path) {
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
+        if (!file.is_open()) {
+            return Error(ErrorCode::FileNotFound,
+                         fmt::format("SPIR-V not found: {}", path.string()));
+        }
+        std::streamsize size = file.tellg();
+        if (size <= 0) {
+            return Error(ErrorCode::InvalidArgument,
+                         fmt::format("Empty SPIR-V file: {}", path.string()));
+        }
+        file.seekg(0, std::ios::beg);
+        if (size % 4 != 0) {
+            return Error(ErrorCode::InvalidArgument,
+                         fmt::format("Invalid SPIR-V size: {}", path.string()));
+        }
+        std::vector<uint32_t> spirv(static_cast<size_t>(size / 4));
+        if (!file.read(reinterpret_cast<char*>(spirv.data()), size)) {
+            return Error(ErrorCode::IOError,
+                         fmt::format("Failed to read SPIR-V: {}", path.string()));
+        }
+        return spirv;
+    }
+
+    static void write_spirv_cache(const std::filesystem::path& shader_path,
+                                  const std::vector<uint32_t>& spirv) {
+        auto cache_dir = get_spirv_cache_dir();
+        if (!cache_dir) {
+            return;
+        }
+
+        std::error_code ec;
+        std::filesystem::create_directories(*cache_dir, ec);
+
+        std::filesystem::path out_path = *cache_dir /
+            (shader_path.filename().string() + ".spv");
+
+        std::ofstream out(out_path, std::ios::binary);
+        if (!out.is_open()) {
+            return;
+        }
+        out.write(reinterpret_cast<const char*>(spirv.data()),
+                  static_cast<std::streamsize>(spirv.size() * sizeof(uint32_t)));
     }
 
     // State
@@ -1009,11 +1229,13 @@ private:
     bool supports_fp16_ = false;
     bool supports_subgroups_ = false;
     uint32_t subgroup_size_ = 32;
+    bool supports_unified_memory_ = false;
 
     // Resource maps
     std::unordered_map<BufferHandle, VkBuffer> buffers_;
     std::unordered_map<BufferHandle, VkDeviceMemory> buffer_memory_;
     std::unordered_map<BufferHandle, size_t> buffer_sizes_;
+    std::unordered_map<BufferHandle, VkMemoryPropertyFlags> buffer_memory_props_;
     std::unordered_map<PipelineHandle, VkPipeline> pipelines_;
     std::unordered_map<PipelineHandle, VkPipelineLayout> pipeline_layouts_;
     std::unordered_map<FenceHandle, VkFence> fences_;

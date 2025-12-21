@@ -22,6 +22,7 @@
 #include <chrono>
 #include <mutex>
 #include <memory>
+#include <optional>
 
 #include "granite/backend.h"
 
@@ -457,6 +458,13 @@ public:
     Result<void> compile_shader(const std::string& name, const std::string& glsl_code,
                                uint32_t num_buffers) {
 #ifdef GRANITE_HAS_SHADERC
+        if (auto precompiled = get_precompiled_spirv_path(name)) {
+            auto spirv_result = load_spirv_file(*precompiled);
+            if (spirv_result.ok()) {
+                return create_pipeline_from_spirv(name, spirv_result.value(), num_buffers);
+            }
+        }
+
         shaderc::Compiler compiler;
         shaderc::CompileOptions options;
         options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_1);
@@ -471,6 +479,7 @@ public:
         }
 
         std::vector<uint32_t> spirv(result.cbegin(), result.cend());
+        write_spirv_cache(name, spirv);
         return create_pipeline_from_spirv(name, spirv, num_buffers);
 #else
         return Error(ErrorCode::NotImplemented,
@@ -524,6 +533,84 @@ private:
 
         descriptor_set_layouts_[num_buffers] = layout;
         return true;
+    }
+
+    static std::optional<std::filesystem::path> get_precompiled_dir() {
+        if (const char* dir = std::getenv("GRANITE_VULKAN_PRECOMPILED_DIR")) {
+            if (dir[0] != '\0') {
+                return std::filesystem::path(dir);
+            }
+        }
+#ifdef GRANITE_VULKAN_PRECOMPILED_DIR
+        return std::filesystem::path(GRANITE_VULKAN_PRECOMPILED_DIR);
+#endif
+        return std::nullopt;
+    }
+
+    static std::optional<std::filesystem::path> get_spirv_cache_dir() {
+        if (const char* dir = std::getenv("GRANITE_VULKAN_SPIRV_CACHE_DIR")) {
+            if (dir[0] != '\0') {
+                return std::filesystem::path(dir);
+            }
+        }
+        return std::nullopt;
+    }
+
+    static std::optional<std::filesystem::path> get_precompiled_spirv_path(
+        const std::string& name) {
+        auto dir = get_precompiled_dir();
+        if (!dir) {
+            return std::nullopt;
+        }
+
+        std::filesystem::path candidate = *dir / (name + ".spv");
+        if (std::filesystem::exists(candidate)) {
+            return candidate;
+        }
+        return std::nullopt;
+    }
+
+    static Result<std::vector<uint32_t>> load_spirv_file(const std::filesystem::path& path) {
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
+        if (!file.is_open()) {
+            return Error(ErrorCode::FileNotFound,
+                         fmt::format("SPIR-V not found: {}", path.string()));
+        }
+        std::streamsize size = file.tellg();
+        if (size <= 0) {
+            return Error(ErrorCode::InvalidArgument,
+                         fmt::format("Empty SPIR-V file: {}", path.string()));
+        }
+        file.seekg(0, std::ios::beg);
+        if (size % 4 != 0) {
+            return Error(ErrorCode::InvalidArgument,
+                         fmt::format("Invalid SPIR-V size: {}", path.string()));
+        }
+        std::vector<uint32_t> spirv(static_cast<size_t>(size / 4));
+        if (!file.read(reinterpret_cast<char*>(spirv.data()), size)) {
+            return Error(ErrorCode::IOError,
+                         fmt::format("Failed to read SPIR-V: {}", path.string()));
+        }
+        return spirv;
+    }
+
+    static void write_spirv_cache(const std::string& name,
+                                  const std::vector<uint32_t>& spirv) {
+        auto cache_dir = get_spirv_cache_dir();
+        if (!cache_dir) {
+            return;
+        }
+
+        std::error_code ec;
+        std::filesystem::create_directories(*cache_dir, ec);
+
+        std::filesystem::path out_path = *cache_dir / (name + ".spv");
+        std::ofstream out(out_path, std::ios::binary);
+        if (!out.is_open()) {
+            return;
+        }
+        out.write(reinterpret_cast<const char*>(spirv.data()),
+                  static_cast<std::streamsize>(spirv.size() * sizeof(uint32_t)));
     }
 
     Result<void> create_pipeline_from_spirv(const std::string& name,
