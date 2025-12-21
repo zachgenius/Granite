@@ -646,6 +646,40 @@ private:
             pipelines_[v.name] = pipeline;
         }
 
+        // Compile FP16 weight simdgroup matmul (NK=64 variant)
+        SgmmVariant sgmm_f16w_nk64_variants[] = {
+            {"matmul_f16_simdgroup_nk64_00", false, false},
+            {"matmul_f16_simdgroup_nk64_01", false, true},
+            {"matmul_f16_simdgroup_nk64_10", true, false},
+            {"matmul_f16_simdgroup_nk64_11", true, true},
+        };
+
+        NS::String* sgmm_f16w_nk64_func_name = NS::String::string("matmul_f16_simdgroup_nk64", NS::UTF8StringEncoding);
+
+        for (const auto& v : sgmm_f16w_nk64_variants) {
+            MTL::FunctionConstantValues* fc_values = MTL::FunctionConstantValues::alloc()->init();
+            fc_values->setConstantValue(&v.bc_inp, MTL::DataTypeBool, FC_MUL_MM + 0);
+            fc_values->setConstantValue(&v.bc_out, MTL::DataTypeBool, FC_MUL_MM + 1);
+
+            MTL::Function* func = library->newFunction(sgmm_f16w_nk64_func_name, fc_values, &error);
+            fc_values->release();
+
+            if (!func) {
+                GRANITE_LOG_WARN("Function '{}' not found with constants", v.name);
+                continue;
+            }
+
+            MTL::ComputePipelineState* pipeline = device_->newComputePipelineState(func, &error);
+            func->release();
+
+            if (!pipeline) {
+                GRANITE_LOG_WARN("Failed to create pipeline for '{}'", v.name);
+                continue;
+            }
+
+            pipelines_[v.name] = pipeline;
+        }
+
         // Compile fused_gate_up_q4k_simdgroup with function constants
         // This kernel fuses gate and up projections into a single dispatch
         SgmmVariant fused_gate_up_variants[] = {
@@ -1061,6 +1095,38 @@ Result<void> MetalCompute::matmul_f16(
     // Simdgroup matrix kernel for prefill batches (M >= 32)
     // Uses simdgroup_half8x8 matrices and simdgroup_multiply_accumulate.
     if (M >= 32 && (K % 32 == 0)) {
+        if (K % 64 == 0) {
+            auto* encoder = impl_->get_encoder();
+            const bool aligned = (M % 32 == 0) && (N % 64 == 0);
+            const char* kernel_name = aligned ? "matmul_f16_simdgroup_nk64_00"
+                                              : "matmul_f16_simdgroup_nk64_11";
+            auto* pipeline = impl_->get_pipeline(kernel_name);
+            if (!pipeline) {
+                return Error(ErrorCode::InternalError, "matmul_f16_simdgroup_nk64 pipeline not found");
+            }
+
+            encoder->setComputePipelineState(pipeline);
+            encoder->setBuffer(X, 0, 0);
+            encoder->setBuffer(W, 0, 1);
+            encoder->setBuffer(Y, 0, 2);
+            encoder->setBytes(&M, sizeof(M), 3);
+            encoder->setBytes(&K, sizeof(K), 4);
+            encoder->setBytes(&N, sizeof(N), 5);
+
+            constexpr uint32_t NR0 = 64;
+            constexpr uint32_t NR1 = 32;
+            constexpr size_t shmem_size = 16384;
+            encoder->setThreadgroupMemoryLength(shmem_size, 0);
+
+            uint32_t num_m_tiles = (M + NR1 - 1) / NR1;
+            uint32_t num_n_tiles = (N + NR0 - 1) / NR0;
+            MTL::Size grid_size = MTL::Size::Make(num_m_tiles, num_n_tiles, 1);
+            MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
+            encoder->dispatchThreadgroups(grid_size, threadgroup_size);
+
+            return {};
+        }
+
         if (M % 32 == 0 && N % 64 == 0) {
             return impl_->dispatch_matmul_simdgroup("matmul_f16_simdgroup_00", X, W, Y, M, K, N);
         }
