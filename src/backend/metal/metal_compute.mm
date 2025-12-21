@@ -715,6 +715,42 @@ private:
             pipelines_[v.name] = pipeline;
         }
 
+        // Compile fused_gate_up_q4k_simdgroup_f32 with function constants
+        // FP32 input variant for non-FP16 RMSNorm path.
+        SgmmVariant fused_gate_up_f32_variants[] = {
+            {"fused_gate_up_q4k_simdgroup_f32_00", false, false},
+            {"fused_gate_up_q4k_simdgroup_f32_01", false, true},
+            {"fused_gate_up_q4k_simdgroup_f32_10", true, false},
+            {"fused_gate_up_q4k_simdgroup_f32_11", true, true},
+        };
+
+        NS::String* fused_gate_up_f32_func_name =
+            NS::String::string("fused_gate_up_q4k_simdgroup_f32", NS::UTF8StringEncoding);
+
+        for (const auto& v : fused_gate_up_f32_variants) {
+            MTL::FunctionConstantValues* fc_values = MTL::FunctionConstantValues::alloc()->init();
+            fc_values->setConstantValue(&v.bc_inp, MTL::DataTypeBool, FC_MUL_MM + 0);
+            fc_values->setConstantValue(&v.bc_out, MTL::DataTypeBool, FC_MUL_MM + 1);
+
+            MTL::Function* func = library->newFunction(fused_gate_up_f32_func_name, fc_values, &error);
+            fc_values->release();
+
+            if (!func) {
+                GRANITE_LOG_WARN("Function '{}' not found with constants", v.name);
+                continue;
+            }
+
+            MTL::ComputePipelineState* pipeline = device_->newComputePipelineState(func, &error);
+            func->release();
+
+            if (!pipeline) {
+                GRANITE_LOG_WARN("Failed to create pipeline for '{}'", v.name);
+                continue;
+            }
+
+            pipelines_[v.name] = pipeline;
+        }
+
         library->release();
         return {};
     }
@@ -895,6 +931,28 @@ Result<void> MetalCompute::fused_gate_up_q4k(
     auto res = matmul_q4k_f16(X, W_gate, Y_gate, M, K, N);
     if (!res.ok()) return res;
     return matmul_q4k_f16(X, W_up, Y_up, M, K, N);
+}
+
+Result<void> MetalCompute::fused_gate_up_q4k_f32(
+    MTL::Buffer* X, MTL::Buffer* W_gate, MTL::Buffer* W_up,
+    MTL::Buffer* Y_gate, MTL::Buffer* Y_up,
+    uint32_t M, uint32_t K, uint32_t N)
+{
+    // FP32 input variant for the fused gate+up kernel.
+    if (M >= 32) {
+        if (M % 32 == 0 && N % 64 == 0) {
+            return impl_->dispatch_fused_gate_up(
+                "fused_gate_up_q4k_simdgroup_f32_00",
+                X, W_gate, W_up, Y_gate, Y_up, M, K, N);
+        }
+        return impl_->dispatch_fused_gate_up(
+            "fused_gate_up_q4k_simdgroup_f32_11",
+            X, W_gate, W_up, Y_gate, Y_up, M, K, N);
+    }
+    // For small batches, fall back to separate matmul calls.
+    auto res = matmul_q4k(X, W_gate, Y_gate, M, K, N);
+    if (!res.ok()) return res;
+    return matmul_q4k(X, W_up, Y_up, M, K, N);
 }
 
 // -----------------------------------------------------------------------------

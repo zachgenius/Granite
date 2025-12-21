@@ -3138,6 +3138,11 @@ Result<void> TransformerModel::transformer_block_prefill_raw(
     // Check if we should use fused RMSNorm->f16 path for gate/up projections
     bool use_ffn_f16_path = (raw_wgate->quant_type == GGMLType::Q4_K) &&
                             can_use_f16_fast(num_tokens, hidden_dim, intermediate_dim);
+    bool use_ffn_f32_fused = !use_ffn_f16_path &&
+                             (raw_wgate->quant_type == GGMLType::Q4_K) &&
+                             (raw_wup->quant_type == GGMLType::Q4_K) &&
+                             (num_tokens >= 32) &&
+                             gpu->get_pipeline("fused_gate_up_q4k_simdgroup_f32_11");
 
     // 8. RMSNorm for FFN (output to f16 buffer if using f16 matmul path)
     if (use_ffn_f16_path) {
@@ -3163,8 +3168,13 @@ Result<void> TransformerModel::transformer_block_prefill_raw(
                                num_tokens, hidden_dim, model_config_.rms_norm_eps);
         }
         // 9. Gate and Up projections
-        dispatch_matmul(ffn_input_buf, wgate_buf, gate_buf, raw_wgate->quant_type, num_tokens, hidden_dim, intermediate_dim);
-        dispatch_matmul(ffn_input_buf, wup_buf, up_buf, raw_wup->quant_type, num_tokens, hidden_dim, intermediate_dim);
+        if (use_ffn_f32_fused) {
+            gpu->fused_gate_up_q4k_f32(ffn_input_buf, wgate_buf, wup_buf, gate_buf, up_buf,
+                                       num_tokens, hidden_dim, intermediate_dim);
+        } else {
+            dispatch_matmul(ffn_input_buf, wgate_buf, gate_buf, raw_wgate->quant_type, num_tokens, hidden_dim, intermediate_dim);
+            dispatch_matmul(ffn_input_buf, wup_buf, up_buf, raw_wup->quant_type, num_tokens, hidden_dim, intermediate_dim);
+        }
     }
 
     // 10. SiLU activation and multiply
@@ -3256,6 +3266,8 @@ Result<void*> TransformerModel::forward_prefill_raw(
     auto* pipe_silu_mul = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("silu_mul"));
     auto* pipe_fused_gate_up = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("fused_gate_up_q4k_simdgroup_11"));
     auto* pipe_fused_gate_up_fast = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("fused_gate_up_q4k_simdgroup_00"));
+    auto* pipe_fused_gate_up_f32 = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("fused_gate_up_q4k_simdgroup_f32_11"));
+    auto* pipe_fused_gate_up_f32_fast = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("fused_gate_up_q4k_simdgroup_f32_00"));
     auto* pipe_convert_f32_to_f16 = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("convert_f32_to_f16"));
 
     // Model dimensions
@@ -3294,6 +3306,12 @@ Result<void*> TransformerModel::forward_prefill_raw(
             return pipe_fused_gate_up_fast;
         }
         return pipe_fused_gate_up;
+    };
+    auto select_fused_gate_up_f32_pipe = [&](uint32_t m, uint32_t /*k*/, uint32_t n) -> MTL::ComputePipelineState* {
+        if (pipe_fused_gate_up_f32_fast && (m % 32 == 0) && (n % 64 == 0)) {
+            return pipe_fused_gate_up_f32_fast;
+        }
+        return pipe_fused_gate_up_f32;
     };
 
     // Simdgroup matmul constants
@@ -3398,6 +3416,11 @@ Result<void*> TransformerModel::forward_prefill_raw(
                            pipe_rms_batch_f16w_to_f16 &&
                            pipe_matmul_q4k_f16 &&
                            pipe_fused_gate_up;
+        bool use_ffn_f32_fused = !use_ffn_f16 &&
+                                 (wc.wgate_qtype == GGMLType::Q4_K) &&
+                                 (wc.wup_qtype == GGMLType::Q4_K) &&
+                                 (M >= 32) &&
+                                 pipe_fused_gate_up_f32;
         bool use_wo_f16 = (wc.wo_qtype == GGMLType::Q4_K) &&
                           can_use_f16_fast(M, qd, hd) &&
                           pipe_matmul_q4k_f16 &&
@@ -3609,6 +3632,22 @@ Result<void*> TransformerModel::forward_prefill_raw(
             uint32_t num_n_tiles = (intd + NR0 - 1) / NR0;
             enc->dispatchThreadgroups(MTL::Size::Make(num_m_tiles, num_n_tiles, 2),
                                       MTL::Size::Make(128, 1, 1));
+        } else if (use_ffn_f32_fused) {
+            enc->setComputePipelineState(select_fused_gate_up_f32_pipe(M, hd, intd));
+            enc->setBuffer(ffn_input_buf, 0, 0);
+            enc->setBuffer(wgate_buf, 0, 1);
+            enc->setBuffer(wup_buf, 0, 2);
+            enc->setBuffer(gate_buf, 0, 3);
+            enc->setBuffer(up_buf, 0, 4);
+            enc->setBytes(&M, 4, 5);
+            enc->setBytes(&hd, 4, 6);
+            enc->setBytes(&intd, 4, 7);
+            enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
+
+            uint32_t num_m_tiles = (M + NR1 - 1) / NR1;
+            uint32_t num_n_tiles = (intd + NR0 - 1) / NR0;
+            enc->dispatchThreadgroups(MTL::Size::Make(num_m_tiles, num_n_tiles, 2),
+                                      MTL::Size::Make(128, 1, 1));
         } else {
             enc->setComputePipelineState(select_q4k_pipe(M, hd, intd));
             enc->setBuffer(ffn_input_buf, 0, 0);
@@ -3625,7 +3664,7 @@ Result<void*> TransformerModel::forward_prefill_raw(
         // ---------------------------------------------------------------------
         // 12. Up projection: [M, hidden] @ [intermediate, hidden]^T
         // ---------------------------------------------------------------------
-        if (!use_ffn_f16) {
+        if (!use_ffn_f16 && !use_ffn_f32_fused) {
             enc->setComputePipelineState(select_q4k_pipe(M, hd, intd));
             enc->setBuffer(ffn_input_buf, 0, 0);
             enc->setBuffer(wup_buf, 0, 1);
