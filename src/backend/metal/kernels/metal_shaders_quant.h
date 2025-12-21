@@ -770,8 +770,8 @@ kernel void matmul_q4k_simdgroup(
 
     // Pointer setup - with or without nullptr handling
     device const block_q4_K* x = FC_mm_bc_inp
-        ? ((lr0 < nr0) ? &weights[(r0 + lr0) * num_blocks_k + il0/nl] : nullptr)
-        : &weights[(r0 + lr0) * num_blocks_k + il0/nl];
+        ? ((lr0 < nr0) ? &weights[(r0 + lr0) * num_blocks_k + (il0 / nl)] : nullptr)
+        : &weights[(r0 + lr0) * num_blocks_k + (il0 / nl)];
     device const float* y = FC_mm_bc_inp
         ? ((lr1 < nr1) ? X + (r1 + lr1) * K + iy : nullptr)
         : X + (r1 + lr1) * K + iy;
@@ -936,8 +936,8 @@ kernel void matmul_q4k_simdgroup_f16(
 
     // Pointer setup - with or without nullptr handling
     device const block_q4_K* x = FC_mm_bc_inp
-        ? ((lr0 < nr0) ? &weights[(r0 + lr0) * num_blocks_k + il0/nl] : nullptr)
-        : &weights[(r0 + lr0) * num_blocks_k + il0/nl];
+        ? ((lr0 < nr0) ? &weights[(r0 + lr0) * num_blocks_k + (il0 / nl)] : nullptr)
+        : &weights[(r0 + lr0) * num_blocks_k + (il0 / nl)];
     // FP16 input pointer - direct half read, no conversion needed
     device const half* y = FC_mm_bc_inp
         ? ((lr1 < nr1) ? X + (r1 + lr1) * K + iy : nullptr)
@@ -1442,8 +1442,8 @@ kernel void fused_gate_up_q4k_simdgroup(
     short il = il0;
 
     device const block_q4_K* x = FC_mm_bc_inp
-        ? ((lr0 < nr0) ? &weights[(r0 + lr0) * num_blocks_k + il0/nl] : nullptr)
-        : &weights[(r0 + lr0) * num_blocks_k + il0/nl];
+        ? ((lr0 < nr0) ? &weights[(r0 + lr0) * num_blocks_k + (il0 / nl)] : nullptr)
+        : &weights[(r0 + lr0) * num_blocks_k + (il0 / nl)];
     device const half* y = FC_mm_bc_inp
         ? ((lr1 < nr1) ? X + (r1 + lr1) * K + iy : nullptr)
         : X + (r1 + lr1) * K + iy;
