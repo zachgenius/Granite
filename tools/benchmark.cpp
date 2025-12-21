@@ -8,8 +8,26 @@
 #include <sstream>
 #include <algorithm>
 
+#ifdef GRANITE_HAS_METAL
+#include <granite/metal_compute.h>
+#endif
+
 using namespace granite;
 using Clock = std::chrono::high_resolution_clock;
+
+std::string format_bytes(size_t bytes) {
+    const char* suffixes[] = {"B", "KB", "MB", "GB", "TB"};
+    double value = static_cast<double>(bytes);
+    size_t suffix_index = 0;
+    const size_t suffix_count = sizeof(suffixes) / sizeof(suffixes[0]);
+    while (value >= 1024.0 && suffix_index + 1 < suffix_count) {
+        value /= 1024.0;
+        suffix_index++;
+    }
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(2) << value << " " << suffixes[suffix_index];
+    return out.str();
+}
 
 // Benchmark helper
 template<typename Func>
@@ -233,6 +251,7 @@ void benchmark_inference(
         return;
     }
     auto kv_cache = std::move(kv_result).take();
+    std::cout << "KV cache (CPU): " << format_bytes(kv_cache.memory_bytes()) << "\n";
 
     // Enable GPU mode and allocate GPU KV cache
 #ifdef GRANITE_HAS_METAL
@@ -242,8 +261,23 @@ void benchmark_inference(
     auto gpu_cache_result = model.allocate_gpu_kv_cache(static_cast<int>(cache_max_seq));
     if (gpu_cache_result.ok()) {
         std::cout << "GPU KV cache allocated\n";
+        const auto& cfg = model.config();
+        size_t elems = static_cast<size_t>(cfg.num_layers) *
+                       static_cast<size_t>(cfg.num_kv_heads) *
+                       static_cast<size_t>(cache_max_seq) *
+                       static_cast<size_t>(cfg.head_dim);
+        size_t gpu_kv_bytes = elems * sizeof(uint16_t) * 2;
+        std::cout << "KV cache (GPU): " << format_bytes(gpu_kv_bytes) << "\n";
     } else {
         std::cout << "GPU KV cache allocation failed, using CPU cache\n";
+    }
+#endif
+
+#ifdef GRANITE_HAS_METAL
+    if (enable_profiling && backend->get_type() == BackendType::Metal) {
+        if (auto* gpu = get_metal_compute()) {
+            gpu->reset_profiling_stats();
+        }
     }
 #endif
 
@@ -376,6 +410,32 @@ void benchmark_inference(
                       << " min=" << min << " max=" << max << "\n";
         }
     }
+
+#ifdef GRANITE_HAS_METAL
+    if (enable_profiling && backend->get_type() == BackendType::Metal) {
+        if (auto* gpu = get_metal_compute()) {
+            uint64_t dispatches = 0;
+            uint64_t syncs = 0;
+            double sync_time_ms = 0.0;
+            uint64_t cmd_buffers = 0;
+            double gpu_time_ms = 0.0;
+            uint64_t gpu_timed_buffers = 0;
+            gpu->get_profiling_stats(dispatches, syncs, sync_time_ms, cmd_buffers,
+                                     gpu_time_ms, gpu_timed_buffers);
+            std::cout << "\nGPU profiling:\n";
+            std::cout << "  dispatches: " << dispatches << "\n";
+            std::cout << "  command buffers: " << cmd_buffers << "\n";
+            std::cout << "  syncs: " << syncs << " (" << std::fixed << std::setprecision(2)
+                      << sync_time_ms << " ms)\n";
+            if (gpu_timed_buffers > 0) {
+                std::cout << "  gpu time: " << std::fixed << std::setprecision(2)
+                          << gpu_time_ms << " ms (" << gpu_timed_buffers << " buffers)\n";
+            } else {
+                std::cout << "  gpu time: unavailable (no timing data)\n";
+            }
+        }
+    }
+#endif
 }
 
 void benchmark_memory(IComputeBackend* backend) {

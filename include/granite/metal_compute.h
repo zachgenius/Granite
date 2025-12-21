@@ -42,6 +42,8 @@ public:
     void enable_profiling(bool enable);
     void reset_profiling_stats();
     void get_profiling_stats(uint64_t& dispatches, uint64_t& syncs, double& sync_time_ms, uint64_t& cmd_buffers) const;
+    void get_profiling_stats(uint64_t& dispatches, uint64_t& syncs, double& sync_time_ms, uint64_t& cmd_buffers,
+                             double& gpu_time_ms, uint64_t& gpu_timed_buffers) const;
 
     // GPU Capture API (for Xcode GPU profiler)
     // Captures a GPU trace that can be opened in Xcode for detailed analysis

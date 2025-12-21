@@ -46,9 +46,12 @@ public:
         uint64_t sync_count = 0;
         double sync_time_ms = 0.0;
         uint64_t command_buffer_count = 0;
+        double gpu_time_ms = 0.0;
+        uint64_t gpu_timed_buffers = 0;
     };
     ProfilingStats stats_;
     bool profiling_enabled_ = false;
+    mutable std::mutex stats_mutex_;
 
     Impl() = default;
     ~Impl() { shutdown(); }
@@ -107,6 +110,8 @@ public:
             auto end = std::chrono::high_resolution_clock::now();
 
             if (profiling_enabled_) {
+                record_gpu_time(current_command_buffer_);
+                std::lock_guard<std::mutex> lock(stats_mutex_);
                 stats_.sync_count++;
                 stats_.sync_time_ms += std::chrono::duration<double, std::milli>(end - start).count();
             }
@@ -122,6 +127,11 @@ public:
                 current_encoder_->endEncoding();
                 current_encoder_ = nullptr;
             }
+            if (profiling_enabled_) {
+                current_command_buffer_->addCompletedHandler(^void(MTL::CommandBuffer* buffer) {
+                    this->record_gpu_time(buffer);
+                });
+            }
             current_command_buffer_->commit();
             current_command_buffer_ = nullptr;
         }
@@ -135,25 +145,34 @@ public:
             current_command_buffer_ = command_queue_->commandBuffer();
             current_encoder_ = current_command_buffer_->computeCommandEncoder();
             if (profiling_enabled_) {
+                std::lock_guard<std::mutex> lock(stats_mutex_);
                 stats_.command_buffer_count++;
             }
         }
         if (profiling_enabled_) {
+            std::lock_guard<std::mutex> lock(stats_mutex_);
             stats_.dispatch_count++;
         }
         return current_encoder_;
     }
 
     void enable_profiling(bool enable) {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
         profiling_enabled_ = enable;
         if (enable) {
             stats_ = ProfilingStats{};  // Reset stats
         }
     }
 
-    ProfilingStats get_stats() const { return stats_; }
+    ProfilingStats get_stats() const {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        return stats_;
+    }
 
-    void reset_stats() { stats_ = ProfilingStats{}; }
+    void reset_stats() {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        stats_ = ProfilingStats{};
+    }
 
     MTL::ComputePipelineState* get_pipeline(const std::string& name) {
         auto it = pipelines_.find(name);
@@ -167,6 +186,19 @@ public:
         return device_->newBuffer(size, options);
     }
 
+    void record_gpu_time(MTL::CommandBuffer* buffer) {
+        if (!buffer) {
+            return;
+        }
+        double start = buffer->GPUStartTime();
+        double end = buffer->GPUEndTime();
+        if (end > start) {
+            std::lock_guard<std::mutex> lock(stats_mutex_);
+            stats_.gpu_time_ms += (end - start) * 1000.0;
+            stats_.gpu_timed_buffers++;
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Dispatch Helpers (reduce boilerplate for common patterns)
     // -------------------------------------------------------------------------
@@ -177,7 +209,8 @@ public:
         const char* kernel_name,
         MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* y,
         uint32_t K, uint32_t N,
-        uint32_t rows_per_simd = 2)
+        uint32_t rows_per_simd = 2,
+        uint32_t simd_groups = 2)
     {
         auto* encoder = get_encoder();
         auto* pipeline = get_pipeline(kernel_name);
@@ -192,9 +225,7 @@ public:
         encoder->setBytes(&K, sizeof(K), 3);
         encoder->setBytes(&N, sizeof(N), 4);
 
-        // 2 SIMD groups per threadgroup (64 threads) - matches llama.cpp
-        // Smaller threadgroups = better occupancy and more parallelism
-        constexpr uint32_t simd_groups = 2;
+        // Match SIMD groups per threadgroup to the kernel's ROWS_PER_TG constant.
         uint32_t rows_per_tg = simd_groups * rows_per_simd;
         uint32_t num_threadgroups = (N + rows_per_tg - 1) / rows_per_tg;
         MTL::Size grid_size = MTL::Size::Make(num_threadgroups, 1, 1);
@@ -830,6 +861,17 @@ void MetalCompute::get_profiling_stats(uint64_t& dispatches, uint64_t& syncs, do
     cmd_buffers = stats.command_buffer_count;
 }
 
+void MetalCompute::get_profiling_stats(uint64_t& dispatches, uint64_t& syncs, double& sync_time_ms, uint64_t& cmd_buffers,
+                                       double& gpu_time_ms, uint64_t& gpu_timed_buffers) const {
+    auto stats = impl_->get_stats();
+    dispatches = stats.dispatch_count;
+    syncs = stats.sync_count;
+    sync_time_ms = stats.sync_time_ms;
+    cmd_buffers = stats.command_buffer_count;
+    gpu_time_ms = stats.gpu_time_ms;
+    gpu_timed_buffers = stats.gpu_timed_buffers;
+}
+
 // GPU Capture API for Xcode profiler
 bool MetalCompute::begin_capture(const char* capture_path) {
     auto* capture_manager = MTL::CaptureManager::sharedCaptureManager();
@@ -892,7 +934,7 @@ Result<void> MetalCompute::matvec_q4k(
     MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N)
 {
-    return impl_->dispatch_matvec("matvec_q4k", x, W, y, K, N);
+    return impl_->dispatch_matvec("matvec_q4k", x, W, y, K, N, 2, 2);
 }
 
 Result<void> MetalCompute::matmul_q4k(
@@ -1001,7 +1043,7 @@ Result<void> MetalCompute::matvec_q8_0(
     MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N)
 {
-    return impl_->dispatch_matvec("matvec_q8_0", x, W, y, K, N);
+    return impl_->dispatch_matvec("matvec_q8_0", x, W, y, K, N, 2, 8);
 }
 
 Result<void> MetalCompute::matmul_q8_0(
@@ -1047,7 +1089,7 @@ Result<void> MetalCompute::matvec_q4_0(
     MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N)
 {
-    return impl_->dispatch_matvec("matvec_q4_0", x, W, y, K, N);
+    return impl_->dispatch_matvec("matvec_q4_0", x, W, y, K, N, 2, 8);
 }
 
 Result<void> MetalCompute::matmul_q4_0(
@@ -1093,7 +1135,7 @@ Result<void> MetalCompute::matvec_iq4_nl(
     MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N)
 {
-    return impl_->dispatch_matvec("matvec_iq4_nl", x, W, y, K, N);
+    return impl_->dispatch_matvec("matvec_iq4_nl", x, W, y, K, N, 2, 8);
 }
 
 Result<void> MetalCompute::matmul_iq4_nl(
@@ -1111,7 +1153,7 @@ Result<void> MetalCompute::matvec_iq4_xs(
     MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N)
 {
-    return impl_->dispatch_matvec("matvec_iq4_xs", x, W, y, K, N);
+    return impl_->dispatch_matvec("matvec_iq4_xs", x, W, y, K, N, 2, 8);
 }
 
 Result<void> MetalCompute::matmul_iq4_xs(
@@ -1129,7 +1171,7 @@ Result<void> MetalCompute::matvec_iq3_s(
     MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N)
 {
-    return impl_->dispatch_matvec("matvec_iq3_s", x, W, y, K, N);
+    return impl_->dispatch_matvec("matvec_iq3_s", x, W, y, K, N, 2, 8);
 }
 
 Result<void> MetalCompute::matmul_iq3_s(
@@ -1147,7 +1189,7 @@ Result<void> MetalCompute::matvec_q6_k(
     MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N)
 {
-    return impl_->dispatch_matvec("matvec_q6_k", x, W, y, K, N);
+    return impl_->dispatch_matvec("matvec_q6_k", x, W, y, K, N, 2, 8);
 }
 
 Result<void> MetalCompute::matmul_q6_k(
@@ -1165,7 +1207,7 @@ Result<void> MetalCompute::matvec_q5_k(
     MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N)
 {
-    return impl_->dispatch_matvec("matvec_q5_k", x, W, y, K, N);
+    return impl_->dispatch_matvec("matvec_q5_k", x, W, y, K, N, 2, 8);
 }
 
 Result<void> MetalCompute::matmul_q5_k(
@@ -1183,7 +1225,7 @@ Result<void> MetalCompute::matvec_q3_k(
     MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N)
 {
-    return impl_->dispatch_matvec("matvec_q3_k", x, W, y, K, N);
+    return impl_->dispatch_matvec("matvec_q3_k", x, W, y, K, N, 2, 8);
 }
 
 Result<void> MetalCompute::matmul_q3_k(
@@ -1201,7 +1243,7 @@ Result<void> MetalCompute::matvec_q2_k(
     MTL::Buffer* x, MTL::Buffer* W, MTL::Buffer* y,
     uint32_t K, uint32_t N)
 {
-    return impl_->dispatch_matvec("matvec_q2_k", x, W, y, K, N);
+    return impl_->dispatch_matvec("matvec_q2_k", x, W, y, K, N, 2, 8);
 }
 
 Result<void> MetalCompute::matmul_q2_k(
