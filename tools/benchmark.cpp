@@ -150,6 +150,8 @@ void benchmark_inference(const std::string& model_path, IComputeBackend* backend
     // Enable GPU mode and allocate GPU KV cache
 #ifdef GRANITE_HAS_METAL
     model.set_use_gpu(true);
+    // Match llama.cpp prompt processing behavior (logits for last token only).
+    model.set_prefill_last_token_only(true);
     auto gpu_cache_result = model.allocate_gpu_kv_cache(512);
     if (gpu_cache_result.ok()) {
         std::cout << "GPU KV cache allocated\n";

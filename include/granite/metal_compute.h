@@ -82,6 +82,19 @@ public:
         uint32_t N           // Output dimension
     );
 
+    // Fused gate+up projections for FFN (prefill optimization)
+    // Computes both projections in a single kernel launch, sharing input loading
+    Result<void> fused_gate_up_q4k(
+        MTL::Buffer* X,          // Input [M, K] half
+        MTL::Buffer* W_gate,     // Gate weights [N, K/256] Q4_K blocks
+        MTL::Buffer* W_up,       // Up weights [N, K/256] Q4_K blocks
+        MTL::Buffer* Y_gate,     // Gate output [M, N] float
+        MTL::Buffer* Y_up,       // Up output [M, N] float
+        uint32_t M,              // Batch size (number of tokens)
+        uint32_t K,              // Input dimension
+        uint32_t N               // Output dimension (intermediate_size)
+    );
+
     // =============================================================================
     // LLM Operations - Q8_0 Quantized Matrix Multiply
     // =============================================================================

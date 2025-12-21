@@ -290,24 +290,32 @@ Result<Tensor> TransformerModel::forward(
                 backend_->unmap_buffer(token_ids.buffer());
 
                 // Use raw prefill path
-                auto raw_result = forward_prefill_raw(tokens, kv_cache);
+                bool last_token_only = prefill_last_token_only_ && batch == 1;
+                auto raw_result = forward_prefill_raw(tokens, kv_cache, last_token_only);
                 if (raw_result.ok()) {
                     // Raw path succeeded - create output Tensor wrapper
                     auto* logits_buf = static_cast<MTL::Buffer*>(raw_result.value());
 
                     // Allocate output tensor and copy from pool buffer
-                    std::vector<int64_t> logits_shape = {
-                        static_cast<int64_t>(batch),
-                        static_cast<int64_t>(seq_len),
-                        static_cast<int64_t>(model_config_.vocab_size)
-                    };
+                    std::vector<int64_t> logits_shape;
+                    if (last_token_only) {
+                        logits_shape = {1, 1, static_cast<int64_t>(model_config_.vocab_size)};
+                    } else {
+                        logits_shape = {
+                            static_cast<int64_t>(batch),
+                            static_cast<int64_t>(seq_len),
+                            static_cast<int64_t>(model_config_.vocab_size)
+                        };
+                    }
                     auto logits_result = Tensor::allocate(logits_shape, DataType::FP32, backend_);
                     if (logits_result.ok()) {
                         auto logits = std::move(logits_result).take();
                         auto* out_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(logits.buffer()));
 
                         // Copy from pool buffer to output tensor
-                        size_t copy_size = total_tokens * model_config_.vocab_size * sizeof(float);
+                        size_t copy_elems = last_token_only ? model_config_.vocab_size
+                                                           : total_tokens * model_config_.vocab_size;
+                        size_t copy_size = copy_elems * sizeof(float);
                         std::memcpy(out_buf->contents(), logits_buf->contents(), copy_size);
 
                         return logits;
@@ -3146,9 +3154,10 @@ Result<void> TransformerModel::transformer_block_prefill_raw(
             gpu->rms_norm_batch_f32_to_f16(post_attn_buf, ffn_norm_buf, matmul_f16_buf,
                                           num_tokens, hidden_dim, model_config_.rms_norm_eps);
         }
-        // Gate and Up projections using f16 matmul directly
-        gpu->matmul_q4k_f16(matmul_f16_buf, wgate_buf, gate_buf, num_tokens, hidden_dim, intermediate_dim);
-        gpu->matmul_q4k_f16(matmul_f16_buf, wup_buf, up_buf, num_tokens, hidden_dim, intermediate_dim);
+        // Fused Gate+Up projections: single kernel dispatch for both
+        // This reduces kernel launch overhead and shares input X loading
+        gpu->fused_gate_up_q4k(matmul_f16_buf, wgate_buf, wup_buf, gate_buf, up_buf,
+                               num_tokens, hidden_dim, intermediate_dim);
     } else {
         // Standard path
         if (ffn_norm_f16) {
@@ -3178,7 +3187,8 @@ Result<void> TransformerModel::transformer_block_prefill_raw(
 
 Result<void*> TransformerModel::forward_prefill_raw(
     const std::vector<int>& tokens,
-    KVCache* kv_cache)
+    KVCache* kv_cache,
+    bool last_token_only)
 {
     int num_tokens = static_cast<int>(tokens.size());
     if (num_tokens == 0) {
@@ -3213,8 +3223,12 @@ Result<void*> TransformerModel::forward_prefill_raw(
     auto* pipe_embedding = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("embedding_lookup"));
     auto* pipe_rms_batch = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("rms_norm_batch"));
     auto* pipe_rms_batch_f16 = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("rms_norm_batch_f16"));
+    auto* pipe_rms_batch_f32_to_f16 = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("rms_norm_batch_f32_to_f16"));
+    auto* pipe_rms_batch_f16w_to_f16 = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("rms_norm_batch_f16w_to_f16"));
     auto* pipe_matmul_q4k = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("matmul_q4k_simdgroup_11"));
     auto* pipe_matmul_q4k_fast = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("matmul_q4k_simdgroup_00"));
+    auto* pipe_matmul_q4k_f16 = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("matmul_q4k_simdgroup_f16_11"));
+    auto* pipe_matmul_q4k_f16_fast = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("matmul_q4k_simdgroup_f16_00"));
     auto* pipe_matmul_f16 = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("matmul_f16"));
 
     // Helper to select fast kernel when dimensions are aligned
@@ -3225,11 +3239,20 @@ Result<void*> TransformerModel::forward_prefill_raw(
         }
         return pipe_matmul_q4k;
     };
+    auto select_q4k_f16_pipe = [&](uint32_t m, uint32_t /*k*/, uint32_t n) -> MTL::ComputePipelineState* {
+        if (pipe_matmul_q4k_f16_fast && (m % 32 == 0) && (n % 64 == 0)) {
+            return pipe_matmul_q4k_f16_fast;
+        }
+        return pipe_matmul_q4k_f16;
+    };
     auto* pipe_rope = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("rope_multihead"));
     auto* pipe_kv_append = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("kv_cache_append_f16"));
     auto* pipe_attn = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("flash_attention_prefill"));
     auto* pipe_add = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("elementwise_add"));
     auto* pipe_silu_mul = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("silu_mul"));
+    auto* pipe_fused_gate_up = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("fused_gate_up_q4k_simdgroup_11"));
+    auto* pipe_fused_gate_up_fast = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("fused_gate_up_q4k_simdgroup_00"));
+    auto* pipe_convert_f32_to_f16 = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("convert_f32_to_f16"));
 
     // Model dimensions
     int hidden_dim = model_config_.hidden_dim;
@@ -3257,6 +3280,17 @@ Result<void*> TransformerModel::forward_prefill_raw(
     uint32_t hd_dim = static_cast<uint32_t>(head_dim);
     uint32_t ms = static_cast<uint32_t>(max_seq);
     uint32_t vs = static_cast<uint32_t>(vocab_size);
+
+    auto can_use_f16_fast = [](uint32_t m, uint32_t k, uint32_t n) {
+        return m >= 32 && (m % 32 == 0) && (n % 64 == 0) && (k % 32 == 0);
+    };
+
+    auto select_fused_gate_up_pipe = [&](uint32_t m, uint32_t /*k*/, uint32_t n) -> MTL::ComputePipelineState* {
+        if (pipe_fused_gate_up_fast && (m % 32 == 0) && (n % 64 == 0)) {
+            return pipe_fused_gate_up_fast;
+        }
+        return pipe_fused_gate_up;
+    };
 
     // Simdgroup matmul constants
     constexpr uint32_t NR0 = 64;  // Output cols per threadgroup
@@ -3292,6 +3326,7 @@ Result<void*> TransformerModel::forward_prefill_raw(
     auto* attn_out_buf = static_cast<MTL::Buffer*>(prefill_pool_->attn_out_buf);
     auto* gate_buf = static_cast<MTL::Buffer*>(prefill_pool_->ffn_gate_buf);
     auto* up_buf = static_cast<MTL::Buffer*>(prefill_pool_->ffn_up_buf);
+    auto* matmul_f16_buf = static_cast<MTL::Buffer*>(prefill_pool_->matmul_input_f16);
     auto* norm_out_buf = static_cast<MTL::Buffer*>(prefill_pool_->norm_out_buf);
     auto* logits_buf = static_cast<MTL::Buffer*>(prefill_pool_->logits_buf);
 
@@ -3344,14 +3379,44 @@ Result<void*> TransformerModel::forward_prefill_raw(
 
         bool attn_f16 = wc.attn_norm_f16;
         bool ffn_f16 = wc.ffn_norm_f16;
+        bool use_attn_f16 = (wc.wq_qtype == GGMLType::Q4_K) &&
+                            (wc.wk_qtype == GGMLType::Q4_K) &&
+                            (wc.wv_qtype == GGMLType::Q4_K) &&
+                            can_use_f16_fast(M, hd, qd) &&
+                            can_use_f16_fast(M, hd, kvd) &&
+                            pipe_rms_batch_f32_to_f16 &&
+                            pipe_rms_batch_f16w_to_f16 &&
+                            pipe_matmul_q4k_f16;
+        bool use_ffn_f16 = (wc.wgate_qtype == GGMLType::Q4_K) &&
+                           (wc.wup_qtype == GGMLType::Q4_K) &&
+                           can_use_f16_fast(M, hd, intd) &&
+                           pipe_rms_batch_f32_to_f16 &&
+                           pipe_rms_batch_f16w_to_f16 &&
+                           pipe_matmul_q4k_f16 &&
+                           pipe_fused_gate_up;
+        bool use_wo_f16 = (wc.wo_qtype == GGMLType::Q4_K) &&
+                          can_use_f16_fast(M, qd, hd) &&
+                          pipe_matmul_q4k_f16 &&
+                          pipe_convert_f32_to_f16;
+        bool use_wdown_f16 = (wc.wdown_qtype == GGMLType::Q4_K) &&
+                             can_use_f16_fast(M, intd, hd) &&
+                             pipe_matmul_q4k_f16 &&
+                             pipe_convert_f32_to_f16;
 
         // ---------------------------------------------------------------------
         // 1. Attention RMSNorm
         // ---------------------------------------------------------------------
-        enc->setComputePipelineState(attn_f16 ? pipe_rms_batch_f16 : pipe_rms_batch);
-        enc->setBuffer(hidden_buf, 0, 0);
-        enc->setBuffer(attn_norm_buf, 0, 1);
-        enc->setBuffer(attn_input_buf, 0, 2);
+        if (use_attn_f16) {
+            enc->setComputePipelineState(attn_f16 ? pipe_rms_batch_f16w_to_f16 : pipe_rms_batch_f32_to_f16);
+            enc->setBuffer(hidden_buf, 0, 0);
+            enc->setBuffer(attn_norm_buf, 0, 1);
+            enc->setBuffer(matmul_f16_buf, 0, 2);
+        } else {
+            enc->setComputePipelineState(attn_f16 ? pipe_rms_batch_f16 : pipe_rms_batch);
+            enc->setBuffer(hidden_buf, 0, 0);
+            enc->setBuffer(attn_norm_buf, 0, 1);
+            enc->setBuffer(attn_input_buf, 0, 2);
+        }
         enc->setBytes(&M, 4, 3);
         enc->setBytes(&hd, 4, 4);
         enc->setBytes(&eps, 4, 5);
@@ -3360,8 +3425,8 @@ Result<void*> TransformerModel::forward_prefill_raw(
         // ---------------------------------------------------------------------
         // 2. Q projection: [M, hidden] @ [q_dim, hidden]^T -> [M, q_dim]
         // ---------------------------------------------------------------------
-        enc->setComputePipelineState(select_q4k_pipe(M, hd, qd));
-        enc->setBuffer(attn_input_buf, 0, 0);
+        enc->setComputePipelineState(use_attn_f16 ? select_q4k_f16_pipe(M, hd, qd) : select_q4k_pipe(M, hd, qd));
+        enc->setBuffer(use_attn_f16 ? matmul_f16_buf : attn_input_buf, 0, 0);
         enc->setBuffer(wq_buf, 0, 1);
         enc->setBuffer(q_buf, 0, 2);
         enc->setBytes(&M, 4, 3);
@@ -3374,8 +3439,8 @@ Result<void*> TransformerModel::forward_prefill_raw(
         // ---------------------------------------------------------------------
         // 3. K projection: [M, hidden] @ [kv_dim, hidden]^T -> [M, kv_dim]
         // ---------------------------------------------------------------------
-        enc->setComputePipelineState(select_q4k_pipe(M, hd, kvd));
-        enc->setBuffer(attn_input_buf, 0, 0);
+        enc->setComputePipelineState(use_attn_f16 ? select_q4k_f16_pipe(M, hd, kvd) : select_q4k_pipe(M, hd, kvd));
+        enc->setBuffer(use_attn_f16 ? matmul_f16_buf : attn_input_buf, 0, 0);
         enc->setBuffer(wk_buf, 0, 1);
         enc->setBuffer(k_buf, 0, 2);
         enc->setBytes(&M, 4, 3);
@@ -3388,8 +3453,8 @@ Result<void*> TransformerModel::forward_prefill_raw(
         // ---------------------------------------------------------------------
         // 4. V projection: [M, hidden] @ [kv_dim, hidden]^T -> [M, kv_dim]
         // ---------------------------------------------------------------------
-        enc->setComputePipelineState(select_q4k_pipe(M, hd, kvd));
-        enc->setBuffer(attn_input_buf, 0, 0);
+        enc->setComputePipelineState(use_attn_f16 ? select_q4k_f16_pipe(M, hd, kvd) : select_q4k_pipe(M, hd, kvd));
+        enc->setBuffer(use_attn_f16 ? matmul_f16_buf : attn_input_buf, 0, 0);
         enc->setBuffer(wv_buf, 0, 1);
         enc->setBuffer(v_buf, 0, 2);
         enc->setBytes(&M, 4, 3);
@@ -3460,16 +3525,36 @@ Result<void*> TransformerModel::forward_prefill_raw(
         // ---------------------------------------------------------------------
         // 8. Output projection (Wo): [M, q_dim] @ [hidden, q_dim]^T -> [M, hidden]
         // ---------------------------------------------------------------------
-        enc->setComputePipelineState(select_q4k_pipe(M, qd, hd));
-        enc->setBuffer(attn_out_buf, 0, 0);
-        enc->setBuffer(wo_buf, 0, 1);
-        enc->setBuffer(attn_input_buf, 0, 2);  // reuse buffer
-        enc->setBytes(&M, 4, 3);
-        enc->setBytes(&qd, 4, 4);
-        enc->setBytes(&hd, 4, 5);
-        enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
-        enc->dispatchThreadgroups(MTL::Size::Make((M + NR1 - 1) / NR1, (hd + NR0 - 1) / NR0, 1),
-                                  MTL::Size::Make(128, 1, 1));
+        if (use_wo_f16) {
+            uint32_t count_q = M * qd;
+            enc->setComputePipelineState(pipe_convert_f32_to_f16);
+            enc->setBuffer(attn_out_buf, 0, 0);
+            enc->setBuffer(matmul_f16_buf, 0, 1);
+            enc->setBytes(&count_q, 4, 2);
+            enc->dispatchThreads(MTL::Size::Make(count_q, 1, 1), MTL::Size::Make(256, 1, 1));
+
+            enc->setComputePipelineState(select_q4k_f16_pipe(M, qd, hd));
+            enc->setBuffer(matmul_f16_buf, 0, 0);
+            enc->setBuffer(wo_buf, 0, 1);
+            enc->setBuffer(attn_input_buf, 0, 2);  // reuse buffer
+            enc->setBytes(&M, 4, 3);
+            enc->setBytes(&qd, 4, 4);
+            enc->setBytes(&hd, 4, 5);
+            enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
+            enc->dispatchThreadgroups(MTL::Size::Make((M + NR1 - 1) / NR1, (hd + NR0 - 1) / NR0, 1),
+                                      MTL::Size::Make(128, 1, 1));
+        } else {
+            enc->setComputePipelineState(select_q4k_pipe(M, qd, hd));
+            enc->setBuffer(attn_out_buf, 0, 0);
+            enc->setBuffer(wo_buf, 0, 1);
+            enc->setBuffer(attn_input_buf, 0, 2);  // reuse buffer
+            enc->setBytes(&M, 4, 3);
+            enc->setBytes(&qd, 4, 4);
+            enc->setBytes(&hd, 4, 5);
+            enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
+            enc->dispatchThreadgroups(MTL::Size::Make((M + NR1 - 1) / NR1, (hd + NR0 - 1) / NR0, 1),
+                                      MTL::Size::Make(128, 1, 1));
+        }
 
         // ---------------------------------------------------------------------
         // 9. Attention residual add (vectorized - 4 elements per thread)
@@ -3485,10 +3570,17 @@ Result<void*> TransformerModel::forward_prefill_raw(
         // ---------------------------------------------------------------------
         // 10. FFN RMSNorm
         // ---------------------------------------------------------------------
-        enc->setComputePipelineState(ffn_f16 ? pipe_rms_batch_f16 : pipe_rms_batch);
-        enc->setBuffer(post_attn_buf, 0, 0);
-        enc->setBuffer(ffn_norm_buf, 0, 1);
-        enc->setBuffer(ffn_input_buf, 0, 2);
+        if (use_ffn_f16) {
+            enc->setComputePipelineState(ffn_f16 ? pipe_rms_batch_f16w_to_f16 : pipe_rms_batch_f32_to_f16);
+            enc->setBuffer(post_attn_buf, 0, 0);
+            enc->setBuffer(ffn_norm_buf, 0, 1);
+            enc->setBuffer(matmul_f16_buf, 0, 2);
+        } else {
+            enc->setComputePipelineState(ffn_f16 ? pipe_rms_batch_f16 : pipe_rms_batch);
+            enc->setBuffer(post_attn_buf, 0, 0);
+            enc->setBuffer(ffn_norm_buf, 0, 1);
+            enc->setBuffer(ffn_input_buf, 0, 2);
+        }
         enc->setBytes(&M, 4, 3);
         enc->setBytes(&hd, 4, 4);
         enc->setBytes(&eps, 4, 5);
@@ -3497,30 +3589,50 @@ Result<void*> TransformerModel::forward_prefill_raw(
         // ---------------------------------------------------------------------
         // 11. Gate projection: [M, hidden] @ [intermediate, hidden]^T
         // ---------------------------------------------------------------------
-        enc->setComputePipelineState(select_q4k_pipe(M, hd, intd));
-        enc->setBuffer(ffn_input_buf, 0, 0);
-        enc->setBuffer(wgate_buf, 0, 1);
-        enc->setBuffer(gate_buf, 0, 2);
-        enc->setBytes(&M, 4, 3);
-        enc->setBytes(&hd, 4, 4);
-        enc->setBytes(&intd, 4, 5);
-        enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
-        enc->dispatchThreadgroups(MTL::Size::Make((M + NR1 - 1) / NR1, (intd + NR0 - 1) / NR0, 1),
-                                  MTL::Size::Make(128, 1, 1));
+        if (use_ffn_f16) {
+            enc->setComputePipelineState(select_fused_gate_up_pipe(M, hd, intd));
+            enc->setBuffer(matmul_f16_buf, 0, 0);
+            enc->setBuffer(wgate_buf, 0, 1);
+            enc->setBuffer(wup_buf, 0, 2);
+            enc->setBuffer(gate_buf, 0, 3);
+            enc->setBuffer(up_buf, 0, 4);
+            enc->setBytes(&M, 4, 5);
+            enc->setBytes(&hd, 4, 6);
+            enc->setBytes(&intd, 4, 7);
+            enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
+
+            uint32_t num_m_tiles = (M + NR1 - 1) / NR1;
+            uint32_t num_n_tiles = (intd + NR0 - 1) / NR0;
+            enc->dispatchThreadgroups(MTL::Size::Make(num_m_tiles, num_n_tiles, 2),
+                                      MTL::Size::Make(128, 1, 1));
+        } else {
+            enc->setComputePipelineState(select_q4k_pipe(M, hd, intd));
+            enc->setBuffer(ffn_input_buf, 0, 0);
+            enc->setBuffer(wgate_buf, 0, 1);
+            enc->setBuffer(gate_buf, 0, 2);
+            enc->setBytes(&M, 4, 3);
+            enc->setBytes(&hd, 4, 4);
+            enc->setBytes(&intd, 4, 5);
+            enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
+            enc->dispatchThreadgroups(MTL::Size::Make((M + NR1 - 1) / NR1, (intd + NR0 - 1) / NR0, 1),
+                                      MTL::Size::Make(128, 1, 1));
+        }
 
         // ---------------------------------------------------------------------
         // 12. Up projection: [M, hidden] @ [intermediate, hidden]^T
         // ---------------------------------------------------------------------
-        enc->setComputePipelineState(select_q4k_pipe(M, hd, intd));
-        enc->setBuffer(ffn_input_buf, 0, 0);
-        enc->setBuffer(wup_buf, 0, 1);
-        enc->setBuffer(up_buf, 0, 2);
-        enc->setBytes(&M, 4, 3);
-        enc->setBytes(&hd, 4, 4);
-        enc->setBytes(&intd, 4, 5);
-        enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
-        enc->dispatchThreadgroups(MTL::Size::Make((M + NR1 - 1) / NR1, (intd + NR0 - 1) / NR0, 1),
-                                  MTL::Size::Make(128, 1, 1));
+        if (!use_ffn_f16) {
+            enc->setComputePipelineState(select_q4k_pipe(M, hd, intd));
+            enc->setBuffer(ffn_input_buf, 0, 0);
+            enc->setBuffer(wup_buf, 0, 1);
+            enc->setBuffer(up_buf, 0, 2);
+            enc->setBytes(&M, 4, 3);
+            enc->setBytes(&hd, 4, 4);
+            enc->setBytes(&intd, 4, 5);
+            enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
+            enc->dispatchThreadgroups(MTL::Size::Make((M + NR1 - 1) / NR1, (intd + NR0 - 1) / NR0, 1),
+                                      MTL::Size::Make(128, 1, 1));
+        }
 
         // ---------------------------------------------------------------------
         // 13. SiLU activation + multiply (vectorized - 4 elements per thread)
@@ -3536,16 +3648,35 @@ Result<void*> TransformerModel::forward_prefill_raw(
         // ---------------------------------------------------------------------
         // 14. Down projection: [M, intermediate] @ [hidden, intermediate]^T
         // ---------------------------------------------------------------------
-        enc->setComputePipelineState(select_q4k_pipe(M, intd, hd));
-        enc->setBuffer(gate_buf, 0, 0);
-        enc->setBuffer(wdown_buf, 0, 1);
-        enc->setBuffer(ffn_input_buf, 0, 2);  // reuse buffer
-        enc->setBytes(&M, 4, 3);
-        enc->setBytes(&intd, 4, 4);
-        enc->setBytes(&hd, 4, 5);
-        enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
-        enc->dispatchThreadgroups(MTL::Size::Make((M + NR1 - 1) / NR1, (hd + NR0 - 1) / NR0, 1),
-                                  MTL::Size::Make(128, 1, 1));
+        if (use_wdown_f16) {
+            enc->setComputePipelineState(pipe_convert_f32_to_f16);
+            enc->setBuffer(gate_buf, 0, 0);
+            enc->setBuffer(matmul_f16_buf, 0, 1);
+            enc->setBytes(&count_int, 4, 2);
+            enc->dispatchThreads(MTL::Size::Make(count_int, 1, 1), MTL::Size::Make(256, 1, 1));
+
+            enc->setComputePipelineState(select_q4k_f16_pipe(M, intd, hd));
+            enc->setBuffer(matmul_f16_buf, 0, 0);
+            enc->setBuffer(wdown_buf, 0, 1);
+            enc->setBuffer(ffn_input_buf, 0, 2);  // reuse buffer
+            enc->setBytes(&M, 4, 3);
+            enc->setBytes(&intd, 4, 4);
+            enc->setBytes(&hd, 4, 5);
+            enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
+            enc->dispatchThreadgroups(MTL::Size::Make((M + NR1 - 1) / NR1, (hd + NR0 - 1) / NR0, 1),
+                                      MTL::Size::Make(128, 1, 1));
+        } else {
+            enc->setComputePipelineState(select_q4k_pipe(M, intd, hd));
+            enc->setBuffer(gate_buf, 0, 0);
+            enc->setBuffer(wdown_buf, 0, 1);
+            enc->setBuffer(ffn_input_buf, 0, 2);  // reuse buffer
+            enc->setBytes(&M, 4, 3);
+            enc->setBytes(&intd, 4, 4);
+            enc->setBytes(&hd, 4, 5);
+            enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
+            enc->dispatchThreadgroups(MTL::Size::Make((M + NR1 - 1) / NR1, (hd + NR0 - 1) / NR0, 1),
+                                      MTL::Size::Make(128, 1, 1));
+        }
 
         // ---------------------------------------------------------------------
         // 15. FFN residual add -> hidden_buf for next layer (vectorized)
@@ -3574,14 +3705,16 @@ Result<void*> TransformerModel::forward_prefill_raw(
     enc->dispatchThreadgroups(MTL::Size::Make(M, 1, 1), MTL::Size::Make(256, 1, 1));
 
     // Output projection (FP16 matmul)
+    uint32_t out_M = last_token_only ? 1 : M;
+    size_t norm_offset = last_token_only ? static_cast<size_t>(M - 1) * hd * sizeof(float) : 0;
     enc->setComputePipelineState(pipe_matmul_f16);
-    enc->setBuffer(norm_out_buf, 0, 0);
+    enc->setBuffer(norm_out_buf, norm_offset, 0);
     enc->setBuffer(out_w_buf, 0, 1);
     enc->setBuffer(logits_buf, 0, 2);
-    enc->setBytes(&M, 4, 3);
+    enc->setBytes(&out_M, 4, 3);
     enc->setBytes(&hd, 4, 4);
     enc->setBytes(&vs, 4, 5);
-    enc->dispatchThreads(MTL::Size::Make(vs, M, 1), MTL::Size::Make(16, 16, 1));
+    enc->dispatchThreads(MTL::Size::Make(vs, out_M, 1), MTL::Size::Make(16, 16, 1));
 
     // =========================================================================
     // SYNC AND RETURN
@@ -4131,13 +4264,34 @@ void TransformerModel::init_layer_weight_cache() {
         const RawWeight* raw_wup = get_raw_weight(prefix + "ffn_up.weight");
         const RawWeight* raw_wdown = get_raw_weight(prefix + "ffn_down.weight");
 
-        if (raw_wq) cache.wq_buf = backend_->get_native_buffer(raw_wq->buffer);
-        if (raw_wk) cache.wk_buf = backend_->get_native_buffer(raw_wk->buffer);
-        if (raw_wv) cache.wv_buf = backend_->get_native_buffer(raw_wv->buffer);
-        if (raw_wo) cache.wo_buf = backend_->get_native_buffer(raw_wo->buffer);
-        if (raw_wgate) cache.wgate_buf = backend_->get_native_buffer(raw_wgate->buffer);
-        if (raw_wup) cache.wup_buf = backend_->get_native_buffer(raw_wup->buffer);
-        if (raw_wdown) cache.wdown_buf = backend_->get_native_buffer(raw_wdown->buffer);
+        if (raw_wq) {
+            cache.wq_buf = backend_->get_native_buffer(raw_wq->buffer);
+            cache.wq_qtype = raw_wq->quant_type;
+        }
+        if (raw_wk) {
+            cache.wk_buf = backend_->get_native_buffer(raw_wk->buffer);
+            cache.wk_qtype = raw_wk->quant_type;
+        }
+        if (raw_wv) {
+            cache.wv_buf = backend_->get_native_buffer(raw_wv->buffer);
+            cache.wv_qtype = raw_wv->quant_type;
+        }
+        if (raw_wo) {
+            cache.wo_buf = backend_->get_native_buffer(raw_wo->buffer);
+            cache.wo_qtype = raw_wo->quant_type;
+        }
+        if (raw_wgate) {
+            cache.wgate_buf = backend_->get_native_buffer(raw_wgate->buffer);
+            cache.wgate_qtype = raw_wgate->quant_type;
+        }
+        if (raw_wup) {
+            cache.wup_buf = backend_->get_native_buffer(raw_wup->buffer);
+            cache.wup_qtype = raw_wup->quant_type;
+        }
+        if (raw_wdown) {
+            cache.wdown_buf = backend_->get_native_buffer(raw_wdown->buffer);
+            cache.wdown_qtype = raw_wdown->quant_type;
+        }
     }
 
     layer_cache_initialized_ = true;

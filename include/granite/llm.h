@@ -408,6 +408,10 @@ public:
     void set_use_gpu(bool use_gpu) { use_gpu_ = use_gpu; }
     [[nodiscard]] bool use_gpu() const { return use_gpu_; }
 
+    /// When enabled, prefill returns logits for the last token only (batch=1).
+    void set_prefill_last_token_only(bool enable) { prefill_last_token_only_ = enable; }
+    [[nodiscard]] bool prefill_last_token_only() const { return prefill_last_token_only_; }
+
     /// Get raw weight by name (for GPU path)
     [[nodiscard]] const RawWeight* get_raw_weight(const std::string& name) const;
 
@@ -453,6 +457,7 @@ private:
     IComputeBackend* backend_ = nullptr;
     std::unique_ptr<GGUFFile> gguf_;
     bool use_gpu_ = false;
+    bool prefill_last_token_only_ = false;
 
 #ifdef GRANITE_HAS_METAL
     std::unique_ptr<GPUKVCache> gpu_kv_cache_;
@@ -538,6 +543,13 @@ private:
         void* wgate_buf = nullptr;
         void* wup_buf = nullptr;
         void* wdown_buf = nullptr;
+        GGMLType wq_qtype = GGMLType::F32;
+        GGMLType wk_qtype = GGMLType::F32;
+        GGMLType wv_qtype = GGMLType::F32;
+        GGMLType wo_qtype = GGMLType::F32;
+        GGMLType wgate_qtype = GGMLType::F32;
+        GGMLType wup_qtype = GGMLType::F32;
+        GGMLType wdown_qtype = GGMLType::F32;
     };
     std::vector<LayerWeightCache> layer_weight_cache_;
     bool layer_cache_initialized_ = false;
@@ -587,7 +599,8 @@ private:
     // This is the fast path that avoids Tensor allocation overhead
     Result<void*> forward_prefill_raw(
         const std::vector<int>& tokens,
-        KVCache* kv_cache);
+        KVCache* kv_cache,
+        bool last_token_only);
 
     // Single layer forward with raw buffers
     // hidden_buf is both input and output (in-place update)

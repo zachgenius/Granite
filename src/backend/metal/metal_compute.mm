@@ -340,6 +340,50 @@ public:
         return {};
     }
 
+    // Fused gate+up simdgroup matmul dispatch
+    // Computes both gate and up projections in a single kernel launch
+    // Grid z=0 for gate, z=1 for up - both share the same input X loading
+    Result<void> dispatch_fused_gate_up(
+        const char* kernel_name,
+        MTL::Buffer* X, MTL::Buffer* W_gate, MTL::Buffer* W_up,
+        MTL::Buffer* Y_gate, MTL::Buffer* Y_up,
+        uint32_t M, uint32_t K, uint32_t N)
+    {
+        auto* encoder = get_encoder();
+        auto* pipeline = get_pipeline(kernel_name);
+        if (!pipeline) {
+            return Error(ErrorCode::InternalError, std::string(kernel_name) + " pipeline not found");
+        }
+
+        encoder->setComputePipelineState(pipeline);
+        encoder->setBuffer(X, 0, 0);
+        encoder->setBuffer(W_gate, 0, 1);
+        encoder->setBuffer(W_up, 0, 2);
+        encoder->setBuffer(Y_gate, 0, 3);
+        encoder->setBuffer(Y_up, 0, 4);
+        encoder->setBytes(&M, sizeof(M), 5);
+        encoder->setBytes(&K, sizeof(K), 6);
+        encoder->setBytes(&N, sizeof(N), 7);
+
+        // Set threadgroup memory (same as simdgroup matmul)
+        constexpr size_t shmem_size = 8192;  // 8KB
+        encoder->setThreadgroupMemoryLength(shmem_size, 0);
+
+        // Tiling constants (same as matmul_q4k_simdgroup)
+        constexpr uint32_t NR0 = 64;  // N (output cols) per threadgroup
+        constexpr uint32_t NR1 = 32;  // M (batch rows) per threadgroup
+
+        // Grid: x = M tiles, y = N tiles, z = 2 (gate and up)
+        uint32_t num_m_tiles = (M + NR1 - 1) / NR1;
+        uint32_t num_n_tiles = (N + NR0 - 1) / NR0;
+        MTL::Size grid_size = MTL::Size::Make(num_m_tiles, num_n_tiles, 2);
+
+        MTL::Size threadgroup_size = MTL::Size::Make(128, 1, 1);
+        encoder->dispatchThreadgroups(grid_size, threadgroup_size);
+
+        return {};
+    }
+
     // Fused RMSNorm + matvec dispatch
     // Uses 8 rows per threadgroup with 256 threads
     Result<void> dispatch_rms_norm_matvec(
@@ -571,6 +615,42 @@ private:
             GRANITE_LOG_DEBUG("Created Metal pipeline: {} (bc_inp={}, bc_out={})", v.name, v.bc_inp, v.bc_out);
         }
 
+        // Compile fused_gate_up_q4k_simdgroup with function constants
+        // This kernel fuses gate and up projections into a single dispatch
+        SgmmVariant fused_gate_up_variants[] = {
+            {"fused_gate_up_q4k_simdgroup_00", false, false},
+            {"fused_gate_up_q4k_simdgroup_01", false, true},
+            {"fused_gate_up_q4k_simdgroup_10", true, false},
+            {"fused_gate_up_q4k_simdgroup_11", true, true},
+        };
+
+        NS::String* fused_gate_up_func_name = NS::String::string("fused_gate_up_q4k_simdgroup", NS::UTF8StringEncoding);
+
+        for (const auto& v : fused_gate_up_variants) {
+            MTL::FunctionConstantValues* fc_values = MTL::FunctionConstantValues::alloc()->init();
+            fc_values->setConstantValue(&v.bc_inp, MTL::DataTypeBool, FC_MUL_MM + 0);
+            fc_values->setConstantValue(&v.bc_out, MTL::DataTypeBool, FC_MUL_MM + 1);
+
+            MTL::Function* func = library->newFunction(fused_gate_up_func_name, fc_values, &error);
+            fc_values->release();
+
+            if (!func) {
+                GRANITE_LOG_WARN("Function '{}' not found with constants", v.name);
+                continue;
+            }
+
+            MTL::ComputePipelineState* pipeline = device_->newComputePipelineState(func, &error);
+            func->release();
+
+            if (!pipeline) {
+                GRANITE_LOG_WARN("Failed to create pipeline for '{}'", v.name);
+                continue;
+            }
+
+            pipelines_[v.name] = pipeline;
+            GRANITE_LOG_DEBUG("Created Metal pipeline: {} (bc_inp={}, bc_out={})", v.name, v.bc_inp, v.bc_out);
+        }
+
         library->release();
         return {};
     }
@@ -723,6 +803,34 @@ Result<void> MetalCompute::matmul_q4k_f16(
     // For small batches, convert to FP32 on-the-fly is not worth it - fall back to FP32 kernel
     // The caller should use convert_f32_to_f16 only when M >= 32
     return matmul_q4k(X, W, Y, M, K, N);
+}
+
+Result<void> MetalCompute::fused_gate_up_q4k(
+    MTL::Buffer* X, MTL::Buffer* W_gate, MTL::Buffer* W_up,
+    MTL::Buffer* Y_gate, MTL::Buffer* Y_up,
+    uint32_t M, uint32_t K, uint32_t N)
+{
+    // Fused gate+up kernel for FFN in transformer prefill
+    // Computes both gate and up projections in a single dispatch:
+    //   Y_gate = X @ W_gate^T  (for SiLU gate)
+    //   Y_up   = X @ W_up^T    (for up projection)
+    // Both share the same input X loading, reducing memory bandwidth.
+    // Uses FP16 input X, Q4_K quantized weights, FP32 output.
+    if (M >= 32) {
+        if (M % 32 == 0 && N % 64 == 0) {
+            return impl_->dispatch_fused_gate_up(
+                "fused_gate_up_q4k_simdgroup_00",
+                X, W_gate, W_up, Y_gate, Y_up, M, K, N);
+        }
+        return impl_->dispatch_fused_gate_up(
+            "fused_gate_up_q4k_simdgroup_11",
+            X, W_gate, W_up, Y_gate, Y_up, M, K, N);
+    }
+    // For small batches, fall back to separate matmul calls
+    // (fused kernel not worth the overhead for decode)
+    auto res = matmul_q4k_f16(X, W_gate, Y_gate, M, K, N);
+    if (!res.ok()) return res;
+    return matmul_q4k_f16(X, W_up, Y_up, M, K, N);
 }
 
 // -----------------------------------------------------------------------------
