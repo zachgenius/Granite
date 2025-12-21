@@ -3281,6 +3281,8 @@ Result<void*> TransformerModel::forward_prefill_raw(
     auto* pipe_matmul_q4k_fast = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("matmul_q4k_simdgroup_00"));
     auto* pipe_matmul_q4k_f16 = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("matmul_q4k_simdgroup_f16_11"));
     auto* pipe_matmul_q4k_f16_fast = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("matmul_q4k_simdgroup_f16_00"));
+    auto* pipe_fused_qkv = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("fused_qkv_matmul_q4k_simdgroup_11"));
+    auto* pipe_fused_qkv_fast = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("fused_qkv_matmul_q4k_simdgroup_00"));
     auto* pipe_matmul_f16 = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("matmul_f16"));
     auto* pipe_matvec_f16 = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("matvec_f16"));
     auto* pipe_matmul_f16_sg = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline("matmul_f16_simdgroup_11"));
@@ -3299,6 +3301,12 @@ Result<void*> TransformerModel::forward_prefill_raw(
             return pipe_matmul_q4k_f16_fast;
         }
         return pipe_matmul_q4k_f16;
+    };
+    auto select_fused_qkv_pipe = [&](uint32_t m, uint32_t n_q, uint32_t n_kv) -> MTL::ComputePipelineState* {
+        if (pipe_fused_qkv_fast && (m % 32 == 0) && (n_q % 64 == 0) && (n_kv % 64 == 0)) {
+            return pipe_fused_qkv_fast;
+        }
+        return pipe_fused_qkv;
     };
     auto select_f16_sg_pipe = [&](uint32_t m, uint32_t /*k*/, uint32_t n) -> MTL::ComputePipelineState* {
         if (pipe_matmul_f16_sg_fast && (m % 32 == 0) && (n % 64 == 0)) {
@@ -3491,6 +3499,11 @@ Result<void*> TransformerModel::forward_prefill_raw(
                                      can_use_f16_fast(M_chunk, intd, hd) &&
                                      pipe_matmul_q4k_f16 &&
                                      pipe_convert_f32_to_f16;
+                bool use_fused_qkv = !use_attn_f16 &&
+                                     (wc.wq_qtype == GGMLType::Q4_K) &&
+                                     (wc.wk_qtype == GGMLType::Q4_K) &&
+                                     (wc.wv_qtype == GGMLType::Q4_K) &&
+                                     pipe_fused_qkv;
 
                 // -----------------------------------------------------------------
                 // 1. Attention RMSNorm
@@ -3512,49 +3525,66 @@ Result<void*> TransformerModel::forward_prefill_raw(
                 enc->dispatchThreadgroups(MTL::Size::Make(M_chunk, 1, 1), MTL::Size::Make(256, 1, 1));
 
                 // -----------------------------------------------------------------
-                // 2. Q projection: [M, hidden] @ [q_dim, hidden]^T -> [M, q_dim]
+                // 2-4. Q/K/V projections
                 // -----------------------------------------------------------------
-                enc->setComputePipelineState(use_attn_f16 ? select_q4k_f16_pipe(M_chunk, hd, qd)
-                                                          : select_q4k_pipe(M_chunk, hd, qd));
-                enc->setBuffer(use_attn_f16 ? matmul_f16_buf : attn_input_buf, 0, 0);
-                enc->setBuffer(wq_buf, 0, 1);
-                enc->setBuffer(q_buf, 0, 2);
-                enc->setBytes(&M_chunk, 4, 3);
-                enc->setBytes(&hd, 4, 4);
-                enc->setBytes(&qd, 4, 5);
-                enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
-                enc->dispatchThreadgroups(MTL::Size::Make((M_chunk + NR1 - 1) / NR1, (qd + NR0 - 1) / NR0, 1),
-                                          MTL::Size::Make(128, 1, 1));
+                if (use_fused_qkv) {
+                    uint32_t nmax = std::max(qd, kvd);
+                    enc->setComputePipelineState(select_fused_qkv_pipe(M_chunk, qd, kvd));
+                    enc->setBuffer(attn_input_buf, 0, 0);
+                    enc->setBuffer(wq_buf, 0, 1);
+                    enc->setBuffer(wk_buf, 0, 2);
+                    enc->setBuffer(wv_buf, 0, 3);
+                    enc->setBuffer(q_buf, 0, 4);
+                    enc->setBuffer(k_buf, 0, 5);
+                    enc->setBuffer(v_buf, 0, 6);
+                    enc->setBytes(&M_chunk, 4, 7);
+                    enc->setBytes(&hd, 4, 8);
+                    enc->setBytes(&qd, 4, 9);
+                    enc->setBytes(&kvd, 4, 10);
+                    enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
+                    enc->dispatchThreadgroups(MTL::Size::Make((M_chunk + NR1 - 1) / NR1,
+                                                              (nmax + NR0 - 1) / NR0, 1),
+                                              MTL::Size::Make(128, 1, 1));
+                } else {
+                    // Q projection
+                    enc->setComputePipelineState(use_attn_f16 ? select_q4k_f16_pipe(M_chunk, hd, qd)
+                                                              : select_q4k_pipe(M_chunk, hd, qd));
+                    enc->setBuffer(use_attn_f16 ? matmul_f16_buf : attn_input_buf, 0, 0);
+                    enc->setBuffer(wq_buf, 0, 1);
+                    enc->setBuffer(q_buf, 0, 2);
+                    enc->setBytes(&M_chunk, 4, 3);
+                    enc->setBytes(&hd, 4, 4);
+                    enc->setBytes(&qd, 4, 5);
+                    enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
+                    enc->dispatchThreadgroups(MTL::Size::Make((M_chunk + NR1 - 1) / NR1, (qd + NR0 - 1) / NR0, 1),
+                                              MTL::Size::Make(128, 1, 1));
 
-                // -----------------------------------------------------------------
-                // 3. K projection: [M, hidden] @ [kv_dim, hidden]^T -> [M, kv_dim]
-                // -----------------------------------------------------------------
-                enc->setComputePipelineState(use_attn_f16 ? select_q4k_f16_pipe(M_chunk, hd, kvd)
-                                                          : select_q4k_pipe(M_chunk, hd, kvd));
-                enc->setBuffer(use_attn_f16 ? matmul_f16_buf : attn_input_buf, 0, 0);
-                enc->setBuffer(wk_buf, 0, 1);
-                enc->setBuffer(k_buf, 0, 2);
-                enc->setBytes(&M_chunk, 4, 3);
-                enc->setBytes(&hd, 4, 4);
-                enc->setBytes(&kvd, 4, 5);
-                enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
-                enc->dispatchThreadgroups(MTL::Size::Make((M_chunk + NR1 - 1) / NR1, (kvd + NR0 - 1) / NR0, 1),
-                                          MTL::Size::Make(128, 1, 1));
+                    // K projection
+                    enc->setComputePipelineState(use_attn_f16 ? select_q4k_f16_pipe(M_chunk, hd, kvd)
+                                                              : select_q4k_pipe(M_chunk, hd, kvd));
+                    enc->setBuffer(use_attn_f16 ? matmul_f16_buf : attn_input_buf, 0, 0);
+                    enc->setBuffer(wk_buf, 0, 1);
+                    enc->setBuffer(k_buf, 0, 2);
+                    enc->setBytes(&M_chunk, 4, 3);
+                    enc->setBytes(&hd, 4, 4);
+                    enc->setBytes(&kvd, 4, 5);
+                    enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
+                    enc->dispatchThreadgroups(MTL::Size::Make((M_chunk + NR1 - 1) / NR1, (kvd + NR0 - 1) / NR0, 1),
+                                              MTL::Size::Make(128, 1, 1));
 
-                // -----------------------------------------------------------------
-                // 4. V projection: [M, hidden] @ [kv_dim, hidden]^T -> [M, kv_dim]
-                // -----------------------------------------------------------------
-                enc->setComputePipelineState(use_attn_f16 ? select_q4k_f16_pipe(M_chunk, hd, kvd)
-                                                          : select_q4k_pipe(M_chunk, hd, kvd));
-                enc->setBuffer(use_attn_f16 ? matmul_f16_buf : attn_input_buf, 0, 0);
-                enc->setBuffer(wv_buf, 0, 1);
-                enc->setBuffer(v_buf, 0, 2);
-                enc->setBytes(&M_chunk, 4, 3);
-                enc->setBytes(&hd, 4, 4);
-                enc->setBytes(&kvd, 4, 5);
-                enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
-                enc->dispatchThreadgroups(MTL::Size::Make((M_chunk + NR1 - 1) / NR1, (kvd + NR0 - 1) / NR0, 1),
-                                          MTL::Size::Make(128, 1, 1));
+                    // V projection
+                    enc->setComputePipelineState(use_attn_f16 ? select_q4k_f16_pipe(M_chunk, hd, kvd)
+                                                              : select_q4k_pipe(M_chunk, hd, kvd));
+                    enc->setBuffer(use_attn_f16 ? matmul_f16_buf : attn_input_buf, 0, 0);
+                    enc->setBuffer(wv_buf, 0, 1);
+                    enc->setBuffer(v_buf, 0, 2);
+                    enc->setBytes(&M_chunk, 4, 3);
+                    enc->setBytes(&hd, 4, 4);
+                    enc->setBytes(&kvd, 4, 5);
+                    enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
+                    enc->dispatchThreadgroups(MTL::Size::Make((M_chunk + NR1 - 1) / NR1, (kvd + NR0 - 1) / NR0, 1),
+                                              MTL::Size::Make(128, 1, 1));
+                }
 
                 // -----------------------------------------------------------------
                 // 5. RoPE on Q and K
@@ -3824,6 +3854,11 @@ Result<void*> TransformerModel::forward_prefill_raw(
                              can_use_f16_fast(M, intd, hd) &&
                              pipe_matmul_q4k_f16 &&
                              pipe_convert_f32_to_f16;
+        bool use_fused_qkv = !use_attn_f16 &&
+                             (wc.wq_qtype == GGMLType::Q4_K) &&
+                             (wc.wk_qtype == GGMLType::Q4_K) &&
+                             (wc.wv_qtype == GGMLType::Q4_K) &&
+                             pipe_fused_qkv;
 
         // ---------------------------------------------------------------------
         // 1. Attention RMSNorm
@@ -3845,46 +3880,63 @@ Result<void*> TransformerModel::forward_prefill_raw(
         enc->dispatchThreadgroups(MTL::Size::Make(M, 1, 1), MTL::Size::Make(256, 1, 1));
 
         // ---------------------------------------------------------------------
-        // 2. Q projection: [M, hidden] @ [q_dim, hidden]^T -> [M, q_dim]
+        // 2-4. Q/K/V projections
         // ---------------------------------------------------------------------
-        enc->setComputePipelineState(use_attn_f16 ? select_q4k_f16_pipe(M, hd, qd) : select_q4k_pipe(M, hd, qd));
-        enc->setBuffer(use_attn_f16 ? matmul_f16_buf : attn_input_buf, 0, 0);
-        enc->setBuffer(wq_buf, 0, 1);
-        enc->setBuffer(q_buf, 0, 2);
-        enc->setBytes(&M, 4, 3);
-        enc->setBytes(&hd, 4, 4);
-        enc->setBytes(&qd, 4, 5);
-        enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
-        enc->dispatchThreadgroups(MTL::Size::Make((M + NR1 - 1) / NR1, (qd + NR0 - 1) / NR0, 1),
-                                  MTL::Size::Make(128, 1, 1));
+        if (use_fused_qkv) {
+            uint32_t nmax = std::max(qd, kvd);
+            enc->setComputePipelineState(select_fused_qkv_pipe(M, qd, kvd));
+            enc->setBuffer(attn_input_buf, 0, 0);
+            enc->setBuffer(wq_buf, 0, 1);
+            enc->setBuffer(wk_buf, 0, 2);
+            enc->setBuffer(wv_buf, 0, 3);
+            enc->setBuffer(q_buf, 0, 4);
+            enc->setBuffer(k_buf, 0, 5);
+            enc->setBuffer(v_buf, 0, 6);
+            enc->setBytes(&M, 4, 7);
+            enc->setBytes(&hd, 4, 8);
+            enc->setBytes(&qd, 4, 9);
+            enc->setBytes(&kvd, 4, 10);
+            enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
+            enc->dispatchThreadgroups(MTL::Size::Make((M + NR1 - 1) / NR1,
+                                                      (nmax + NR0 - 1) / NR0, 1),
+                                      MTL::Size::Make(128, 1, 1));
+        } else {
+            // Q projection
+            enc->setComputePipelineState(use_attn_f16 ? select_q4k_f16_pipe(M, hd, qd) : select_q4k_pipe(M, hd, qd));
+            enc->setBuffer(use_attn_f16 ? matmul_f16_buf : attn_input_buf, 0, 0);
+            enc->setBuffer(wq_buf, 0, 1);
+            enc->setBuffer(q_buf, 0, 2);
+            enc->setBytes(&M, 4, 3);
+            enc->setBytes(&hd, 4, 4);
+            enc->setBytes(&qd, 4, 5);
+            enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
+            enc->dispatchThreadgroups(MTL::Size::Make((M + NR1 - 1) / NR1, (qd + NR0 - 1) / NR0, 1),
+                                      MTL::Size::Make(128, 1, 1));
 
-        // ---------------------------------------------------------------------
-        // 3. K projection: [M, hidden] @ [kv_dim, hidden]^T -> [M, kv_dim]
-        // ---------------------------------------------------------------------
-        enc->setComputePipelineState(use_attn_f16 ? select_q4k_f16_pipe(M, hd, kvd) : select_q4k_pipe(M, hd, kvd));
-        enc->setBuffer(use_attn_f16 ? matmul_f16_buf : attn_input_buf, 0, 0);
-        enc->setBuffer(wk_buf, 0, 1);
-        enc->setBuffer(k_buf, 0, 2);
-        enc->setBytes(&M, 4, 3);
-        enc->setBytes(&hd, 4, 4);
-        enc->setBytes(&kvd, 4, 5);
-        enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
-        enc->dispatchThreadgroups(MTL::Size::Make((M + NR1 - 1) / NR1, (kvd + NR0 - 1) / NR0, 1),
-                                  MTL::Size::Make(128, 1, 1));
+            // K projection
+            enc->setComputePipelineState(use_attn_f16 ? select_q4k_f16_pipe(M, hd, kvd) : select_q4k_pipe(M, hd, kvd));
+            enc->setBuffer(use_attn_f16 ? matmul_f16_buf : attn_input_buf, 0, 0);
+            enc->setBuffer(wk_buf, 0, 1);
+            enc->setBuffer(k_buf, 0, 2);
+            enc->setBytes(&M, 4, 3);
+            enc->setBytes(&hd, 4, 4);
+            enc->setBytes(&kvd, 4, 5);
+            enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
+            enc->dispatchThreadgroups(MTL::Size::Make((M + NR1 - 1) / NR1, (kvd + NR0 - 1) / NR0, 1),
+                                      MTL::Size::Make(128, 1, 1));
 
-        // ---------------------------------------------------------------------
-        // 4. V projection: [M, hidden] @ [kv_dim, hidden]^T -> [M, kv_dim]
-        // ---------------------------------------------------------------------
-        enc->setComputePipelineState(use_attn_f16 ? select_q4k_f16_pipe(M, hd, kvd) : select_q4k_pipe(M, hd, kvd));
-        enc->setBuffer(use_attn_f16 ? matmul_f16_buf : attn_input_buf, 0, 0);
-        enc->setBuffer(wv_buf, 0, 1);
-        enc->setBuffer(v_buf, 0, 2);
-        enc->setBytes(&M, 4, 3);
-        enc->setBytes(&hd, 4, 4);
-        enc->setBytes(&kvd, 4, 5);
-        enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
-        enc->dispatchThreadgroups(MTL::Size::Make((M + NR1 - 1) / NR1, (kvd + NR0 - 1) / NR0, 1),
-                                  MTL::Size::Make(128, 1, 1));
+            // V projection
+            enc->setComputePipelineState(use_attn_f16 ? select_q4k_f16_pipe(M, hd, kvd) : select_q4k_pipe(M, hd, kvd));
+            enc->setBuffer(use_attn_f16 ? matmul_f16_buf : attn_input_buf, 0, 0);
+            enc->setBuffer(wv_buf, 0, 1);
+            enc->setBuffer(v_buf, 0, 2);
+            enc->setBytes(&M, 4, 3);
+            enc->setBytes(&hd, 4, 4);
+            enc->setBytes(&kvd, 4, 5);
+            enc->setThreadgroupMemoryLength(SHMEM_SIZE, 0);
+            enc->dispatchThreadgroups(MTL::Size::Make((M + NR1 - 1) / NR1, (kvd + NR0 - 1) / NR0, 1),
+                                      MTL::Size::Make(128, 1, 1));
+        }
 
         // ---------------------------------------------------------------------
         // 5. RoPE on Q and K

@@ -615,6 +615,41 @@ private:
             pipelines_[v.name] = pipeline;
         }
 
+        // Compile fused_qkv_matmul_q4k_simdgroup with function constants
+        SgmmVariant fused_qkv_variants[] = {
+            {"fused_qkv_matmul_q4k_simdgroup_00", false, false},
+            {"fused_qkv_matmul_q4k_simdgroup_01", false, true},
+            {"fused_qkv_matmul_q4k_simdgroup_10", true, false},
+            {"fused_qkv_matmul_q4k_simdgroup_11", true, true},
+        };
+
+        NS::String* fused_qkv_func_name = NS::String::string(
+            "fused_qkv_matmul_q4k_simdgroup", NS::UTF8StringEncoding);
+
+        for (const auto& v : fused_qkv_variants) {
+            MTL::FunctionConstantValues* fc_values = MTL::FunctionConstantValues::alloc()->init();
+            fc_values->setConstantValue(&v.bc_inp, MTL::DataTypeBool, FC_MUL_MM + 0);
+            fc_values->setConstantValue(&v.bc_out, MTL::DataTypeBool, FC_MUL_MM + 1);
+
+            MTL::Function* func = library->newFunction(fused_qkv_func_name, fc_values, &error);
+            fc_values->release();
+
+            if (!func) {
+                GRANITE_LOG_WARN("Function '{}' not found with constants", v.name);
+                continue;
+            }
+
+            MTL::ComputePipelineState* pipeline = device_->newComputePipelineState(func, &error);
+            func->release();
+
+            if (!pipeline) {
+                GRANITE_LOG_WARN("Failed to create pipeline for '{}'", v.name);
+                continue;
+            }
+
+            pipelines_[v.name] = pipeline;
+        }
+
         // Compile FP16 weight simdgroup matmul (for full logits output)
         SgmmVariant sgmm_f16w_variants[] = {
             {"matmul_f16_simdgroup_00", false, false},

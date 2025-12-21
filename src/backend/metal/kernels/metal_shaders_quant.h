@@ -882,6 +882,350 @@ kernel void matmul_q4k_simdgroup(
 }
 
 // =============================================================================
+// Fused QKV Matmul (Q4_K) - FP32 Input Variant
+// =============================================================================
+// Computes Q/K/V projections in a single dispatch to reuse input loads.
+
+kernel void fused_qkv_matmul_q4k_simdgroup(
+    device const float* X          [[buffer(0)]],
+    device const void* Wq          [[buffer(1)]],
+    device const void* Wk          [[buffer(2)]],
+    device const void* Wv          [[buffer(3)]],
+    device float* Yq               [[buffer(4)]],
+    device float* Yk               [[buffer(5)]],
+    device float* Yv               [[buffer(6)]],
+    constant uint& M               [[buffer(7)]],
+    constant uint& K               [[buffer(8)]],
+    constant uint& Nq              [[buffer(9)]],
+    constant uint& Nkv             [[buffer(10)]],
+    threadgroup char* shmem        [[threadgroup(0)]],
+    uint3 tgpig                    [[threadgroup_position_in_grid]],
+    ushort tiitg                   [[thread_index_in_threadgroup]],
+    ushort sgitg                   [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup half* sa = (threadgroup half*)(shmem);
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);
+    threadgroup float* sc = (threadgroup float*)(shmem);
+
+    const uint num_blocks_k = K / QK_K;
+    const device block_q4_K* wq = (const device block_q4_K*)Wq;
+    const device block_q4_K* wk = (const device block_q4_K*)Wk;
+    const device block_q4_K* wv = (const device block_q4_K*)Wv;
+
+    const uint r0 = tgpig.y * SGMM_NR0;
+    const uint r1 = tgpig.x * SGMM_NR1;
+    const uint n_max = max(Nq, Nkv);
+
+    // Bounds only computed if FC_mm_bc_inp is true
+    const short nr0 = FC_mm_bc_inp ? min((uint)SGMM_NR0, n_max - r0) : SGMM_NR0;
+    const short nr1 = FC_mm_bc_inp ? min((uint)SGMM_NR1, M - r1) : SGMM_NR1;
+
+    constexpr short NL0 = SGMM_NK / 16;
+    constexpr short NL1 = SGMM_NK / 8;
+
+    // Thread assignment - with or without bounds checking
+    const short lr0 = FC_mm_bc_inp ? min((short)(tiitg / NL0), (short)(nr0 - 1)) : (tiitg / NL0);
+    const short lr1 = FC_mm_bc_inp ? min((short)(tiitg / NL1), (short)(nr1 - 1)) : (tiitg / NL1);
+    const short il0 = tiitg % NL0;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc_q[8];
+    simdgroup_float8x8 mc_k[8];
+    simdgroup_float8x8 mc_v[8];
+
+    for (short i = 0; i < 8; i++) {
+        mc_q[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+        mc_k[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+        mc_v[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    const short iy = 8 * (tiitg % NL1);
+    constexpr short nl = QK_K / 16;
+    short il = il0;
+
+    const bool q_valid = (r0 + lr0) < Nq;
+    const bool kv_valid = (r0 + lr0) < Nkv;
+
+    device const block_q4_K* xq = FC_mm_bc_inp
+        ? ((q_valid && lr0 < nr0) ? &wq[(r0 + lr0) * num_blocks_k + (il0 / nl)] : nullptr)
+        : &wq[(r0 + lr0) * num_blocks_k + (il0 / nl)];
+    device const block_q4_K* xk = FC_mm_bc_inp
+        ? ((kv_valid && lr0 < nr0) ? &wk[(r0 + lr0) * num_blocks_k + (il0 / nl)] : nullptr)
+        : &wk[(r0 + lr0) * num_blocks_k + (il0 / nl)];
+    device const block_q4_K* xv = FC_mm_bc_inp
+        ? ((kv_valid && lr0 < nr0) ? &wv[(r0 + lr0) * num_blocks_k + (il0 / nl)] : nullptr)
+        : &wv[(r0 + lr0) * num_blocks_k + (il0 / nl)];
+
+    device const float* y = FC_mm_bc_inp
+        ? ((lr1 < nr1) ? X + (r1 + lr1) * K + iy : nullptr)
+        : X + (r1 + lr1) * K + iy;
+
+    threadgroup const half* lsmb_base = sb + 2 * 64 * (sgitg / 2);
+    threadgroup const half* lsma_base = sa + 4 * 64 * (sgitg % 2);
+
+    for (uint loop_k = 0; loop_k < K; loop_k += SGMM_NK) {
+        // Load Q weights into shared memory
+        half4x4 temp_a;
+        if (FC_mm_bc_inp) {
+            if (xq != nullptr) {
+                dequantize_q4_k_to_half4x4_opt(xq, il, temp_a);
+            } else {
+                temp_a = half4x4(0);
+            }
+        } else {
+            dequantize_q4_k_to_half4x4_opt(xq, il, temp_a);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = (short)(tiitg/NL0)/8;
+            const short lx = (short)(tiitg/NL0)%8;
+            const short ly = i%8;
+            const short ib = 8*sx + sy;
+            *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+        }
+
+        if (FC_mm_bc_inp) {
+            if (y != nullptr) {
+                const short sx = tiitg % NL1;
+                const short sy = lr1 / 8;
+                const short ly = lr1 % 8;
+                const short ib = 4 * sx + sy;
+                *(threadgroup half2x4*)(sb + 64 * ib + 8 * ly) = half2x4(*(device const float2x4*)y);
+            }
+        } else {
+            const short sx = tiitg % NL1;
+            const short sy = lr1 / 8;
+            const short ly = lr1 % 8;
+            const short ib = 4 * sx + sy;
+            *(threadgroup half2x4*)(sb + 64 * ib + 8 * ly) = half2x4(*(device const float2x4*)y);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Q multiply accumulate
+        threadgroup const half* lsma = lsma_base;
+        threadgroup const half* lsmb = lsmb_base;
+        #pragma clang loop unroll(full)
+        for (short ik = 0; ik < SGMM_NK / 8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc_q[i], mb[i/4], ma[i%4], mc_q[i]);
+            }
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+
+        // K multiply accumulate
+        if (FC_mm_bc_inp) {
+            if (xk != nullptr) {
+                dequantize_q4_k_to_half4x4_opt(xk, il, temp_a);
+            } else {
+                temp_a = half4x4(0);
+            }
+        } else {
+            dequantize_q4_k_to_half4x4_opt(xk, il, temp_a);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = (short)(tiitg/NL0)/8;
+            const short lx = (short)(tiitg/NL0)%8;
+            const short ly = i%8;
+            const short ib = 8*sx + sy;
+            *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        lsma = lsma_base;
+        lsmb = lsmb_base;
+        #pragma clang loop unroll(full)
+        for (short ik = 0; ik < SGMM_NK / 8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc_k[i], mb[i/4], ma[i%4], mc_k[i]);
+            }
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+
+        // V multiply accumulate
+        if (FC_mm_bc_inp) {
+            if (xv != nullptr) {
+                dequantize_q4_k_to_half4x4_opt(xv, il, temp_a);
+            } else {
+                temp_a = half4x4(0);
+            }
+        } else {
+            dequantize_q4_k_to_half4x4_opt(xv, il, temp_a);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = (short)(tiitg/NL0)/8;
+            const short lx = (short)(tiitg/NL0)%8;
+            const short ly = i%8;
+            const short ib = 8*sx + sy;
+            *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        lsma = lsma_base;
+        lsmb = lsmb_base;
+        #pragma clang loop unroll(full)
+        for (short ik = 0; ik < SGMM_NK / 8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc_v[i], mb[i/4], ma[i%4], mc_v[i]);
+            }
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        if (FC_mm_bc_inp) {
+            xq = (il < 2 && xq != nullptr) ? xq + 1 : xq;
+            xk = (il < 2 && xk != nullptr) ? xk + 1 : xk;
+            xv = (il < 2 && xv != nullptr) ? xv + 1 : xv;
+            y = (y != nullptr) ? y + SGMM_NK : nullptr;
+        } else {
+            xq = (il < 2) ? xq + 1 : xq;
+            xk = (il < 2) ? xk + 1 : xk;
+            xv = (il < 2) ? xv + 1 : xv;
+            y = y + SGMM_NK;
+        }
+    }
+
+    const uint sg_n = r0 + 32 * (sgitg % 2);
+    const uint sg_m = r1 + 16 * (sgitg / 2);
+
+    // Store Q
+    if (sg_n < Nq) {
+        if (!FC_mm_bc_out || (sg_m + 16 <= M && sg_n + 32 <= Nq)) {
+            device float* C = Yq + sg_m * Nq + sg_n;
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 8; i++) {
+                simdgroup_store(mc_q[i], C + 8*(i%4) + 8*Nq*(i/4), Nq, 0, false);
+            }
+        } else {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            threadgroup float* temp_str = sc + 32*(sgitg%2) + 16*(sgitg/2)*SGMM_NR0;
+            for (short i = 0; i < 8; i++) {
+                simdgroup_store(mc_q[i], temp_str + 8*(i%4) + 8*SGMM_NR0*(i/4), SGMM_NR0, 0, false);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sgitg == 0) {
+                int max_n = min((uint)SGMM_NR0, Nq - r0);
+                for (int j = tiitg; j < (int)nr1; j += SGMM_NR1) {
+                    device float* D = Yq + (r1 + j) * Nq + r0;
+                    threadgroup float* C = sc + j * SGMM_NR0;
+                    for (int i = 0; i < max_n; i++) {
+                        D[i] = C[i];
+                    }
+                }
+            }
+        }
+    }
+
+    // Store K
+    if (sg_n < Nkv) {
+        if (!FC_mm_bc_out || (sg_m + 16 <= M && sg_n + 32 <= Nkv)) {
+            device float* C = Yk + sg_m * Nkv + sg_n;
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 8; i++) {
+                simdgroup_store(mc_k[i], C + 8*(i%4) + 8*Nkv*(i/4), Nkv, 0, false);
+            }
+        } else {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            threadgroup float* temp_str = sc + 32*(sgitg%2) + 16*(sgitg/2)*SGMM_NR0;
+            for (short i = 0; i < 8; i++) {
+                simdgroup_store(mc_k[i], temp_str + 8*(i%4) + 8*SGMM_NR0*(i/4), SGMM_NR0, 0, false);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sgitg == 0) {
+                int max_n = min((uint)SGMM_NR0, Nkv - r0);
+                for (int j = tiitg; j < (int)nr1; j += SGMM_NR1) {
+                    device float* D = Yk + (r1 + j) * Nkv + r0;
+                    threadgroup float* C = sc + j * SGMM_NR0;
+                    for (int i = 0; i < max_n; i++) {
+                        D[i] = C[i];
+                    }
+                }
+            }
+        }
+    }
+
+    // Store V
+    if (sg_n < Nkv) {
+        if (!FC_mm_bc_out || (sg_m + 16 <= M && sg_n + 32 <= Nkv)) {
+            device float* C = Yv + sg_m * Nkv + sg_n;
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 8; i++) {
+                simdgroup_store(mc_v[i], C + 8*(i%4) + 8*Nkv*(i/4), Nkv, 0, false);
+            }
+        } else {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            threadgroup float* temp_str = sc + 32*(sgitg%2) + 16*(sgitg/2)*SGMM_NR0;
+            for (short i = 0; i < 8; i++) {
+                simdgroup_store(mc_v[i], temp_str + 8*(i%4) + 8*SGMM_NR0*(i/4), SGMM_NR0, 0, false);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sgitg == 0) {
+                int max_n = min((uint)SGMM_NR0, Nkv - r0);
+                for (int j = tiitg; j < (int)nr1; j += SGMM_NR1) {
+                    device float* D = Yv + (r1 + j) * Nkv + r0;
+                    threadgroup float* C = sc + j * SGMM_NR0;
+                    for (int i = 0; i < max_n; i++) {
+                        D[i] = C[i];
+                    }
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
 // Q4_K Simdgroup Matrix Multiply - FP16 Input Variant
 // =============================================================================
 // Same as matmul_q4k_simdgroup but reads FP16 activations instead of FP32.
