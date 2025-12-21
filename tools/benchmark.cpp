@@ -46,6 +46,22 @@ void print_header(const std::string& title) {
     std::cout << std::string(60, '=') << "\n";
 }
 
+bool parse_backend_arg(const std::string& value, BackendType& out_type) {
+    if (value == "cpu") {
+        out_type = BackendType::CPU;
+        return true;
+    }
+    if (value == "metal") {
+        out_type = BackendType::Metal;
+        return true;
+    }
+    if (value == "vulkan") {
+        out_type = BackendType::Vulkan;
+        return true;
+    }
+    return false;
+}
+
 void benchmark_matmul(IComputeBackend* backend) {
     print_header("Matrix Multiplication Benchmark");
 
@@ -449,7 +465,31 @@ int main(int argc, char* argv[]) {
     std::cout << "==============================\n";
 
     // Create backend
-    auto backend = create_default_backend();
+    BackendType preferred_backend = BackendType::CPU;
+    bool preferred_backend_set = false;
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--backend" && i + 1 < argc) {
+            BackendType parsed = BackendType::CPU;
+            if (parse_backend_arg(argv[++i], parsed)) {
+                preferred_backend = parsed;
+                preferred_backend_set = true;
+            } else {
+                std::cerr << "Invalid --backend value, using default.\n";
+            }
+        }
+    }
+
+    std::unique_ptr<IComputeBackend> backend;
+    if (preferred_backend_set) {
+        backend = create_backend(preferred_backend);
+        if (!backend) {
+            std::cerr << "Preferred backend unavailable, falling back to default.\n";
+            backend = create_default_backend();
+        }
+    } else {
+        backend = create_default_backend();
+    }
     if (!backend) {
         std::cerr << "Failed to create backend\n";
         return 1;
@@ -476,6 +516,8 @@ int main(int argc, char* argv[]) {
         size_t kv_cache_max_seq = 0;
         bool kv_cache_max_seq_set = false;
         bool enable_profiling = false;
+        BackendType run_backend = preferred_backend;
+        bool run_backend_set = preferred_backend_set;
 
         for (int i = 1; i < argc; i++) {
             std::string arg = argv[i];
@@ -508,9 +550,21 @@ int main(int argc, char* argv[]) {
                 }
             } else if (arg == "--profile") {
                 enable_profiling = true;
+            } else if (arg == "--backend" && i + 1 < argc) {
+                BackendType parsed = BackendType::CPU;
+                if (parse_backend_arg(argv[++i], parsed)) {
+                    run_backend = parsed;
+                    run_backend_set = true;
+                } else {
+                    std::cerr << "Invalid --backend value, using default.\n";
+                }
             } else if (arg[0] != '-') {
                 model_path = arg;
             }
+        }
+
+        if (run_backend_set && run_backend != backend->get_type()) {
+            std::cerr << "Requested backend differs from active backend; using active backend.\n";
         }
 
         if (!model_path.empty()) {
@@ -526,6 +580,7 @@ int main(int argc, char* argv[]) {
             std::cout << "  --prefill-chunk-size <n>: Override prefill chunk size (0 disables)\n";
             std::cout << "  --kv-cache-max-seq <n>: Override KV cache max sequence length\n";
             std::cout << "  --profile: Print per-section timing stats\n";
+            std::cout << "  --backend <cpu|metal|vulkan>: Force backend for benchmarking\n";
         }
     } else {
         std::cout << "\nUsage: " << argv[0] << " [model.gguf] [--full-logits]\n";
@@ -535,6 +590,7 @@ int main(int argc, char* argv[]) {
         std::cout << "  --prefill-chunk-size <n>: Override prefill chunk size (0 disables)\n";
         std::cout << "  --kv-cache-max-seq <n>: Override KV cache max sequence length\n";
         std::cout << "  --profile: Print per-section timing stats\n";
+        std::cout << "  --backend <cpu|metal|vulkan>: Force backend for benchmarking\n";
     }
 
     backend->shutdown();
