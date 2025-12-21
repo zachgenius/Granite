@@ -16,8 +16,85 @@
 #include <vector>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
+
+#ifdef GRANITE_HAS_SHADERC
+#include <shaderc/shaderc.hpp>
+#endif
 
 namespace granite {
+
+#ifdef GRANITE_HAS_SHADERC
+namespace {
+class ShadercIncluder : public shaderc::CompileOptions::IncluderInterface {
+public:
+    explicit ShadercIncluder(std::filesystem::path base_dir)
+        : base_dir_(std::move(base_dir)) {}
+
+    shaderc_include_result* GetInclude(const char* requested_source,
+                                       shaderc_include_type type,
+                                       const char* requesting_source,
+                                       size_t /*include_depth*/) override {
+        std::filesystem::path include_path;
+
+        if (type == shaderc_include_type_relative && requesting_source) {
+            std::filesystem::path requester(requesting_source);
+            include_path = requester.parent_path() / requested_source;
+        } else {
+            include_path = base_dir_ / requested_source;
+        }
+
+        std::string content;
+        std::ifstream file(include_path);
+        if (file.is_open()) {
+            content.assign((std::istreambuf_iterator<char>(file)),
+                           std::istreambuf_iterator<char>());
+        }
+
+        auto* result = new shaderc_include_result();
+        auto* data = new IncludeData();
+
+        if (content.empty()) {
+            data->content = "";
+            data->source_name = include_path.string();
+            result->source_name = data->source_name.c_str();
+            result->source_name_length = data->source_name.size();
+            result->content = "";
+            result->content_length = 0;
+            result->user_data = data;
+            return result;
+        }
+
+        data->content = std::move(content);
+        data->source_name = include_path.string();
+
+        result->source_name = data->source_name.c_str();
+        result->source_name_length = data->source_name.size();
+        result->content = data->content.c_str();
+        result->content_length = data->content.size();
+        result->user_data = data;
+
+        return result;
+    }
+
+    void ReleaseInclude(shaderc_include_result* include_result) override {
+        if (!include_result) {
+            return;
+        }
+        delete static_cast<IncludeData*>(include_result->user_data);
+        delete include_result;
+    }
+
+private:
+    struct IncludeData {
+        std::string content;
+        std::string source_name;
+    };
+
+    std::filesystem::path base_dir_;
+};
+}  // namespace
+#endif
 
 class VulkanBackend : public IComputeBackend {
 public:
@@ -373,28 +450,64 @@ public:
         }
 
         std::vector<uint32_t> spirv;
+        std::filesystem::path shader_path(desc.shader_source);
+        std::string extension = shader_path.extension().string();
 
-        // shader_source is expected to be a SPIR-V path for Vulkan
-        std::ifstream file(desc.shader_source, std::ios::binary | std::ios::ate);
-        if (file.is_open()) {
-            std::streamsize size = file.tellg();
-            if (size <= 0) {
-                return Error(ErrorCode::InvalidArgument,
-                             fmt::format("Empty SPIR-V file: {}", desc.shader_source));
+        if (extension == ".comp" || extension == ".glsl") {
+#ifdef GRANITE_HAS_SHADERC
+            std::ifstream file(desc.shader_source);
+            if (!file.is_open()) {
+                return Error(ErrorCode::FileNotFound,
+                             fmt::format("GLSL shader not found: {}", desc.shader_source));
             }
-            file.seekg(0, std::ios::beg);
-            if (size % 4 != 0) {
-                return Error(ErrorCode::InvalidArgument,
-                             fmt::format("Invalid SPIR-V size: {}", desc.shader_source));
+            std::string source((std::istreambuf_iterator<char>(file)),
+                               std::istreambuf_iterator<char>());
+
+            shaderc::Compiler compiler;
+            shaderc::CompileOptions options;
+            options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_1);
+            options.SetIncluder(std::make_unique<ShadercIncluder>(shader_path.parent_path()));
+
+            auto result = compiler.CompileGlslToSpv(
+                source,
+                shaderc_compute_shader,
+                desc.shader_source.c_str(),
+                desc.entry_point.c_str(),
+                options);
+
+            if (result.GetCompilationStatus() != shaderc_compilation_status_success) {
+                return Error(ErrorCode::ShaderCompilationFailed,
+                             fmt::format("GLSL compile failed: {}", result.GetErrorMessage()));
             }
-            spirv.resize(static_cast<size_t>(size / 4));
-            if (!file.read(reinterpret_cast<char*>(spirv.data()), size)) {
-                return Error(ErrorCode::IOError,
-                             fmt::format("Failed to read SPIR-V: {}", desc.shader_source));
-            }
+
+            spirv.assign(result.cbegin(), result.cend());
+#else
+            return Error(ErrorCode::NotImplemented,
+                         "GLSL compilation requires GRANITE_WITH_SHADERC");
+#endif
         } else {
-            return Error(ErrorCode::FileNotFound,
-                         fmt::format("SPIR-V not found: {}", desc.shader_source));
+            // shader_source is expected to be a SPIR-V path for Vulkan
+            std::ifstream file(desc.shader_source, std::ios::binary | std::ios::ate);
+            if (file.is_open()) {
+                std::streamsize size = file.tellg();
+                if (size <= 0) {
+                    return Error(ErrorCode::InvalidArgument,
+                                 fmt::format("Empty SPIR-V file: {}", desc.shader_source));
+                }
+                file.seekg(0, std::ios::beg);
+                if (size % 4 != 0) {
+                    return Error(ErrorCode::InvalidArgument,
+                                 fmt::format("Invalid SPIR-V size: {}", desc.shader_source));
+                }
+                spirv.resize(static_cast<size_t>(size / 4));
+                if (!file.read(reinterpret_cast<char*>(spirv.data()), size)) {
+                    return Error(ErrorCode::IOError,
+                                 fmt::format("Failed to read SPIR-V: {}", desc.shader_source));
+                }
+            } else {
+                return Error(ErrorCode::FileNotFound,
+                             fmt::format("SPIR-V not found: {}", desc.shader_source));
+            }
         }
 
         VkShaderModuleCreateInfo module_info{};
@@ -679,6 +792,18 @@ public:
     // Native handle access
     void* get_native_device() override {
         return device_;
+    }
+
+    void* get_native_physical_device() override {
+        return physical_device_;
+    }
+
+    void* get_native_queue() override {
+        return compute_queue_;
+    }
+
+    uint32_t get_native_queue_family() override {
+        return compute_queue_family_;
     }
 
     void* get_native_buffer(BufferHandle handle) override {

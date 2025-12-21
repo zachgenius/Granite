@@ -114,6 +114,18 @@ public:
     /// Returns nullptr if not supported or handle is invalid
     virtual void* get_native_buffer(BufferHandle handle) { (void)handle; return nullptr; }
 
+    /// Get native device handle (e.g., VkDevice for Vulkan)
+    virtual void* get_native_device() { return nullptr; }
+
+    /// Get native physical device handle (e.g., VkPhysicalDevice for Vulkan)
+    virtual void* get_native_physical_device() { return nullptr; }
+
+    /// Get native queue handle (e.g., VkQueue for Vulkan)
+    virtual void* get_native_queue() { return nullptr; }
+
+    /// Get native queue family index (e.g., Vulkan compute queue family)
+    virtual uint32_t get_native_queue_family() { return 0; }
+
     // -------------------------------------------------------------------------
     // Compute Pipeline
     // -------------------------------------------------------------------------

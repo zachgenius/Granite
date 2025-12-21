@@ -1359,19 +1359,35 @@ VulkanCompute* get_vulkan_compute() {
 
         // Get Vulkan device from backend
         VkDevice device = static_cast<VkDevice>(g_vulkan_backend->get_native_device());
-        if (!device) {
-            GRANITE_LOG_ERROR("Failed to get Vulkan device");
+        VkPhysicalDevice physical_device = static_cast<VkPhysicalDevice>(
+            g_vulkan_backend->get_native_physical_device());
+        VkQueue queue = static_cast<VkQueue>(g_vulkan_backend->get_native_queue());
+        uint32_t queue_family = g_vulkan_backend->get_native_queue_family();
+
+        if (!device || !physical_device || !queue) {
+            GRANITE_LOG_ERROR("Failed to get Vulkan native handles");
             g_vulkan_backend.reset();
             return;
         }
 
         g_vulkan_compute = std::make_unique<VulkanCompute>();
 
-        // Note: Full initialization requires physical device and queue
-        // These need to be exposed from VulkanBackend
-        // For now, VulkanCompute is created but not fully initialized
-        GRANITE_LOG_INFO("VulkanCompute accessor ready (device: {})",
-                        g_vulkan_backend->get_capabilities().name);
+        bool ok = g_vulkan_compute->initialize(
+            device,
+            physical_device,
+            queue,
+            queue_family,
+            "shaders/vulkan");
+
+        if (!ok) {
+            GRANITE_LOG_ERROR("Failed to initialize VulkanCompute");
+            g_vulkan_compute.reset();
+            g_vulkan_backend.reset();
+            return;
+        }
+
+        GRANITE_LOG_INFO("VulkanCompute initialized (device: {})",
+                         g_vulkan_backend->get_capabilities().name);
     });
 
     return g_vulkan_compute.get();

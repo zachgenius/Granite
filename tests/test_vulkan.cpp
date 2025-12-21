@@ -12,6 +12,8 @@
 #include <vector>
 #include <cmath>
 #include <random>
+#include <fstream>
+#include <filesystem>
 
 #ifdef GRANITE_HAS_VULKAN
 
@@ -237,6 +239,100 @@ TEST_CASE("Vulkan mul kernel", "[vulkan][compute]") {
     }
 
     INFO("Mul kernel test - requires VulkanCompute integration");
+}
+
+TEST_CASE("Vulkan pipeline add shader", "[vulkan][pipeline]") {
+    VulkanTestFixture fixture;
+
+    if (!fixture.is_available()) {
+        SKIP("Vulkan backend not available");
+    }
+
+#ifndef GRANITE_HAS_SHADERC
+    SKIP("Shaderc not available for GLSL compilation");
+#endif
+
+    auto* backend = fixture.backend();
+
+    const char* shader_source = R"(
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint size;
+} pc;
+
+layout(binding = 0) readonly buffer A { float data_a[]; };
+layout(binding = 1) readonly buffer B { float data_b[]; };
+layout(binding = 2) writeonly buffer D { float data_d[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.size) return;
+    data_d[i] = data_a[i] + data_b[i];
+}
+)";
+
+    std::filesystem::path temp_path = std::filesystem::temp_directory_path() / "granite_add_test.comp";
+    {
+        std::ofstream out(temp_path);
+        out << shader_source;
+    }
+
+    PipelineDesc pipeline_desc;
+    pipeline_desc.shader_source = temp_path.string();
+    pipeline_desc.entry_point = "main";
+
+    auto pipeline_result = backend->create_pipeline(pipeline_desc);
+    REQUIRE(pipeline_result.ok());
+    PipelineHandle pipeline = pipeline_result.value();
+
+    const uint32_t size = 256;
+    auto input_a = random_vector(size);
+    auto input_b = random_vector(size);
+
+    BufferDesc buf_desc;
+    buf_desc.size = size * sizeof(float);
+    buf_desc.memory_type = MemoryType::Shared;
+
+    auto a_buf = backend->create_buffer(buf_desc);
+    auto b_buf = backend->create_buffer(buf_desc);
+    auto out_buf = backend->create_buffer(buf_desc);
+    REQUIRE(a_buf.ok());
+    REQUIRE(b_buf.ok());
+    REQUIRE(out_buf.ok());
+
+    REQUIRE(backend->write_buffer(a_buf.value(), input_a.data(), buf_desc.size).ok());
+    REQUIRE(backend->write_buffer(b_buf.value(), input_b.data(), buf_desc.size).ok());
+
+    REQUIRE(backend->begin_commands().ok());
+    REQUIRE(backend->bind_pipeline(pipeline).ok());
+    REQUIRE(backend->bind_buffer(0, a_buf.value()).ok());
+    REQUIRE(backend->bind_buffer(1, b_buf.value()).ok());
+    REQUIRE(backend->bind_buffer(2, out_buf.value()).ok());
+    REQUIRE(backend->set_push_constants(&size, sizeof(size)).ok());
+
+    uint32_t groups_x = (size + 64 - 1) / 64;
+    REQUIRE(backend->dispatch(groups_x, 1, 1).ok());
+    REQUIRE(backend->end_commands().ok());
+    REQUIRE(backend->submit().ok());
+    REQUIRE(backend->wait_for_completion().ok());
+
+    std::vector<float> output(size);
+    REQUIRE(backend->read_buffer(out_buf.value(), output.data(), buf_desc.size).ok());
+
+    for (uint32_t i = 0; i < size; i++) {
+        REQUIRE_THAT(output[i], WithinAbs(input_a[i] + input_b[i], 1e-6f));
+    }
+
+    backend->destroy_pipeline(pipeline);
+    backend->destroy_buffer(a_buf.value());
+    backend->destroy_buffer(b_buf.value());
+    backend->destroy_buffer(out_buf.value());
+
+    std::error_code ec;
+    std::filesystem::remove(temp_path, ec);
 }
 
 #else  // !GRANITE_HAS_VULKAN
