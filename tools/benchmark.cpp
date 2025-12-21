@@ -5,6 +5,7 @@
 #include <numeric>
 #include <iomanip>
 #include <cstdlib>
+#include <sstream>
 
 using namespace granite;
 using Clock = std::chrono::high_resolution_clock;
@@ -119,7 +120,28 @@ void benchmark_matmul(IComputeBackend* backend) {
     }
 }
 
-void benchmark_inference(const std::string& model_path, IComputeBackend* backend, bool full_logits = false) {
+std::vector<int64_t> parse_seq_lens(const std::string& value) {
+    std::vector<int64_t> seq_lens;
+    std::stringstream ss(value);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        if (token.empty()) continue;
+        char* end = nullptr;
+        long len = std::strtol(token.c_str(), &end, 10);
+        if (!end || *end != '\0' || len <= 0) {
+            seq_lens.clear();
+            return seq_lens;
+        }
+        seq_lens.push_back(static_cast<int64_t>(len));
+    }
+    return seq_lens;
+}
+
+void benchmark_inference(
+    const std::string& model_path,
+    IComputeBackend* backend,
+    const std::vector<int64_t>& seq_lens,
+    bool full_logits = false) {
     print_header("LLM Inference Benchmark");
 
     // Load model
@@ -165,7 +187,7 @@ void benchmark_inference(const std::string& model_path, IComputeBackend* backend
     std::cout << std::string(45, '-') << "\n";
     std::cout << std::flush;
 
-    for (int64_t seq_len : {32, 128, 256, 512}) {  // Match llama.cpp benchmark sizes
+    for (int64_t seq_len : seq_lens) {  // Match llama.cpp benchmark sizes by default
         // Create token tensor
         std::vector<int64_t> shape = {1, seq_len};
         auto ids_result = Tensor::allocate(shape, DataType::INT32, backend);
@@ -379,27 +401,37 @@ int main(int argc, char* argv[]) {
     if (argc > 1) {
         std::string model_path;
         bool full_logits = false;
+        std::vector<int64_t> seq_lens = {32, 128, 256, 512};
 
         for (int i = 1; i < argc; i++) {
             std::string arg = argv[i];
             if (arg == "--full-logits") {
                 full_logits = true;
+            } else if (arg == "--seq-lens" && i + 1 < argc) {
+                auto parsed = parse_seq_lens(argv[++i]);
+                if (!parsed.empty()) {
+                    seq_lens = std::move(parsed);
+                } else {
+                    std::cerr << "Invalid --seq-lens value, using defaults.\n";
+                }
             } else if (arg[0] != '-') {
                 model_path = arg;
             }
         }
 
         if (!model_path.empty()) {
-            benchmark_inference(model_path, backend.get(), full_logits);
+            benchmark_inference(model_path, backend.get(), seq_lens, full_logits);
         } else {
             std::cout << "\nUsage: " << argv[0] << " [model.gguf] [--full-logits]\n";
             std::cout << "Provide a GGUF model path to run inference benchmarks.\n";
             std::cout << "  --full-logits: Compute logits for all tokens (default: last token only)\n";
+            std::cout << "  --seq-lens <a,b,c>: Override prefill prompt lengths\n";
         }
     } else {
         std::cout << "\nUsage: " << argv[0] << " [model.gguf] [--full-logits]\n";
         std::cout << "Provide a GGUF model path to run inference benchmarks.\n";
         std::cout << "  --full-logits: Compute logits for all tokens (default: last token only)\n";
+        std::cout << "  --seq-lens <a,b,c>: Override prefill prompt lengths\n";
     }
 
     backend->shutdown();
