@@ -7,6 +7,7 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include "granite/backend.h"
+#include "granite/operators.h"
 #include "granite/log.h"
 
 #include <vector>
@@ -240,6 +241,82 @@ TEST_CASE("Vulkan mul kernel", "[vulkan][compute]") {
     }
 
     INFO("Mul kernel test - requires VulkanCompute integration");
+}
+
+TEST_CASE("Vulkan MatMul operator", "[vulkan][compute]") {
+    VulkanTestFixture fixture;
+
+    if (!fixture.is_available()) {
+        SKIP("Vulkan backend not available");
+    }
+
+    initialize_operators();
+
+    auto* backend = fixture.backend();
+
+    std::vector<int64_t> shape_a = {2, 3};
+    std::vector<int64_t> shape_b = {3, 4};
+
+    auto a_result = Tensor::allocate(shape_a, DataType::FP32, backend);
+    auto b_result = Tensor::allocate(shape_b, DataType::FP32, backend);
+    REQUIRE(a_result.ok());
+    REQUIRE(b_result.ok());
+
+    auto a = std::move(a_result).take();
+    auto b = std::move(b_result).take();
+
+    // Fill inputs
+    {
+        auto map_a = backend->map_buffer(a.buffer());
+        auto map_b = backend->map_buffer(b.buffer());
+        REQUIRE(map_a.ok());
+        REQUIRE(map_b.ok());
+
+        float* pa = static_cast<float*>(map_a.value());
+        float* pb = static_cast<float*>(map_b.value());
+
+        for (size_t i = 0; i < a.numel(); i++) {
+            pa[i] = static_cast<float>(i + 1);
+        }
+        for (size_t i = 0; i < b.numel(); i++) {
+            pb[i] = static_cast<float>(i + 1);
+        }
+
+        backend->unmap_buffer(a.buffer());
+        backend->unmap_buffer(b.buffer());
+    }
+
+    auto out_result = ops::matmul(a, b);
+    REQUIRE(out_result.ok());
+    auto out = std::move(out_result).take();
+
+    auto map_out = backend->map_buffer(out.buffer());
+    REQUIRE(map_out.ok());
+    const float* pout = static_cast<const float*>(map_out.value());
+
+    // Reference compute
+    float expected[8] = {};
+    const float a_vals[6] = {1, 2, 3, 4, 5, 6};
+    const float b_vals[12] = {
+        1, 2, 3, 4,
+        5, 6, 7, 8,
+        9, 10, 11, 12
+    };
+    for (int i = 0; i < 2; i++) {
+        for (int j = 0; j < 4; j++) {
+            float sum = 0.0f;
+            for (int k = 0; k < 3; k++) {
+                sum += a_vals[i * 3 + k] * b_vals[k * 4 + j];
+            }
+            expected[i * 4 + j] = sum;
+        }
+    }
+
+    for (int i = 0; i < 8; i++) {
+        REQUIRE_THAT(pout[i], WithinAbs(expected[i], 1e-5f));
+    }
+
+    backend->unmap_buffer(out.buffer());
 }
 
 TEST_CASE("Vulkan pipeline add shader", "[vulkan][pipeline]") {

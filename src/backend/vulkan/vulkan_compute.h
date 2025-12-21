@@ -20,6 +20,7 @@ namespace granite {
 // Forward declarations
 class VulkanComputeImpl;
 class VulkanCompute;
+class IComputeBackend;
 
 class VulkanCompute {
 public:
@@ -77,6 +78,10 @@ public:
 
     Result<void> matvec_q4k(VkBuffer x, VkBuffer W, VkBuffer y, uint32_t K, uint32_t N);
     Result<void> matvec_q8_0(VkBuffer x, VkBuffer W, VkBuffer y, uint32_t K, uint32_t N);
+
+    // Basic FP32 matmul (A[M,K] @ B[K,N] = C[M,N])
+    Result<void> matmul_f32(VkBuffer a, VkBuffer b, VkBuffer out,
+                            uint32_t M, uint32_t K, uint32_t N);
 
     // =========================================================================
     // RoPE (Rotary Position Embedding)
@@ -138,6 +143,13 @@ private:
 // Global accessor for VulkanCompute singleton
 // Returns nullptr if Vulkan is not available or initialization failed
 VulkanCompute* get_vulkan_compute();
+
+// Accessor tied to a specific backend instance
+// Returns nullptr if Vulkan is not available or initialization failed
+VulkanCompute* get_vulkan_compute(IComputeBackend* backend);
+
+// Release compute instance tied to backend (called before backend shutdown)
+void release_vulkan_compute(IComputeBackend* backend);
 
 } // namespace granite
 

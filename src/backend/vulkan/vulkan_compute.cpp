@@ -350,6 +350,25 @@ public:
         return dispatch_simple(*pipeline, {x, W, y}, pc, N);
     }
 
+    Result<void> matmul_f32(VkBuffer a, VkBuffer b, VkBuffer out,
+                            uint32_t M, uint32_t K, uint32_t N) {
+        auto* pipeline = get_pipeline("matmul_simple");
+        if (!pipeline) {
+            return Error(ErrorCode::NotImplemented, "MatMul pipeline not available");
+        }
+
+        PushConstantsSimple pc{};
+        pc.KX = M;
+        pc.KY = K;
+        pc.param1 = static_cast<float>(N);
+
+        constexpr uint32_t tile = 16;
+        uint32_t groups_x = (N + tile - 1) / tile;
+        uint32_t groups_y = (M + tile - 1) / tile;
+
+        return dispatch_simple(*pipeline, {a, b, out}, pc, groups_x, groups_y);
+    }
+
     // =========================================================================
     // RoPE (Rotary Position Embedding)
     // =========================================================================
@@ -1036,6 +1055,45 @@ void main() {
             GRANITE_LOG_WARN("Failed to compile softmax shader: {}", softmax_result.error().message());
         }
 
+        const char* matmul_shader = R"(
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    float N;
+    float padding;
+} p;
+
+layout(binding = 0) readonly buffer A { float data_a[]; };
+layout(binding = 1) readonly buffer B { float data_b[]; };
+layout(binding = 2) writeonly buffer D { float data_d[]; };
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    uint n = uint(p.N);
+
+    if (row >= p.M || col >= n) {
+        return;
+    }
+
+    float sum = 0.0;
+    for (uint k = 0; k < p.K; k++) {
+        sum += data_a[row * p.K + k] * data_b[k * n + col];
+    }
+
+    data_d[row * n + col] = sum;
+}
+)";
+
+        auto matmul_result = compile_shader("matmul_simple", matmul_shader, 3);
+        if (!matmul_result.ok()) {
+            GRANITE_LOG_WARN("Failed to compile matmul shader: {}", matmul_result.error().message());
+        }
+
         // Q8_0 matvec shader
         const char* matvec_q8_0_shader = R"(
 #version 450
@@ -1281,8 +1339,13 @@ Result<void> VulkanCompute::matvec_q4k(VkBuffer x, VkBuffer W, VkBuffer y,
 }
 
 Result<void> VulkanCompute::matvec_q8_0(VkBuffer x, VkBuffer W, VkBuffer y,
-                                         uint32_t K, uint32_t N) {
+                                       uint32_t K, uint32_t N) {
     return impl_->matvec_q8_0(x, W, y, K, N);
+}
+
+Result<void> VulkanCompute::matmul_f32(VkBuffer a, VkBuffer b, VkBuffer out,
+                                       uint32_t M, uint32_t K, uint32_t N) {
+    return impl_->matmul_f32(a, b, out, M, K, N);
 }
 
 Result<void> VulkanCompute::rope(VkBuffer x, VkBuffer freq_cos, VkBuffer freq_sin,
@@ -1339,6 +1402,8 @@ extern std::unique_ptr<IComputeBackend> create_vulkan_backend();
 static std::unique_ptr<VulkanCompute> g_vulkan_compute;
 static std::unique_ptr<IComputeBackend> g_vulkan_backend;  // Keep backend alive
 static std::once_flag g_vulkan_compute_init;
+static std::mutex g_vulkan_compute_mutex;
+static std::unordered_map<IComputeBackend*, std::unique_ptr<VulkanCompute>> g_vulkan_compute_map;
 
 VulkanCompute* get_vulkan_compute() {
     std::call_once(g_vulkan_compute_init, []() {
@@ -1398,6 +1463,55 @@ VulkanCompute* get_vulkan_compute() {
     });
 
     return g_vulkan_compute.get();
+}
+
+VulkanCompute* get_vulkan_compute(IComputeBackend* backend) {
+    if (!backend) {
+        return get_vulkan_compute();
+    }
+
+    if (backend->get_type() != BackendType::Vulkan) {
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(g_vulkan_compute_mutex);
+    auto it = g_vulkan_compute_map.find(backend);
+    if (it != g_vulkan_compute_map.end()) {
+        return it->second.get();
+    }
+
+    auto* device = static_cast<VkDevice>(backend->get_native_device());
+    auto* physical_device = static_cast<VkPhysicalDevice>(backend->get_native_physical_device());
+    auto* queue = static_cast<VkQueue>(backend->get_native_queue());
+    uint32_t queue_family = backend->get_native_queue_family();
+
+    if (!device || !physical_device || !queue) {
+        return nullptr;
+    }
+
+    auto compute = std::make_unique<VulkanCompute>();
+    const char* shader_dir =
+#ifdef GRANITE_VULKAN_SHADER_DIR
+        GRANITE_VULKAN_SHADER_DIR;
+#else
+        "shaders/vulkan";
+#endif
+
+    if (!compute->initialize(device, physical_device, queue, queue_family, shader_dir)) {
+        return nullptr;
+    }
+
+    auto* ptr = compute.get();
+    g_vulkan_compute_map.emplace(backend, std::move(compute));
+    return ptr;
+}
+
+void release_vulkan_compute(IComputeBackend* backend) {
+    if (!backend) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_vulkan_compute_mutex);
+    g_vulkan_compute_map.erase(backend);
 }
 
 } // namespace granite

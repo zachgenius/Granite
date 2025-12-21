@@ -5,6 +5,7 @@
 
 #include "granite/backend.h"
 #include "granite/log.h"
+#include "backend/vulkan/vulkan_compute.h"
 
 #ifdef GRANITE_HAS_VULKAN
 
@@ -204,6 +205,8 @@ public:
         }
 
         GRANITE_LOG_INFO("Shutting down Vulkan backend");
+
+        release_vulkan_compute(this);
 
         if (device_ != VK_NULL_HANDLE) {
             vkDeviceWaitIdle(device_);
