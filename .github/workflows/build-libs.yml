@@ -1,0 +1,166 @@
+name: Granite Library Builds
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    name: macOS (Metal + CPU)
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Download metal-cpp
+        run: ./scripts/download_metal_cpp.sh
+
+      - name: Configure CMake
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGRANITE_BUILD_METAL=ON \
+            -DGRANITE_BUILD_VULKAN=OFF \
+            -DGRANITE_BUILD_CPU=ON \
+            -DGRANITE_BUILD_TESTS=OFF \
+            -DGRANITE_BUILD_EXAMPLES=OFF
+
+      - name: Build Library
+        run: cmake --build build --target granite --parallel
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: granite-lib-macos
+          path: build/libgranite.a
+          retention-days: 14
+
+  build-linux:
+    name: Linux (CPU)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake
+
+      - name: Configure CMake
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGRANITE_BUILD_METAL=OFF \
+            -DGRANITE_BUILD_VULKAN=OFF \
+            -DGRANITE_BUILD_CPU=ON \
+            -DGRANITE_BUILD_TESTS=OFF \
+            -DGRANITE_BUILD_EXAMPLES=OFF
+
+      - name: Build Library
+        run: cmake --build build --target granite --parallel
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: granite-lib-linux
+          path: build/libgranite.a
+          retention-days: 14
+
+  build-android:
+    name: Android (Vulkan + CPU)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Android SDK/NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        run: |
+          yes | sdkmanager "ndk;25.2.9519653"
+          echo "ANDROID_NDK=$ANDROID_SDK_ROOT/ndk/25.2.9519653" >> $GITHUB_ENV
+
+      - name: Build Android Library
+        run: |
+          ./scripts/build_android.sh --build-dir=build-android-ci --abi=arm64-v8a
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: granite-lib-android
+          path: build-android-ci/libgranite.a
+          retention-days: 14
+
+  build-ios:
+    name: iOS (XCFramework)
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Download metal-cpp
+        run: ./scripts/download_metal_cpp.sh
+
+      - name: Configure CMake (iOS device)
+        run: |
+          cmake -B build-ios-device \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
+            -DGRANITE_BUILD_METAL=ON \
+            -DGRANITE_BUILD_VULKAN=OFF \
+            -DGRANITE_BUILD_CPU=ON \
+            -DGRANITE_BUILD_TESTS=OFF \
+            -DGRANITE_BUILD_EXAMPLES=OFF
+
+      - name: Build Library (iOS device)
+        run: cmake --build build-ios-device --target granite --parallel
+
+      - name: Configure CMake (iOS simulator)
+        run: |
+          cmake -B build-ios-sim \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphonesimulator \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
+            -DGRANITE_BUILD_METAL=ON \
+            -DGRANITE_BUILD_VULKAN=OFF \
+            -DGRANITE_BUILD_CPU=ON \
+            -DGRANITE_BUILD_TESTS=OFF \
+            -DGRANITE_BUILD_EXAMPLES=OFF
+
+      - name: Build Library (iOS simulator)
+        run: cmake --build build-ios-sim --target granite --parallel
+
+      - name: Create XCFramework
+        run: |
+          mkdir -p build-ios
+          xcodebuild -create-xcframework \
+            -library build-ios-device/libgranite.a -headers include \
+            -library build-ios-sim/libgranite.a -headers include \
+            -output build-ios/granite.xcframework
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: granite-xcframework-ios
+          path: build-ios/granite.xcframework
+          retention-days: 14

@@ -26,7 +26,11 @@ int main() {
         // Compile kernels
         NSError* error = nil;
         MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
-        options.mathMode = MTLMathModeFast;
+#if defined(MTLMathModeFast)
+        if ([options respondsToSelector:@selector(setMathMode:)]) {
+            [options setValue:@(MTLMathModeFast) forKey:@"mathMode"];
+        }
+#endif
 
         NSString* source = @(METAL_SHADER_SOURCE.c_str());
         id<MTLLibrary> library = [device newLibraryWithSource:source

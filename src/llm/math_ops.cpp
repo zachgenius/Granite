@@ -1,6 +1,7 @@
 #include "math_ops.h"
 
 #include <cstring>
+#include <cmath>
 #include <thread>
 #include <vector>
 
