@@ -360,6 +360,8 @@ add_executable(granite_tree_bench tools/benchmark_tree_batching.cpp)
 target_link_libraries(granite_tree_bench PRIVATE granite)
 
 add_executable(granite_bench_vs_llamacpp tools/benchmark_vs_llamacpp.cpp)
+add_executable(granite_stress_inference tools/stress_inference.cpp)
+target_link_libraries(granite_stress_inference PRIVATE granite)
 target_link_libraries(granite_bench_vs_llamacpp PRIVATE granite)
 
 if(GRANITE_ENABLE_ONNX)
