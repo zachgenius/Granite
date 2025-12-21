@@ -4358,6 +4358,7 @@ Result<void> TransformerModel::sync_cpu_to_gpu_kv_cache(KVCache* kv_cache) {
 Result<Tensor> TransformerModel::attention_full_gpu(
     const Tensor& hidden,
     int layer,
+    KVCache* kv_cache,
     int start_pos)
 {
     std::string prefix = "blk." + std::to_string(layer) + ".";
@@ -4505,6 +4506,27 @@ Result<Tensor> TransformerModel::attention_full_gpu(
         current_len, 1, max_seq
     );
 
+    // Mirror KV to CPU cache when offload is enabled.
+    if (runtime_config_.kv_cache_offload && kv_cache) {
+        if (current_len + 1 <= kv_cache->max_seq_len()) {
+            auto [k_cpu, v_cpu] = kv_cache->get(layer);
+            if (k_cpu.buffer().valid() && v_cpu.buffer().valid()) {
+                auto* k_cpu_buf = static_cast<MTL::Buffer*>(
+                    backend_->get_native_buffer(k_cpu.buffer()));
+                auto* v_cpu_buf = static_cast<MTL::Buffer*>(
+                    backend_->get_native_buffer(v_cpu.buffer()));
+                if (k_cpu_buf && v_cpu_buf) {
+                    gpu->kv_cache_append(
+                        k_cpu_buf, v_cpu_buf,
+                        k_buf, v_buf,
+                        num_kv_heads, head_dim,
+                        current_len, 1,
+                        static_cast<uint32_t>(kv_cache->max_seq_len()));
+                }
+            }
+        }
+    }
+
     // 4. Multi-head attention (Metal GPU)
     // NOTE: CoreML/ANE attention was tested but found to be 10-50x slower due to
     // ~10ms fixed MPSGraph overhead. Metal Flash Attention is the optimal path.
@@ -4576,6 +4598,10 @@ Result<Tensor> TransformerModel::attention_gpu(
     if (has_gpu_cache && runtime_config_.kv_cache_offload) {
         int needed_len = start_pos + total_tokens;
         if (needed_len > gpu_kv_cache_->max_seq_len) {
+            auto* gpu = get_metal_compute();
+            if (gpu && gpu->is_initialized()) {
+                gpu->sync();
+            }
             return attention(hidden, layer, kv_cache, start_pos);
         }
     }
@@ -4586,7 +4612,7 @@ Result<Tensor> TransformerModel::attention_gpu(
 
         // If GPU cache is already valid (gpu_len == start_pos), use GPU path
         if (gpu_len == start_pos) {
-            auto result = attention_full_gpu(hidden, layer, start_pos);
+            auto result = attention_full_gpu(hidden, layer, kv_cache, start_pos);
             // After last layer, sync CPU cache length to match GPU cache
             // This keeps forward_single's start_pos calculation correct
             if (result.ok() && layer == model_config_.num_layers - 1 && kv_cache) {
@@ -4607,7 +4633,7 @@ Result<Tensor> TransformerModel::attention_gpu(
             }
             // After sync, GPU cache should be valid
             if (gpu_kv_cache_->seq_len() == start_pos) {
-                auto result = attention_full_gpu(hidden, layer, start_pos);
+                auto result = attention_full_gpu(hidden, layer, kv_cache, start_pos);
                 // After last layer, sync CPU cache length
                 if (result.ok() && layer == model_config_.num_layers - 1 && kv_cache) {
                     kv_cache->increment_seq_len(1);
@@ -4834,8 +4860,9 @@ Result<Tensor> TransformerModel::feed_forward_gpu(const Tensor& hidden, int laye
 Result<Tensor> TransformerModel::attention_full_gpu(
     const Tensor& hidden,
     int layer,
+    KVCache* kv_cache,
     int start_pos) {
-    return attention(hidden, layer, nullptr, start_pos);
+    return attention(hidden, layer, kv_cache, start_pos);
 }
 
 Result<Tensor> TransformerModel::attention_gpu(

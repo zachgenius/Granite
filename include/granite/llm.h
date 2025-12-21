@@ -597,6 +597,7 @@ private:
     Result<Tensor> attention_full_gpu(
         const Tensor& hidden,
         int layer,
+        KVCache* kv_cache,
         int start_pos);
 
     // =========================================================================
