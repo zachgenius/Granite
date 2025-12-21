@@ -6,13 +6,15 @@
 #include <iomanip>
 #include <cstdlib>
 #include <sstream>
+#include <algorithm>
 
 using namespace granite;
 using Clock = std::chrono::high_resolution_clock;
 
 // Benchmark helper
 template<typename Func>
-double benchmark_ms(Func&& f, int warmup = 2, int iterations = 10) {
+double benchmark_ms(Func&& f, int warmup = 2, int iterations = 10,
+                    std::vector<double>* samples = nullptr) {
     // Warmup
     for (int i = 0; i < warmup; i++) {
         f();
@@ -27,6 +29,10 @@ double benchmark_ms(Func&& f, int warmup = 2, int iterations = 10) {
         f();
         auto end = Clock::now();
         times.push_back(std::chrono::duration<double, std::milli>(end - start).count());
+    }
+
+    if (samples) {
+        *samples = times;
     }
 
     // Return median
@@ -143,7 +149,10 @@ void benchmark_inference(
     const std::vector<int64_t>& seq_lens,
     bool full_logits = false,
     uint32_t prefill_chunk_size = 0,
-    bool prefill_chunk_set = false) {
+    bool prefill_chunk_set = false,
+    size_t kv_cache_max_seq = 0,
+    bool kv_cache_max_seq_set = false,
+    bool enable_profiling = false) {
     print_header("LLM Inference Benchmark");
 
     Config runtime_config = Config::Balanced();
@@ -157,6 +166,25 @@ void benchmark_inference(
             runtime_config.prefill_chunk_size = static_cast<uint32_t>(chunk);
             std::cout << "Prefill chunk size: " << runtime_config.prefill_chunk_size << "\n";
         }
+    }
+
+    if (kv_cache_max_seq_set) {
+        runtime_config.kv_cache_max_seq = kv_cache_max_seq;
+        std::cout << "KV cache max seq: " << runtime_config.kv_cache_max_seq << "\n";
+    } else if (const char* kv_env = std::getenv("GRANITE_KV_CACHE_MAX_SEQ")) {
+        char* end = nullptr;
+        long kv = std::strtol(kv_env, &end, 10);
+        if (end && *end == '\0' && kv > 0) {
+            runtime_config.kv_cache_max_seq = static_cast<size_t>(kv);
+            kv_cache_max_seq_set = true;
+            kv_cache_max_seq = runtime_config.kv_cache_max_seq;
+            std::cout << "KV cache max seq: " << runtime_config.kv_cache_max_seq << "\n";
+        }
+    }
+
+    if (enable_profiling) {
+        runtime_config.enable_profiling = true;
+        std::cout << "Profiling: enabled\n";
     }
 
     // Load model
@@ -174,8 +202,16 @@ void benchmark_inference(
               << config.num_heads << " heads\n";
     std::cout << "Logits mode: " << (full_logits ? "ALL tokens" : "last token only") << "\n";
 
+    size_t cache_max_seq = 512;
+    if (kv_cache_max_seq_set) {
+        cache_max_seq = kv_cache_max_seq;
+    }
+    if (cache_max_seq > static_cast<size_t>(config.max_seq_len)) {
+        cache_max_seq = static_cast<size_t>(config.max_seq_len);
+    }
+
     // Allocate KV cache
-    auto kv_result = KVCache::allocate(config, 512, backend);
+    auto kv_result = KVCache::allocate(config, static_cast<int>(cache_max_seq), backend);
     if (!kv_result.ok()) {
         std::cerr << "Failed to allocate KV cache\n";
         return;
@@ -187,7 +223,7 @@ void benchmark_inference(
     model.set_use_gpu(true);
     // Control logits computation: full_logits=false means last-token-only (faster)
     model.set_prefill_last_token_only(!full_logits);
-    auto gpu_cache_result = model.allocate_gpu_kv_cache(512);
+    auto gpu_cache_result = model.allocate_gpu_kv_cache(static_cast<int>(cache_max_seq));
     if (gpu_cache_result.ok()) {
         std::cout << "GPU KV cache allocated\n";
     } else {
@@ -237,13 +273,22 @@ void benchmark_inference(
             return result.ok();
         };
 
-        double time_ms = benchmark_ms(prefill, 1, 3);
+        std::vector<double> samples;
+        double time_ms = benchmark_ms(prefill, 1, 3, enable_profiling ? &samples : nullptr);
         double tokens_per_sec = (seq_len / time_ms) * 1000.0;
 
         std::cout << std::setw(15) << seq_len
                   << std::setw(15) << std::fixed << std::setprecision(2) << time_ms
                   << std::setw(15) << std::fixed << std::setprecision(1) << tokens_per_sec
                   << "\n";
+        if (enable_profiling && !samples.empty()) {
+            double sum = std::accumulate(samples.begin(), samples.end(), 0.0);
+            double avg = sum / static_cast<double>(samples.size());
+            double min = *std::min_element(samples.begin(), samples.end());
+            double max = *std::max_element(samples.begin(), samples.end());
+            std::cout << "  prefill stats (ms): avg=" << std::fixed << std::setprecision(2) << avg
+                      << " min=" << min << " max=" << max << "\n";
+        }
     }
 
     // Benchmark single-token generation (decode)
@@ -299,12 +344,21 @@ void benchmark_inference(
         };
 
         int actual_len = get_cache_len();
-        double time_ms = benchmark_ms(decode, 1, 3);
+        std::vector<double> samples;
+        double time_ms = benchmark_ms(decode, 1, 3, enable_profiling ? &samples : nullptr);
         double tokens_per_sec = 1000.0 / time_ms;
 
         std::cout << std::setw(15) << actual_len
                   << std::setw(15) << std::fixed << std::setprecision(2) << time_ms
                   << std::setw(15) << std::fixed << std::setprecision(1) << tokens_per_sec << "\n";
+        if (enable_profiling && !samples.empty()) {
+            double sum = std::accumulate(samples.begin(), samples.end(), 0.0);
+            double avg = sum / static_cast<double>(samples.size());
+            double min = *std::min_element(samples.begin(), samples.end());
+            double max = *std::max_element(samples.begin(), samples.end());
+            std::cout << "  decode stats (ms): avg=" << std::fixed << std::setprecision(2) << avg
+                      << " min=" << min << " max=" << max << "\n";
+        }
     }
 }
 
@@ -419,6 +473,9 @@ int main(int argc, char* argv[]) {
         std::vector<int64_t> seq_lens = {32, 128, 256, 512};
         uint32_t prefill_chunk_size = 0;
         bool prefill_chunk_set = false;
+        size_t kv_cache_max_seq = 0;
+        bool kv_cache_max_seq_set = false;
+        bool enable_profiling = false;
 
         for (int i = 1; i < argc; i++) {
             std::string arg = argv[i];
@@ -440,6 +497,17 @@ int main(int argc, char* argv[]) {
                 } else {
                     std::cerr << "Invalid --prefill-chunk-size value, ignoring.\n";
                 }
+            } else if (arg == "--kv-cache-max-seq" && i + 1 < argc) {
+                char* end = nullptr;
+                long kv = std::strtol(argv[++i], &end, 10);
+                if (end && *end == '\0' && kv > 0) {
+                    kv_cache_max_seq = static_cast<size_t>(kv);
+                    kv_cache_max_seq_set = true;
+                } else {
+                    std::cerr << "Invalid --kv-cache-max-seq value, ignoring.\n";
+                }
+            } else if (arg == "--profile") {
+                enable_profiling = true;
             } else if (arg[0] != '-') {
                 model_path = arg;
             }
@@ -447,13 +515,17 @@ int main(int argc, char* argv[]) {
 
         if (!model_path.empty()) {
             benchmark_inference(model_path, backend.get(), seq_lens, full_logits,
-                                prefill_chunk_size, prefill_chunk_set);
+                                prefill_chunk_size, prefill_chunk_set,
+                                kv_cache_max_seq, kv_cache_max_seq_set,
+                                enable_profiling);
         } else {
             std::cout << "\nUsage: " << argv[0] << " [model.gguf] [--full-logits]\n";
             std::cout << "Provide a GGUF model path to run inference benchmarks.\n";
             std::cout << "  --full-logits: Compute logits for all tokens (default: last token only)\n";
             std::cout << "  --seq-lens <a,b,c>: Override prefill prompt lengths\n";
             std::cout << "  --prefill-chunk-size <n>: Override prefill chunk size (0 disables)\n";
+            std::cout << "  --kv-cache-max-seq <n>: Override KV cache max sequence length\n";
+            std::cout << "  --profile: Print per-section timing stats\n";
         }
     } else {
         std::cout << "\nUsage: " << argv[0] << " [model.gguf] [--full-logits]\n";
@@ -461,6 +533,8 @@ int main(int argc, char* argv[]) {
         std::cout << "  --full-logits: Compute logits for all tokens (default: last token only)\n";
         std::cout << "  --seq-lens <a,b,c>: Override prefill prompt lengths\n";
         std::cout << "  --prefill-chunk-size <n>: Override prefill chunk size (0 disables)\n";
+        std::cout << "  --kv-cache-max-seq <n>: Override KV cache max sequence length\n";
+        std::cout << "  --profile: Print per-section timing stats\n";
     }
 
     backend->shutdown();

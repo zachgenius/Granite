@@ -29,8 +29,18 @@ Result<std::unique_ptr<SpeculativeRunner>> SpeculativeRunner::load(
     auto runner = std::make_unique<SpeculativeRunner>();
 
     // Create backends for both models
-    runner->target_backend_ = create_default_backend();
-    runner->draft_backend_ = create_default_backend();
+    if (config.preferred_backend) {
+        runner->target_backend_ = create_backend(*config.preferred_backend);
+        runner->draft_backend_ = create_backend(*config.preferred_backend);
+        if (!runner->target_backend_ || !runner->draft_backend_) {
+            GRANITE_LOG_WARN("Preferred backend unavailable, falling back to default");
+            runner->target_backend_ = create_default_backend();
+            runner->draft_backend_ = create_default_backend();
+        }
+    } else {
+        runner->target_backend_ = create_default_backend();
+        runner->draft_backend_ = create_default_backend();
+    }
 
     if (!runner->target_backend_ || !runner->draft_backend_) {
         GRANITE_FAIL(ErrorCode::InternalError, "Failed to create backends");
@@ -129,6 +139,11 @@ Result<void> SpeculativeRunner::generate_streaming(
     ProgressCallback progress_callback,
     const SpeculativeConfig& spec_config)
 {
+    if (spec_config.use_tree) {
+        return generate_streaming_tree(prompt, config, std::move(callback),
+                                       std::move(progress_callback), spec_config);
+    }
+
     cancelled_ = false;
     stats_ = Stats{};  // Reset stats
 
@@ -206,6 +221,7 @@ Result<void> SpeculativeRunner::generate_streaming(
     // Output first token
     std::string token_str = tokenizer_.decode_token(last_token);
     if (!callback(token_str)) {
+        cancelled_ = true;
         return {};
     }
     if (progress_callback) {
@@ -252,6 +268,7 @@ Result<void> SpeculativeRunner::generate_streaming(
 
             token_str = tokenizer_.decode_token(token);
             if (!callback(token_str)) {
+                cancelled_ = true;
                 should_stop = true;
                 break;
             }
@@ -303,6 +320,9 @@ std::vector<int32_t> SpeculativeRunner::draft_tokens(int k, int32_t last_token) 
     int draft_start_pos = draft_kv_cache_.seq_len();
 
     for (int i = 0; i < k; i++) {
+        if (cancelled_) {
+            break;
+        }
         // Generate next token from draft model
         auto logits_result = draft_model_.forward_single(token, draft_kv_cache_);
         if (!logits_result.ok()) {
@@ -328,6 +348,10 @@ std::vector<int32_t> SpeculativeRunner::verify_tokens(
     int32_t last_accepted_token)
 {
     if (candidates.empty()) {
+        return {};
+    }
+
+    if (cancelled_) {
         return {};
     }
 
@@ -378,6 +402,9 @@ std::vector<int32_t> SpeculativeRunner::verify_tokens(
     // Now verify remaining candidates using batch_logits
     // batch_logits[i] gives logits for predicting candidates[i+1] (shifted by 1)
     for (int i = 0; i < num_candidates - 1; i++) {
+        if (cancelled_) {
+            break;
+        }
         const float* pos_logits = logits_data + i * vocab_size;
 
         // Find argmax for this position
@@ -689,6 +716,7 @@ Result<void> SpeculativeRunner::generate_streaming_tree(
     const std::string& prompt,
     const GenerationConfig& config,
     TokenCallback callback,
+    ProgressCallback progress_callback,
     const SpeculativeConfig& spec_config)
 {
     cancelled_ = false;
@@ -743,6 +771,19 @@ Result<void> SpeculativeRunner::generate_streaming_tree(
         return draft_logits_result.error();
     }
 
+    if (progress_callback) {
+        GenerationProgress progress;
+        progress.prompt_tokens = static_cast<int>(prompt_tokens.size());
+        progress.generated_tokens = 0;
+        progress.max_tokens = config.max_tokens;
+        progress.is_prefill = true;
+        progress_callback(progress);
+    }
+
+    if (cancelled_) {
+        return {};
+    }
+
     // Sample first token
     int32_t last_token = argmax(target_logits);
 
@@ -752,7 +793,16 @@ Result<void> SpeculativeRunner::generate_streaming_tree(
 
     std::string token_str = tokenizer_.decode_token(last_token);
     if (!callback(token_str)) {
+        cancelled_ = true;
         return {};
+    }
+    if (progress_callback) {
+        GenerationProgress progress;
+        progress.prompt_tokens = static_cast<int>(prompt_tokens.size());
+        progress.generated_tokens = 1;
+        progress.max_tokens = config.max_tokens;
+        progress.is_prefill = false;
+        progress_callback(progress);
     }
 
     // Tree speculative decoding loop
@@ -790,11 +840,20 @@ Result<void> SpeculativeRunner::generate_streaming_tree(
 
             token_str = tokenizer_.decode_token(token);
             if (!callback(token_str)) {
+                cancelled_ = true;
                 should_stop = true;
                 break;
             }
 
             generated++;
+            if (progress_callback) {
+                GenerationProgress progress;
+                progress.prompt_tokens = static_cast<int>(prompt_tokens.size());
+                progress.generated_tokens = generated;
+                progress.max_tokens = config.max_tokens;
+                progress.is_prefill = false;
+                progress_callback(progress);
+            }
             if (generated >= config.max_tokens) {
                 should_stop = true;
                 break;

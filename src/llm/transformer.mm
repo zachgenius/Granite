@@ -42,6 +42,14 @@ Result<TransformerModel> TransformerModel::load(
     model.backend_ = backend;
     model.runtime_config_ = config;
 
+#ifdef GRANITE_HAS_METAL
+    if (config.enable_profiling) {
+        if (auto* gpu = get_metal_compute()) {
+            gpu->enable_profiling(true);
+        }
+    }
+#endif
+
     // Open GGUF file
     auto gguf_result = GGUFFile::open(path);
     if (!gguf_result.ok()) {

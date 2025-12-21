@@ -1,6 +1,9 @@
 #pragma once
 
+#include "granite/types.h"
+
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace granite {
@@ -98,6 +101,9 @@ struct Config {
     bool kv_cache_offload = false;         ///< Allow CPU KV fallback when GPU cache is smaller
     CachePolicy weight_cache_policy = CachePolicy::Lazy;
     bool use_memory_mapping = true;        ///< mmap for weights
+
+    // === Backend Configuration ===
+    std::optional<BackendType> preferred_backend;  ///< Force a specific backend if available
 
     // === Thermal Configuration ===
     ThermalMode thermal_mode = ThermalMode::Adaptive;
@@ -234,6 +240,11 @@ public:
 
     ConfigBuilder& weight_cache_policy(CachePolicy policy) {
         config_.weight_cache_policy = policy;
+        return *this;
+    }
+
+    ConfigBuilder& preferred_backend(BackendType backend) {
+        config_.preferred_backend = backend;
         return *this;
     }
 

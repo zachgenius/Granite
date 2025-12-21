@@ -13,7 +13,15 @@ Result<std::unique_ptr<LLMRunner>> LLMRunner::load(const std::string& path, cons
     auto runner = std::make_unique<LLMRunner>();
 
     // Create backend
-    runner->backend_ = create_default_backend();
+    if (config.preferred_backend) {
+        runner->backend_ = create_backend(*config.preferred_backend);
+        if (!runner->backend_) {
+            GRANITE_LOG_WARN("Preferred backend unavailable, falling back to default");
+            runner->backend_ = create_default_backend();
+        }
+    } else {
+        runner->backend_ = create_default_backend();
+    }
     if (!runner->backend_) {
         GRANITE_FAIL(ErrorCode::InternalError, "Failed to create backend");
     }
@@ -173,6 +181,7 @@ Result<void> LLMRunner::generate_streaming(
         // Decode and callback
         std::string token_str = tokenizer_.decode_token(next_token);
         if (!callback(token_str)) {
+            cancelled_ = true;
             break;
         }
 

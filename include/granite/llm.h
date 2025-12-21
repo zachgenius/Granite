@@ -807,6 +807,7 @@ private:
         const std::string& prompt,
         const GenerationConfig& config,
         TokenCallback callback,
+        ProgressCallback progress_callback,
         const SpeculativeConfig& spec_config);
 
     // Sampling
