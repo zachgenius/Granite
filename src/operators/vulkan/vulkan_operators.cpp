@@ -12,6 +12,7 @@
 #include <vulkan/vulkan.h>
 #include <limits>
 #include <algorithm>
+#include <cmath>
 
 namespace granite {
 
@@ -341,6 +342,97 @@ public:
     }
 };
 
+class VulkanAttentionOp : public VulkanOperator {
+public:
+    OpType type() const override { return OpType::ScaledDotProductAttention; }
+
+    Result<void> validate(const OpContext& ctx) const override {
+        if (ctx.num_inputs() < 3) {
+            return Error(ErrorCode::InvalidArgument, "Attention requires 3 inputs (Q, K, V)");
+        }
+
+        const auto& q = ctx.inputs[0];
+        const auto& k = ctx.inputs[1];
+        const auto& v = ctx.inputs[2];
+
+        if (q.dtype() != DataType::FP32 || k.dtype() != DataType::FP32 || v.dtype() != DataType::FP32) {
+            return Error(ErrorCode::NotImplemented, "Vulkan attention only supports FP32");
+        }
+
+        if (q.ndim() != 2 || k.ndim() != 2 || v.ndim() != 2) {
+            return Error(ErrorCode::NotImplemented, "Vulkan attention supports 2D tensors only");
+        }
+
+        // Expect K to be transposed: [head_dim, seq_kv]
+        if (q.size(1) != k.size(0) || k.size(1) != v.size(0) || v.size(1) != q.size(1)) {
+            return Error(ErrorCode::ShapeMismatch, "Attention expects K as [D, T] and V as [T, D]");
+        }
+
+        return {};
+    }
+
+    Result<std::vector<std::vector<int64_t>>> infer_shapes(const OpContext& ctx) const override {
+        const auto& q = ctx.inputs[0];
+        return std::vector<std::vector<int64_t>>{
+            std::vector<int64_t>(q.shape().begin(), q.shape().end())
+        };
+    }
+
+    Result<void> execute(OpContext& ctx) override {
+        const auto& q = ctx.inputs[0];
+        const auto& k = ctx.inputs[1];
+        const auto& v = ctx.inputs[2];
+        auto& out = ctx.outputs[0];
+
+        auto* compute = get_vulkan_compute(ctx.backend);
+        if (!compute || !compute->is_initialized()) {
+            return Error(ErrorCode::BackendNotInitialized, "VulkanCompute not initialized");
+        }
+
+        uint32_t seq_q = static_cast<uint32_t>(q.size(0));
+        uint32_t head_dim = static_cast<uint32_t>(q.size(1));
+        uint32_t seq_kv = static_cast<uint32_t>(k.size(1));
+
+        float scale = static_cast<float>(
+            ctx.attrs.get<double>("scale", 1.0 / std::sqrt(static_cast<double>(head_dim))));
+
+        std::vector<int64_t> scores_shape = {
+            static_cast<int64_t>(seq_q),
+            static_cast<int64_t>(seq_kv)
+        };
+        auto scores_result = Tensor::allocate(scores_shape, DataType::FP32, ctx.backend);
+        if (!scores_result.ok()) {
+            return scores_result.error();
+        }
+        auto scores = std::move(scores_result).take();
+
+        auto* buf_q = static_cast<VkBuffer>(ctx.backend->get_native_buffer(q.buffer()));
+        auto* buf_k = static_cast<VkBuffer>(ctx.backend->get_native_buffer(k.buffer()));
+        auto* buf_v = static_cast<VkBuffer>(ctx.backend->get_native_buffer(v.buffer()));
+        auto* buf_scores = static_cast<VkBuffer>(ctx.backend->get_native_buffer(scores.buffer()));
+        auto* buf_out = static_cast<VkBuffer>(ctx.backend->get_native_buffer(out.buffer()));
+
+        if (!buf_q || !buf_k || !buf_v || !buf_scores || !buf_out) {
+            return Error(ErrorCode::InvalidArgument, "Invalid Vulkan buffer handle");
+        }
+
+        // scores = Q [S,D] @ K [D,T]
+        auto matmul_scores = compute->matmul_f32(buf_q, buf_k, buf_scores, seq_q, head_dim, seq_kv);
+        if (!matmul_scores.ok()) {
+            return matmul_scores.error();
+        }
+
+        // softmax rows with scale
+        auto softmax_result = compute->softmax_rows(buf_scores, buf_scores, seq_q, seq_kv, scale);
+        if (!softmax_result.ok()) {
+            return softmax_result.error();
+        }
+
+        // out = scores [S,T] @ V [T,D]
+        return compute->matmul_f32(buf_scores, buf_v, buf_out, seq_q, seq_kv, head_dim);
+    }
+};
+
 // =============================================================================
 // Register Vulkan Operators
 // =============================================================================
@@ -362,6 +454,8 @@ void register_vulkan_operators() {
                         []() { return std::make_unique<VulkanSoftmaxOp>(); });
     registry.register_op(OpType::MatMul, BackendType::Vulkan,
                         []() { return std::make_unique<VulkanMatMulOp>(); });
+    registry.register_op(OpType::ScaledDotProductAttention, BackendType::Vulkan,
+                        []() { return std::make_unique<VulkanAttentionOp>(); });
 
 }
 
