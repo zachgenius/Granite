@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 #include <cstring>
+#include <fstream>
 
 namespace granite {
 
@@ -371,9 +372,85 @@ public:
             return Error(ErrorCode::BackendNotInitialized);
         }
 
-        // TODO: Implement shader compilation from SPIR-V
-        // For now, return a placeholder
-        return Error(ErrorCode::NotImplemented, "Pipeline creation not yet implemented");
+        std::vector<uint32_t> spirv;
+
+        // shader_source is expected to be a SPIR-V path for Vulkan
+        std::ifstream file(desc.shader_source, std::ios::binary | std::ios::ate);
+        if (file.is_open()) {
+            std::streamsize size = file.tellg();
+            if (size <= 0) {
+                return Error(ErrorCode::InvalidArgument,
+                             fmt::format("Empty SPIR-V file: {}", desc.shader_source));
+            }
+            file.seekg(0, std::ios::beg);
+            if (size % 4 != 0) {
+                return Error(ErrorCode::InvalidArgument,
+                             fmt::format("Invalid SPIR-V size: {}", desc.shader_source));
+            }
+            spirv.resize(static_cast<size_t>(size / 4));
+            if (!file.read(reinterpret_cast<char*>(spirv.data()), size)) {
+                return Error(ErrorCode::IOError,
+                             fmt::format("Failed to read SPIR-V: {}", desc.shader_source));
+            }
+        } else {
+            return Error(ErrorCode::FileNotFound,
+                         fmt::format("SPIR-V not found: {}", desc.shader_source));
+        }
+
+        VkShaderModuleCreateInfo module_info{};
+        module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        module_info.codeSize = spirv.size() * sizeof(uint32_t);
+        module_info.pCode = spirv.data();
+
+        VkShaderModule shader_module = VK_NULL_HANDLE;
+        VkResult result = vkCreateShaderModule(device_, &module_info, nullptr, &shader_module);
+        if (result != VK_SUCCESS) {
+            return Error(ErrorCode::ShaderCompilationFailed, "Failed to create shader module");
+        }
+
+        VkPushConstantRange push_constant_range{};
+        push_constant_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        push_constant_range.offset = 0;
+        push_constant_range.size = max_push_constant_size_;
+
+        VkPipelineLayoutCreateInfo layout_info{};
+        layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layout_info.setLayoutCount = 1;
+        layout_info.pSetLayouts = &descriptor_set_layout_;
+        layout_info.pushConstantRangeCount = 1;
+        layout_info.pPushConstantRanges = &push_constant_range;
+
+        VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+        result = vkCreatePipelineLayout(device_, &layout_info, nullptr, &pipeline_layout);
+        if (result != VK_SUCCESS) {
+            vkDestroyShaderModule(device_, shader_module, nullptr);
+            return Error(ErrorCode::InternalError, "Failed to create pipeline layout");
+        }
+
+        VkComputePipelineCreateInfo pipeline_info{};
+        pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        pipeline_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipeline_info.stage.module = shader_module;
+        pipeline_info.stage.pName = desc.entry_point.c_str();
+        pipeline_info.layout = pipeline_layout;
+
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        result = vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1,
+                                          &pipeline_info, nullptr, &pipeline);
+
+        vkDestroyShaderModule(device_, shader_module, nullptr);
+
+        if (result != VK_SUCCESS) {
+            vkDestroyPipelineLayout(device_, pipeline_layout, nullptr);
+            return Error(ErrorCode::InternalError, "Failed to create compute pipeline");
+        }
+
+        PipelineHandle handle{next_handle_++};
+        pipelines_[handle] = pipeline;
+        pipeline_layouts_[handle] = pipeline_layout;
+
+        return handle;
     }
 
     void destroy_pipeline(PipelineHandle handle) override {
@@ -423,17 +500,81 @@ public:
 
         current_pipeline_ = it->second;
         vkCmdBindPipeline(current_command_buffer_, VK_PIPELINE_BIND_POINT_COMPUTE, current_pipeline_);
+
+        auto layout_it = pipeline_layouts_.find(handle);
+        if (layout_it == pipeline_layouts_.end()) {
+            return Error(ErrorCode::InvalidHandle, "Pipeline layout not found");
+        }
+        current_pipeline_layout_ = layout_it->second;
+
+        VkDescriptorSetAllocateInfo alloc_info{};
+        alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        alloc_info.descriptorPool = descriptor_pool_;
+        alloc_info.descriptorSetCount = 1;
+        alloc_info.pSetLayouts = &descriptor_set_layout_;
+
+        VkResult result = vkAllocateDescriptorSets(device_, &alloc_info, &current_descriptor_set_);
+        if (result != VK_SUCCESS) {
+            return Error(ErrorCode::InternalError, "Failed to allocate descriptor set");
+        }
+
+        bound_buffers_.assign(kMaxBufferBindings, {});
+        bound_buffer_sizes_.assign(kMaxBufferBindings, 0);
+        bound_buffer_valid_.assign(kMaxBufferBindings, false);
         return {};
     }
 
     Result<void> bind_buffer(uint32_t index, BufferHandle handle, size_t offset) override {
-        // TODO: Implement descriptor set binding
-        return Error(ErrorCode::NotImplemented, "Buffer binding not yet implemented");
+        if (current_command_buffer_ == VK_NULL_HANDLE || current_descriptor_set_ == VK_NULL_HANDLE) {
+            return Error(ErrorCode::InvalidState, "No active command buffer or descriptor set");
+        }
+        if (index >= kMaxBufferBindings) {
+            return Error(ErrorCode::InvalidArgument, "Binding index out of range");
+        }
+
+        auto buffer_it = buffers_.find(handle);
+        if (buffer_it == buffers_.end()) {
+            return Error(ErrorCode::InvalidHandle, "Buffer not found");
+        }
+
+        auto size_it = buffer_sizes_.find(handle);
+        if (size_it == buffer_sizes_.end()) {
+            return Error(ErrorCode::InvalidHandle, "Buffer size not found");
+        }
+
+        VkDescriptorBufferInfo buffer_info{};
+        buffer_info.buffer = buffer_it->second;
+        buffer_info.offset = offset;
+        buffer_info.range = size_it->second > offset ? size_it->second - offset : 0;
+
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = current_descriptor_set_;
+        write.dstBinding = index;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.pBufferInfo = &buffer_info;
+
+        vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+
+        bound_buffers_[index] = buffer_info;
+        bound_buffer_sizes_[index] = buffer_info.range;
+        bound_buffer_valid_[index] = true;
+        return {};
     }
 
     Result<void> set_push_constants(const void* data, size_t size) override {
-        // TODO: Implement push constants
-        return Error(ErrorCode::NotImplemented, "Push constants not yet implemented");
+        if (current_command_buffer_ == VK_NULL_HANDLE || current_pipeline_layout_ == VK_NULL_HANDLE) {
+            return Error(ErrorCode::InvalidState, "No active pipeline for push constants");
+        }
+        if (size > max_push_constant_size_) {
+            return Error(ErrorCode::InvalidArgument, "Push constants exceed max size");
+        }
+
+        vkCmdPushConstants(current_command_buffer_, current_pipeline_layout_,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                           static_cast<uint32_t>(size), data);
+        return {};
     }
 
     Result<void> dispatch(uint32_t groups_x, uint32_t groups_y, uint32_t groups_z) override {
@@ -441,6 +582,11 @@ public:
             return Error(ErrorCode::InvalidState, "No active command buffer");
         }
 
+        if (current_descriptor_set_ != VK_NULL_HANDLE) {
+            vkCmdBindDescriptorSets(current_command_buffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    current_pipeline_layout_, 0, 1,
+                                    &current_descriptor_set_, 0, nullptr);
+        }
         vkCmdDispatch(current_command_buffer_, groups_x, groups_y, groups_z);
         return {};
     }
@@ -480,6 +626,12 @@ public:
             current_command_buffer_ = VK_NULL_HANDLE;
         }
 
+        if (current_descriptor_set_ != VK_NULL_HANDLE) {
+            vkFreeDescriptorSets(device_, descriptor_pool_, 1, &current_descriptor_set_);
+            current_descriptor_set_ = VK_NULL_HANDLE;
+        }
+
+        current_pipeline_layout_ = VK_NULL_HANDLE;
         return {};
     }
 
@@ -699,8 +851,10 @@ private:
 
     VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout descriptor_set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorSet current_descriptor_set_ = VK_NULL_HANDLE;
 
     VkPipeline current_pipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout current_pipeline_layout_ = VK_NULL_HANDLE;
 
     // Device capabilities
     bool supports_fp16_ = false;
@@ -714,6 +868,12 @@ private:
     std::unordered_map<PipelineHandle, VkPipeline> pipelines_;
     std::unordered_map<PipelineHandle, VkPipelineLayout> pipeline_layouts_;
     std::unordered_map<FenceHandle, VkFence> fences_;
+
+    static constexpr uint32_t kMaxBufferBindings = 8;
+    static constexpr uint32_t max_push_constant_size_ = 128;
+    std::vector<VkDescriptorBufferInfo> bound_buffers_;
+    std::vector<size_t> bound_buffer_sizes_;
+    std::vector<bool> bound_buffer_valid_;
 };
 
 // Factory function
