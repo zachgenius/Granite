@@ -1072,21 +1072,45 @@ layout(binding = 0) readonly buffer A { float data_a[]; };
 layout(binding = 1) readonly buffer B { float data_b[]; };
 layout(binding = 2) writeonly buffer D { float data_d[]; };
 
+shared float tile_a[16][16];
+shared float tile_b[16][16];
+
 void main() {
     uint row = gl_GlobalInvocationID.y;
     uint col = gl_GlobalInvocationID.x;
     uint n = uint(p.N);
 
-    if (row >= p.M || col >= n) {
-        return;
-    }
+    bool in_bounds = (row < p.M) && (col < n);
 
     float sum = 0.0;
-    for (uint k = 0; k < p.K; k++) {
-        sum += data_a[row * p.K + k] * data_b[k * n + col];
+    for (uint k0 = 0; k0 < p.K; k0 += 16) {
+        uint k = k0 + gl_LocalInvocationID.x;
+        uint kb = k0 + gl_LocalInvocationID.y;
+
+        if (row < p.M && k < p.K) {
+            tile_a[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = data_a[row * p.K + k];
+        } else {
+            tile_a[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = 0.0;
+        }
+
+        if (kb < p.K && col < n) {
+            tile_b[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = data_b[kb * n + col];
+        } else {
+            tile_b[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = 0.0;
+        }
+
+        barrier();
+
+        for (uint kk = 0; kk < 16; kk++) {
+            sum += tile_a[gl_LocalInvocationID.y][kk] * tile_b[kk][gl_LocalInvocationID.x];
+        }
+
+        barrier();
     }
 
-    data_d[row * n + col] = sum;
+    if (in_bounds) {
+        data_d[row * n + col] = sum;
+    }
 }
 )";
 

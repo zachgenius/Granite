@@ -319,6 +319,137 @@ TEST_CASE("Vulkan MatMul operator", "[vulkan][compute]") {
     backend->unmap_buffer(out.buffer());
 }
 
+TEST_CASE("Vulkan attention operator", "[vulkan][compute]") {
+    VulkanTestFixture fixture;
+
+    if (!fixture.is_available()) {
+        SKIP("Vulkan backend not available");
+    }
+
+    initialize_operators();
+
+    auto* backend = fixture.backend();
+
+    const int64_t seq_q = 2;
+    const int64_t seq_kv = 3;
+    const int64_t head_dim = 4;
+
+    std::vector<int64_t> shape_q = {seq_q, head_dim};
+    std::vector<int64_t> shape_k = {head_dim, seq_kv};  // transposed
+    std::vector<int64_t> shape_v = {seq_kv, head_dim};
+
+    auto q_result = Tensor::allocate(shape_q, DataType::FP32, backend);
+    auto k_result = Tensor::allocate(shape_k, DataType::FP32, backend);
+    auto v_result = Tensor::allocate(shape_v, DataType::FP32, backend);
+    REQUIRE(q_result.ok());
+    REQUIRE(k_result.ok());
+    REQUIRE(v_result.ok());
+
+    auto q = std::move(q_result).take();
+    auto k = std::move(k_result).take();
+    auto v = std::move(v_result).take();
+
+    {
+        auto map_q = backend->map_buffer(q.buffer());
+        auto map_k = backend->map_buffer(k.buffer());
+        auto map_v = backend->map_buffer(v.buffer());
+        REQUIRE(map_q.ok());
+        REQUIRE(map_k.ok());
+        REQUIRE(map_v.ok());
+
+        float* pq = static_cast<float*>(map_q.value());
+        float* pk = static_cast<float*>(map_k.value());
+        float* pv = static_cast<float*>(map_v.value());
+
+        for (int i = 0; i < seq_q * head_dim; i++) {
+            pq[i] = static_cast<float>(i + 1);
+        }
+        for (int i = 0; i < head_dim * seq_kv; i++) {
+            pk[i] = static_cast<float>(i + 1) * 0.5f;
+        }
+        for (int i = 0; i < seq_kv * head_dim; i++) {
+            pv[i] = static_cast<float>(i + 1) * 0.25f;
+        }
+
+        backend->unmap_buffer(q.buffer());
+        backend->unmap_buffer(k.buffer());
+        backend->unmap_buffer(v.buffer());
+    }
+
+    auto attn_op = OperatorRegistry::instance().create(
+        OpType::ScaledDotProductAttention, BackendType::Vulkan);
+    REQUIRE(attn_op != nullptr);
+
+    OpContext ctx;
+    ctx.backend = backend;
+    ctx.inputs = {q, k, v};
+    ctx.attrs.set("scale", 1.0 / std::sqrt(static_cast<double>(head_dim)));
+
+    auto shapes_result = attn_op->infer_shapes(ctx);
+    REQUIRE(shapes_result.ok());
+
+    auto out_result = Tensor::allocate(shapes_result.value()[0], DataType::FP32, backend);
+    REQUIRE(out_result.ok());
+    ctx.outputs = {std::move(out_result).take()};
+
+    auto exec_result = attn_op->execute(ctx);
+    REQUIRE(exec_result.ok());
+
+    auto map_out = backend->map_buffer(ctx.outputs[0].buffer());
+    REQUIRE(map_out.ok());
+    const float* pout = static_cast<const float*>(map_out.value());
+
+    // CPU reference
+    float scores[seq_q * seq_kv] = {};
+    float probs[seq_q * seq_kv] = {};
+    float expected[seq_q * head_dim] = {};
+
+    double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
+
+    for (int i = 0; i < seq_q; i++) {
+        for (int j = 0; j < seq_kv; j++) {
+            float sum = 0.0f;
+            for (int d = 0; d < head_dim; d++) {
+                sum += static_cast<float>((i * head_dim + d + 1) * ((d * seq_kv + j + 1) * 0.5f));
+            }
+            scores[i * seq_kv + j] = sum * static_cast<float>(scale);
+        }
+
+        float max_val = scores[i * seq_kv];
+        for (int j = 1; j < seq_kv; j++) {
+            max_val = std::max(max_val, scores[i * seq_kv + j]);
+        }
+
+        float sum_exp = 0.0f;
+        for (int j = 0; j < seq_kv; j++) {
+            float val = std::exp(scores[i * seq_kv + j] - max_val);
+            probs[i * seq_kv + j] = val;
+            sum_exp += val;
+        }
+        float inv_sum = 1.0f / sum_exp;
+        for (int j = 0; j < seq_kv; j++) {
+            probs[i * seq_kv + j] *= inv_sum;
+        }
+    }
+
+    for (int i = 0; i < seq_q; i++) {
+        for (int d = 0; d < head_dim; d++) {
+            float sum = 0.0f;
+            for (int j = 0; j < seq_kv; j++) {
+                float v_val = static_cast<float>((j * head_dim + d + 1) * 0.25f);
+                sum += probs[i * seq_kv + j] * v_val;
+            }
+            expected[i * head_dim + d] = sum;
+        }
+    }
+
+    for (int i = 0; i < seq_q * head_dim; i++) {
+        REQUIRE_THAT(pout[i], WithinAbs(expected[i], 1e-4f));
+    }
+
+    backend->unmap_buffer(ctx.outputs[0].buffer());
+}
+
 TEST_CASE("Vulkan pipeline add shader", "[vulkan][pipeline]") {
     VulkanTestFixture fixture;
 
