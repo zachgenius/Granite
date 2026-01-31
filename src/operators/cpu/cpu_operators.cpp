@@ -8,10 +8,14 @@
 
 #ifdef GRANITE_HAS_CPU
 
+extern "C" {
+#include "grml/grml.h"
+}
+
 namespace granite {
 
 // =============================================================================
-// CPU Binary Operators (Add, Sub, Mul, Div)
+// CPU Binary Operators (Add, Sub, Mul, Div) — backed by GrML SIMD kernels
 // =============================================================================
 
 template<OpType Op>
@@ -55,20 +59,18 @@ public:
         const float* pb = static_cast<const float*>(map_b.value());
         float* pout = static_cast<float*>(map_out.value());
 
-        size_t n = out.numel();
+        int64_t n = static_cast<int64_t>(out.numel());
 
         // Simple case: same shape, no broadcasting
-        if (a.numel() == b.numel() && a.numel() == n) {
-            for (size_t i = 0; i < n; i++) {
-                if constexpr (Op == OpType::Add) {
-                    pout[i] = pa[i] + pb[i];
-                } else if constexpr (Op == OpType::Sub) {
-                    pout[i] = pa[i] - pb[i];
-                } else if constexpr (Op == OpType::Mul) {
-                    pout[i] = pa[i] * pb[i];
-                } else if constexpr (Op == OpType::Div) {
-                    pout[i] = pa[i] / pb[i];
-                }
+        if (a.numel() == b.numel() && a.numel() == static_cast<size_t>(n)) {
+            if constexpr (Op == OpType::Add) {
+                grml_kernel_add_f32(n, pout, pa, pb);
+            } else if constexpr (Op == OpType::Sub) {
+                grml_kernel_sub_f32(n, pout, pa, pb);
+            } else if constexpr (Op == OpType::Mul) {
+                grml_kernel_mul_f32(n, pout, pa, pb);
+            } else if constexpr (Op == OpType::Div) {
+                grml_kernel_div_f32(n, pout, pa, pb);
             }
         } else {
             return Error(ErrorCode::NotImplemented, "Broadcasting not yet implemented for CPU");
@@ -83,7 +85,7 @@ public:
 };
 
 // =============================================================================
-// CPU Unary Operators (ReLU, GELU, SiLU)
+// CPU Unary Operators (ReLU, GELU, SiLU, Sigmoid, Tanh) — backed by GrML SIMD
 // =============================================================================
 
 template<OpType Op>
@@ -122,24 +124,18 @@ public:
         const float* px = static_cast<const float*>(map_x.value());
         float* pout = static_cast<float*>(map_out.value());
 
-        size_t n = x.numel();
+        int64_t n = static_cast<int64_t>(x.numel());
 
-        for (size_t i = 0; i < n; i++) {
-            float val = px[i];
-            if constexpr (Op == OpType::ReLU) {
-                pout[i] = std::max(val, 0.0f);
-            } else if constexpr (Op == OpType::GELU) {
-                // GELU approximation
-                float x3 = val * val * val;
-                float inner = 0.7978845608f * (val + 0.044715f * x3);
-                pout[i] = 0.5f * val * (1.0f + std::tanh(inner));
-            } else if constexpr (Op == OpType::SiLU) {
-                pout[i] = val / (1.0f + std::exp(-val));
-            } else if constexpr (Op == OpType::Sigmoid) {
-                pout[i] = 1.0f / (1.0f + std::exp(-val));
-            } else if constexpr (Op == OpType::Tanh) {
-                pout[i] = std::tanh(val);
-            }
+        if constexpr (Op == OpType::ReLU) {
+            grml_kernel_relu_f32(n, pout, px);
+        } else if constexpr (Op == OpType::GELU) {
+            grml_kernel_gelu_f32(n, pout, px);
+        } else if constexpr (Op == OpType::SiLU) {
+            grml_kernel_silu_f32(n, pout, px);
+        } else if constexpr (Op == OpType::Sigmoid) {
+            grml_kernel_sigmoid_f32(n, pout, px);
+        } else if constexpr (Op == OpType::Tanh) {
+            grml_kernel_tanh_f32(n, pout, px);
         }
 
         ctx.backend->unmap_buffer(x.buffer());
@@ -150,7 +146,7 @@ public:
 };
 
 // =============================================================================
-// CPU Softmax
+// CPU Softmax — backed by GrML SIMD kernel
 // =============================================================================
 
 class CPUSoftmaxOp : public IOperator {
@@ -187,36 +183,13 @@ public:
         const float* px = static_cast<const float*>(map_x.value());
         float* pout = static_cast<float*>(map_out.value());
 
-        // For simplicity, assume softmax over last dimension
-        size_t outer = 1;
+        int64_t outer = 1;
         for (int i = 0; i < axis; i++) {
-            outer *= x.size(i);
+            outer *= static_cast<int64_t>(x.size(i));
         }
-        size_t inner = x.size(axis);
+        int64_t inner = static_cast<int64_t>(x.size(axis));
 
-        for (size_t row = 0; row < outer; row++) {
-            const float* row_in = px + row * inner;
-            float* row_out = pout + row * inner;
-
-            // Find max for numerical stability
-            float max_val = row_in[0];
-            for (size_t i = 1; i < inner; i++) {
-                max_val = std::max(max_val, row_in[i]);
-            }
-
-            // Compute exp and sum
-            float sum = 0.0f;
-            for (size_t i = 0; i < inner; i++) {
-                row_out[i] = std::exp(row_in[i] - max_val);
-                sum += row_out[i];
-            }
-
-            // Normalize
-            float inv_sum = 1.0f / sum;
-            for (size_t i = 0; i < inner; i++) {
-                row_out[i] *= inv_sum;
-            }
-        }
+        grml_kernel_softmax_f32(outer, inner, pout, px);
 
         ctx.backend->unmap_buffer(x.buffer());
         ctx.backend->unmap_buffer(out.buffer());
@@ -226,7 +199,7 @@ public:
 };
 
 // =============================================================================
-// CPU MatMul
+// CPU MatMul — backed by GrML SIMD kernel
 // =============================================================================
 
 class CPUMatMulOp : public IOperator {
@@ -281,20 +254,11 @@ public:
         const float* pb = static_cast<const float*>(map_b.value());
         float* pout = static_cast<float*>(map_out.value());
 
-        size_t M = a.size(0);
-        size_t K = a.size(1);
-        size_t N = b.size(1);
+        int64_t M = static_cast<int64_t>(a.size(0));
+        int64_t K = static_cast<int64_t>(a.size(1));
+        int64_t N = static_cast<int64_t>(b.size(1));
 
-        // Naive matrix multiplication
-        for (size_t i = 0; i < M; i++) {
-            for (size_t j = 0; j < N; j++) {
-                float sum = 0.0f;
-                for (size_t k = 0; k < K; k++) {
-                    sum += pa[i * K + k] * pb[k * N + j];
-                }
-                pout[i * N + j] = sum;
-            }
-        }
+        grml_kernel_mul_mat_f32(M, N, K, pout, pa, pb, NULL);
 
         ctx.backend->unmap_buffer(a.buffer());
         ctx.backend->unmap_buffer(b.buffer());
@@ -305,7 +269,7 @@ public:
 };
 
 // =============================================================================
-// CPU LayerNorm
+// CPU LayerNorm — backed by GrML SIMD kernel
 // =============================================================================
 
 class CPULayerNormOp : public IOperator {
@@ -347,35 +311,10 @@ public:
         const float* pb = static_cast<const float*>(map_b.value());
         float* pout = static_cast<float*>(map_out.value());
 
-        size_t norm_size = x.size(x.ndim() - 1);
-        size_t num_rows = x.numel() / norm_size;
+        int64_t dim = static_cast<int64_t>(x.size(x.ndim() - 1));
+        int64_t nrows = static_cast<int64_t>(x.numel()) / dim;
 
-        for (size_t row = 0; row < num_rows; row++) {
-            const float* row_in = px + row * norm_size;
-            float* row_out = pout + row * norm_size;
-
-            // Compute mean
-            float sum = 0.0f;
-            for (size_t i = 0; i < norm_size; i++) {
-                sum += row_in[i];
-            }
-            float mean = sum / static_cast<float>(norm_size);
-
-            // Compute variance
-            float var_sum = 0.0f;
-            for (size_t i = 0; i < norm_size; i++) {
-                float diff = row_in[i] - mean;
-                var_sum += diff * diff;
-            }
-            float var = var_sum / static_cast<float>(norm_size);
-            float inv_std = 1.0f / std::sqrt(var + eps);
-
-            // Normalize and apply affine
-            for (size_t i = 0; i < norm_size; i++) {
-                float normalized = (row_in[i] - mean) * inv_std;
-                row_out[i] = normalized * pw[i] + pb[i];
-            }
-        }
+        grml_kernel_layer_norm_f32(nrows, dim, eps, pout, px, pw, pb);
 
         ctx.backend->unmap_buffer(x.buffer());
         ctx.backend->unmap_buffer(weight.buffer());
@@ -387,7 +326,7 @@ public:
 };
 
 // =============================================================================
-// CPU RMSNorm
+// CPU RMSNorm — backed by GrML SIMD kernel
 // =============================================================================
 
 class CPURMSNormOp : public IOperator {
@@ -426,27 +365,10 @@ public:
         const float* pw = static_cast<const float*>(map_w.value());
         float* pout = static_cast<float*>(map_out.value());
 
-        size_t norm_size = x.size(x.ndim() - 1);
-        size_t num_rows = x.numel() / norm_size;
+        int64_t dim = static_cast<int64_t>(x.size(x.ndim() - 1));
+        int64_t nrows = static_cast<int64_t>(x.numel()) / dim;
 
-        for (size_t row = 0; row < num_rows; row++) {
-            const float* row_in = px + row * norm_size;
-            float* row_out = pout + row * norm_size;
-
-            // Compute sum of squares
-            float sum_sq = 0.0f;
-            for (size_t i = 0; i < norm_size; i++) {
-                sum_sq += row_in[i] * row_in[i];
-            }
-
-            float rms = std::sqrt(sum_sq / static_cast<float>(norm_size) + eps);
-            float inv_rms = 1.0f / rms;
-
-            // Normalize and apply weight
-            for (size_t i = 0; i < norm_size; i++) {
-                row_out[i] = row_in[i] * inv_rms * pw[i];
-            }
-        }
+        grml_kernel_rms_norm_f32(nrows, dim, eps, pout, px, pw);
 
         ctx.backend->unmap_buffer(x.buffer());
         ctx.backend->unmap_buffer(weight.buffer());
@@ -457,11 +379,12 @@ public:
 };
 
 // =============================================================================
-// FP16 Conversion Helpers
+// CPU Quantized MatMul — Q8_0/Q4_0 backed by GrML SIMD, Q4_K kept as-is
 // =============================================================================
 
 namespace {
 
+// FP16 helpers retained for Q4_K path (GrML has no Q4_K support yet)
 inline float fp16_to_fp32_cpu(uint16_t h) {
     uint32_t sign = (h >> 15) & 1;
     uint32_t exp = (h >> 10) & 0x1F;
@@ -511,17 +434,11 @@ inline uint16_t fp32_to_fp16_cpu(float f) {
 
 }  // anonymous namespace
 
-// =============================================================================
-// CPU Quantized MatMul
-// =============================================================================
-
 class CPUQuantizedMatMulOp : public IOperator {
 public:
     OpType type() const override { return OpType::QuantizedMatMul; }
 
     Result<void> validate(const OpContext& ctx) const override {
-        // Inputs: [0] activation (FP16/FP32), [1] quantized weights (raw bytes)
-        // Attributes: quant_type, weight_shape
         if (ctx.num_inputs() < 2) {
             return Error(ErrorCode::InvalidArgument, "QuantizedMatMul requires at least 2 inputs");
         }
@@ -531,7 +448,6 @@ public:
     Result<std::vector<std::vector<int64_t>>> infer_shapes(const OpContext& ctx) const override {
         const auto& a = ctx.inputs[0];
 
-        // Get weight dimensions from attributes
         auto weight_shape = ctx.attrs.get<std::vector<int64_t>>("weight_shape");
         if (weight_shape.size() < 2) {
             return Error(ErrorCode::InvalidArgument, "weight_shape attribute required");
@@ -544,21 +460,18 @@ public:
     }
 
     Result<void> execute(OpContext& ctx) override {
-        const auto& activation = ctx.inputs[0];  // FP16 or FP32
-        const auto& weights = ctx.inputs[1];      // Quantized weights
+        const auto& activation = ctx.inputs[0];
+        const auto& weights = ctx.inputs[1];
         auto& out = ctx.outputs[0];
 
-        // Get quantization type
         auto quant_type_val = ctx.attrs.get<int64_t>("quant_type", static_cast<int64_t>(GGMLType::Q8_0));
         auto quant_type = static_cast<GGMLType>(quant_type_val);
 
-        // Get weight shape
         auto weight_shape = ctx.attrs.get<std::vector<int64_t>>("weight_shape");
         if (weight_shape.size() < 2) {
             return Error(ErrorCode::InvalidArgument, "weight_shape required for QuantizedMatMul");
         }
 
-        // Map buffers
         auto map_act = ctx.backend->map_buffer(activation.buffer());
         auto map_w = ctx.backend->map_buffer(weights.buffer());
         auto map_out = ctx.backend->map_buffer(out.buffer());
@@ -567,14 +480,12 @@ public:
             return Error(ErrorCode::InternalError, "Failed to map buffers");
         }
 
-        // Dimensions: A[M, K] @ W[K, N] = Out[M, N]
-        size_t M = activation.size(activation.ndim() - 2);
-        size_t K = activation.size(activation.ndim() - 1);
-        size_t N = static_cast<size_t>(weight_shape[weight_shape.size() - 1]);
+        int64_t M = static_cast<int64_t>(activation.size(activation.ndim() - 2));
+        int64_t K = static_cast<int64_t>(activation.size(activation.ndim() - 1));
+        int64_t N = weight_shape[weight_shape.size() - 1];
 
         const auto* w_data = static_cast<const uint8_t*>(map_w.value());
 
-        // Dispatch based on activation type
         if (activation.dtype() == DataType::FP32) {
             const float* a_ptr = static_cast<const float*>(map_act.value());
             float* out_ptr = static_cast<float*>(map_out.value());
@@ -600,14 +511,14 @@ public:
 
 private:
     Result<void> execute_fp32(const float* A, const uint8_t* W,
-                              float* out, size_t M, size_t K, size_t N,
+                              float* out, int64_t M, int64_t K, int64_t N,
                               GGMLType quant_type) {
         switch (quant_type) {
             case GGMLType::Q8_0:
-                matmul_q8_0_fp32(A, W, out, M, K, N);
+                grml_kernel_mul_mat_q8_0_f32(M, N, K, out, A, W, NULL);
                 break;
             case GGMLType::Q4_0:
-                matmul_q4_0_fp32(A, W, out, M, K, N);
+                grml_kernel_mul_mat_q4_0_f32(M, N, K, out, A, W, NULL);
                 break;
             case GGMLType::Q4_K:
                 matmul_q4_k_fp32(A, W, out, M, K, N);
@@ -621,135 +532,47 @@ private:
     }
 
     Result<void> execute_fp16(const uint16_t* A, const uint8_t* W,
-                              uint16_t* out, size_t M, size_t K, size_t N,
+                              uint16_t* out, int64_t M, int64_t K, int64_t N,
                               GGMLType quant_type) {
-        // Convert FP16 to FP32, compute, convert back
-        std::vector<float> a_fp32(M * K);
-        std::vector<float> out_fp32(M * N, 0.0f);
+        // Convert FP16 to FP32 using GrML, compute, convert back
+        std::vector<float> a_fp32(static_cast<size_t>(M * K));
+        std::vector<float> out_fp32(static_cast<size_t>(M * N), 0.0f);
 
-        for (size_t i = 0; i < M * K; i++) {
-            a_fp32[i] = fp16_to_fp32_cpu(A[i]);
-        }
+        grml_f16_to_f32_row(A, a_fp32.data(), M * K);
 
         auto result = execute_fp32(a_fp32.data(), W, out_fp32.data(), M, K, N, quant_type);
         if (!result.ok()) return result;
 
-        for (size_t i = 0; i < M * N; i++) {
-            out[i] = fp32_to_fp16_cpu(out_fp32[i]);
-        }
+        grml_f32_to_f16_row(out_fp32.data(), out, M * N);
 
         return {};
     }
 
-    // Q8_0 MatMul: weights are 32-element blocks with FP16 scale + 32 int8 values
-    void matmul_q8_0_fp32(const float* A, const uint8_t* W,
-                         float* out, size_t M, size_t K, size_t N) {
-        constexpr size_t BLOCK_SIZE = 32;
-        constexpr size_t BYTES_PER_BLOCK = 34;  // 2 (scale) + 32 (data)
-        size_t num_blocks_per_row = (K + BLOCK_SIZE - 1) / BLOCK_SIZE;
-
-        // For each output element
-        for (size_t m = 0; m < M; m++) {
-            for (size_t n = 0; n < N; n++) {
-                float sum = 0.0f;
-
-                // Process blocks
-                const uint8_t* w_row = W + n * num_blocks_per_row * BYTES_PER_BLOCK;
-
-                for (size_t blk = 0; blk < num_blocks_per_row; blk++) {
-                    const uint8_t* block = w_row + blk * BYTES_PER_BLOCK;
-
-                    // Read scale
-                    uint16_t scale_bits;
-                    std::memcpy(&scale_bits, block, 2);
-                    float scale = fp16_to_fp32_cpu(scale_bits);
-
-                    // Dot product with dequantized values
-                    const int8_t* qs = reinterpret_cast<const int8_t*>(block + 2);
-                    size_t k_start = blk * BLOCK_SIZE;
-
-                    for (size_t i = 0; i < BLOCK_SIZE && (k_start + i) < K; i++) {
-                        float w_val = static_cast<float>(qs[i]) * scale;
-                        sum += A[m * K + k_start + i] * w_val;
-                    }
-                }
-
-                out[m * N + n] = sum;
-            }
-        }
-    }
-
-    // Q4_0 MatMul: weights are 32-element blocks with FP16 scale + 16 bytes (4-bit values)
-    void matmul_q4_0_fp32(const float* A, const uint8_t* W,
-                         float* out, size_t M, size_t K, size_t N) {
-        constexpr size_t BLOCK_SIZE = 32;
-        constexpr size_t BYTES_PER_BLOCK = 18;  // 2 (scale) + 16 (data)
-        size_t num_blocks_per_row = (K + BLOCK_SIZE - 1) / BLOCK_SIZE;
-
-        for (size_t m = 0; m < M; m++) {
-            for (size_t n = 0; n < N; n++) {
-                float sum = 0.0f;
-
-                const uint8_t* w_row = W + n * num_blocks_per_row * BYTES_PER_BLOCK;
-
-                for (size_t blk = 0; blk < num_blocks_per_row; blk++) {
-                    const uint8_t* block = w_row + blk * BYTES_PER_BLOCK;
-
-                    uint16_t scale_bits;
-                    std::memcpy(&scale_bits, block, 2);
-                    float scale = fp16_to_fp32_cpu(scale_bits);
-
-                    const uint8_t* qs = block + 2;
-                    size_t k_start = blk * BLOCK_SIZE;
-
-                    for (size_t i = 0; i < 16 && (k_start + i * 2) < K; i++) {
-                        uint8_t byte = qs[i];
-                        int8_t q0 = (byte & 0xF) - 8;
-                        int8_t q1 = (byte >> 4) - 8;
-
-                        float w0 = static_cast<float>(q0) * scale;
-                        float w1 = static_cast<float>(q1) * scale;
-
-                        sum += A[m * K + k_start + i * 2] * w0;
-                        if (k_start + i * 2 + 1 < K) {
-                            sum += A[m * K + k_start + i * 2 + 1] * w1;
-                        }
-                    }
-                }
-
-                out[m * N + n] = sum;
-            }
-        }
-    }
-
-    // Q4_K MatMul: 256-element super-blocks
+    // Q4_K MatMul: kept as-is (GrML has no Q4_K support yet)
     void matmul_q4_k_fp32(const float* A, const uint8_t* W,
-                         float* out, size_t M, size_t K, size_t N) {
-        constexpr size_t SUPER_BLOCK_SIZE = 256;
-        constexpr size_t BYTES_PER_BLOCK = 144;
-        size_t num_blocks_per_row = (K + SUPER_BLOCK_SIZE - 1) / SUPER_BLOCK_SIZE;
+                         float* out, int64_t M, int64_t K, int64_t N) {
+        constexpr int64_t SUPER_BLOCK_SIZE = 256;
+        constexpr int64_t BYTES_PER_BLOCK = 144;
+        int64_t num_blocks_per_row = (K + SUPER_BLOCK_SIZE - 1) / SUPER_BLOCK_SIZE;
 
-        for (size_t m = 0; m < M; m++) {
-            for (size_t n = 0; n < N; n++) {
+        for (int64_t m = 0; m < M; m++) {
+            for (int64_t n = 0; n < N; n++) {
                 float sum = 0.0f;
 
                 const uint8_t* w_row = W + n * num_blocks_per_row * BYTES_PER_BLOCK;
 
-                for (size_t blk = 0; blk < num_blocks_per_row; blk++) {
+                for (int64_t blk = 0; blk < num_blocks_per_row; blk++) {
                     const uint8_t* block = w_row + blk * BYTES_PER_BLOCK;
 
-                    // Read global scales
                     uint16_t d_bits, dmin_bits;
                     std::memcpy(&d_bits, block, 2);
                     std::memcpy(&dmin_bits, block + 2, 2);
                     float d = fp16_to_fp32_cpu(d_bits);
                     float dmin = fp16_to_fp32_cpu(dmin_bits);
 
-                    // Read sub-block scales (simplified)
                     const uint8_t* scales_ptr = block + 4;
                     uint8_t scales[8], mins[8];
 
-                    // Simplified scale extraction
                     for (int j = 0; j < 4; j++) {
                         scales[j] = scales_ptr[j] & 63;
                         scales[j + 4] = (scales_ptr[j + 4] & 0xF) | ((scales_ptr[j] >> 6) << 4);
@@ -758,14 +581,14 @@ private:
                     }
 
                     const uint8_t* qs = block + 16;
-                    size_t k_start = blk * SUPER_BLOCK_SIZE;
+                    int64_t k_start = blk * SUPER_BLOCK_SIZE;
 
                     for (int sub = 0; sub < 8; sub++) {
                         float sub_scale = d * static_cast<float>(scales[sub]);
                         float sub_min = dmin * static_cast<float>(mins[sub]);
 
                         for (int i = 0; i < 16; i++) {
-                            size_t k = k_start + sub * 32 + i * 2;
+                            int64_t k = k_start + sub * 32 + i * 2;
                             if (k >= K) break;
 
                             uint8_t byte = qs[sub * 16 + i];

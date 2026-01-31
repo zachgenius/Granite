@@ -183,6 +183,10 @@ endif()
 # =============================================================================
 
 if(GRANITE_BUILD_CPU)
+    # Link GrML for SIMD-accelerated CPU kernels
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../GrML grml_build EXCLUDE_FROM_ALL)
+    target_link_libraries(granite PRIVATE grml)
+
     set(GRANITE_CPU_SOURCES
         src/backend/cpu/cpu_backend.cpp
         src/operators/cpu/cpu_operators.cpp

@@ -36,3 +36,4 @@ cmake-build-*/
 build/
 build-*/
 bulid_*/
+.cache
