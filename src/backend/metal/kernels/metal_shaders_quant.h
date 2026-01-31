@@ -2135,84 +2135,6 @@ kernel void matvec_q8_0(
     }
 }
 
-// Q8_0 Matrix Multiplication (Batched - Prefill)
-kernel void matmul_q8_0(
-    device const float* X          [[buffer(0)]],
-    device const void* W           [[buffer(1)]],
-    device float* Y                [[buffer(2)]],
-    constant uint& M               [[buffer(3)]],
-    constant uint& K               [[buffer(4)]],
-    constant uint& N               [[buffer(5)]],
-    uint2 gid                      [[thread_position_in_grid]]
-) {
-    uint row = gid.y;
-    uint col = gid.x;
-
-    if (row >= M || col >= N) return;
-
-    const uint num_blocks_k = K / QK8_0;
-    const device block_q8_0* weights = (const device block_q8_0*)W;
-
-    float sum = 0.0f;
-
-    for (uint kb = 0; kb < num_blocks_k; kb++) {
-        const device block_q8_0* block = &weights[col * num_blocks_k + kb];
-        float d = float(block->d);
-
-        uint base_idx = kb * QK8_0;
-
-        for (int i = 0; i < 32; i++) {
-            float w = d * float(block->qs[i]);
-            sum += X[row * K + base_idx + i] * w;
-        }
-    }
-
-    Y[row * N + col] = sum;
-}
-
-// Fused Gate+Up Q8_0 Matmul (Batched - Prefill)
-kernel void fused_gate_up_q8_0(
-    device const float* X          [[buffer(0)]],
-    device const void* W_gate      [[buffer(1)]],
-    device const void* W_up        [[buffer(2)]],
-    device float* Y_gate           [[buffer(3)]],
-    device float* Y_up             [[buffer(4)]],
-    constant uint& M               [[buffer(5)]],
-    constant uint& K               [[buffer(6)]],
-    constant uint& N               [[buffer(7)]],
-    uint2 gid                      [[thread_position_in_grid]]
-) {
-    uint row = gid.y;
-    uint col = gid.x;
-
-    if (row >= M || col >= N) return;
-
-    const uint num_blocks_k = K / QK8_0;
-    const device block_q8_0* wg = (const device block_q8_0*)W_gate;
-    const device block_q8_0* wu = (const device block_q8_0*)W_up;
-
-    float sum_g = 0.0f;
-    float sum_u = 0.0f;
-
-    for (uint kb = 0; kb < num_blocks_k; kb++) {
-        const device block_q8_0* block_g = &wg[col * num_blocks_k + kb];
-        const device block_q8_0* block_u = &wu[col * num_blocks_k + kb];
-        float d_g = float(block_g->d);
-        float d_u = float(block_u->d);
-
-        uint base_idx = kb * QK8_0;
-
-        for (int i = 0; i < 32; i++) {
-            float x = X[row * K + base_idx + i];
-            sum_g += x * (d_g * float(block_g->qs[i]));
-            sum_u += x * (d_u * float(block_u->qs[i]));
-        }
-    }
-
-    Y_gate[row * N + col] = sum_g;
-    Y_up[row * N + col] = sum_u;
-}
-
 // Fused RMSNorm + Q8_0 MatVec
 // Computes: y = RMSNorm(x, weight) @ W^T (Q8_0)
 kernel void rms_norm_matvec_q8_0(
@@ -2359,94 +2281,387 @@ kernel void matvec_q4_0(
     }
 }
 
-// Q4_0 Matrix Multiplication (Batched - Prefill)
-kernel void matmul_q4_0(
+// =============================================================================
+// SIMDGROUP MATRIX Q8_0 Matmul with Function Constants
+// =============================================================================
+// Tiled simdgroup matmul for Q8_0: Y[M,N] = X[M,K] @ dequant(W[N,K/32 blocks])^T
+// Uses same 64x32 tile structure and function constants as matmul_q4k_simdgroup.
+// 128 threads (4 simdgroups), FP16 shmem + FP32 accumulation.
+// sa: 64 N-rows × 32 K-cols (weight tile, 4096 bytes)
+// sb: 32 M-rows × 32 K-cols (activation tile, 2048 bytes)
+// =============================================================================
+
+kernel void matmul_q8_0_simdgroup(
     device const float* X          [[buffer(0)]],
     device const void* W           [[buffer(1)]],
     device float* Y                [[buffer(2)]],
     constant uint& M               [[buffer(3)]],
     constant uint& K               [[buffer(4)]],
     constant uint& N               [[buffer(5)]],
-    uint2 gid                      [[thread_position_in_grid]]
+    threadgroup char* shmem        [[threadgroup(0)]],
+    uint3 tgpig                    [[threadgroup_position_in_grid]],
+    ushort tiitg                   [[thread_index_in_threadgroup]],
+    ushort sgitg                   [[simdgroup_index_in_threadgroup]]
 ) {
-    uint row = gid.y;
-    uint col = gid.x;
+    // Granite convention: r0=N offset (64), r1=M offset (32)
+    const uint r0 = tgpig.y * SGMM_NR0;  // N offset (weight rows)
+    const uint r1 = tgpig.x * SGMM_NR1;  // M offset (activation rows)
 
-    if (row >= M || col >= N) return;
+    const short nr0 = FC_mm_bc_inp ? min((uint)SGMM_NR0, N - r0) : SGMM_NR0;
+    const short nr1 = FC_mm_bc_inp ? min((uint)SGMM_NR1, M - r1) : SGMM_NR1;
+
+    threadgroup half* sa = (threadgroup half*)(shmem);          // 64*32 half = 4096 bytes
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);   // 32*32 half = 2048 bytes
+
+    simdgroup_float8x8 mc[8];
+    #pragma clang loop unroll(full)
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    // A-tile (weight) thread mapping: 128 threads -> 64 N-rows × 32 K-elements
+    constexpr short NL0 = 2;   // K sub-blocks per thread for weight tile
+    constexpr short NL1 = 4;   // K sub-blocks per thread for activation tile
+
+    const short lr0 = FC_mm_bc_inp ? min((short)(tiitg / NL0), (short)(nr0 - 1)) : (tiitg / NL0);
+    const short lr1 = FC_mm_bc_inp ? min((short)(tiitg / NL1), (short)(nr1 - 1)) : (tiitg / NL1);
+    const short il0 = tiitg % NL0;
+    const short il1 = tiitg % NL1;
+
+    const uint num_blocks_k = K / QK8_0;
+    const device block_q8_0* weights = (const device block_q8_0*)W;
+
+    // Activation pointer setup
+    device const float* x_ptr = FC_mm_bc_inp
+        ? ((lr1 < nr1) ? X + (r1 + lr1) * K + il1 * 8 : nullptr)
+        : X + (r1 + lr1) * K + il1 * 8;
+
+    // Weight pointer setup
+    device const block_q8_0* w_ptr = FC_mm_bc_inp
+        ? ((lr0 < nr0) ? &weights[(r0 + lr0) * num_blocks_k] : nullptr)
+        : &weights[(r0 + lr0) * num_blocks_k];
+
+    for (uint loop_k = 0; loop_k < K; loop_k += SGMM_NK) {
+        // --- Load A tile (weight W, dequantized Q8_0) [64 N-rows × 32 K-cols] as half ---
+        {
+            if (FC_mm_bc_inp) {
+                if (w_ptr != nullptr) {
+                    const device block_q8_0* blk = &w_ptr[loop_k / 32];
+                    const float d = float(blk->d);
+                    const short qs_off = il0 * 16;
+                    const short sy = lr0 / 8;
+                    const short lx = lr0 % 8;
+                    #pragma clang loop unroll(full)
+    for (short i = 0; i < 16; i++) {
+                        const short sx = 2 * il0 + i / 8;
+                        const short ly = i % 8;
+                        const short ib = 8 * sx + sy;
+                        bool oob_k = (loop_k + qs_off + i >= K);
+                        sa[64 * ib + 8 * ly + lx] = oob_k ? half(0) : half(d * float(blk->qs[qs_off + i]));
+                    }
+                } else {
+                    const short sy = lr0 / 8;
+                    const short lx = lr0 % 8;
+                    #pragma clang loop unroll(full)
+    for (short i = 0; i < 16; i++) {
+                        const short sx = 2 * il0 + i / 8;
+                        const short ly = i % 8;
+                        const short ib = 8 * sx + sy;
+                        sa[64 * ib + 8 * ly + lx] = half(0);
+                    }
+                }
+            } else {
+                const device block_q8_0* blk = &w_ptr[loop_k / 32];
+                const float d = float(blk->d);
+                const short qs_off = il0 * 16;
+                const short sy = lr0 / 8;
+                const short lx = lr0 % 8;
+                #pragma clang loop unroll(full)
+    for (short i = 0; i < 16; i++) {
+                    const short sx = 2 * il0 + i / 8;
+                    const short ly = i % 8;
+                    const short ib = 8 * sx + sy;
+                    sa[64 * ib + 8 * ly + lx] = half(d * float(blk->qs[qs_off + i]));
+                }
+            }
+        }
+
+        // --- Load B tile (activation X) [32 M-rows × 32 K-cols] as half ---
+        {
+            if (FC_mm_bc_inp) {
+                if (x_ptr != nullptr) {
+                    const short sx = tiitg % NL1;
+                    const short sy = lr1 / 8;
+                    const short ly = lr1 % 8;
+                    const short ib = 4 * sx + sy;
+                    *(threadgroup half2x4*)(sb + 64 * ib + 8 * ly) = half2x4(*(device const float2x4*)x_ptr);
+                }
+            } else {
+                const short sx = tiitg % NL1;
+                const short sy = lr1 / 8;
+                const short ly = lr1 % 8;
+                const short ib = 4 * sx + sy;
+                *(threadgroup half2x4*)(sb + 64 * ib + 8 * ly) = half2x4(*(device const float2x4*)x_ptr);
+            }
+        }
+
+        if (FC_mm_bc_inp) {
+            x_ptr = (x_ptr != nullptr) ? x_ptr + SGMM_NK : nullptr;
+        } else {
+            x_ptr = x_ptr + SGMM_NK;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // --- Simdgroup MMA: 4 iterations over K (NK/8 = 4) ---
+        simdgroup_half8x8 ma[4], mb[2];
+        threadgroup const half* lsma = sa + 4 * 64 * (sgitg % 2);
+        threadgroup const half* lsmb = sb + 2 * 64 * (sgitg / 2);
+
+        #pragma clang loop unroll(full)
+    for (short ik = 0; ik < SGMM_NK / 8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+    for (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+    for (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+    for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            }
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // --- Write results ---
+    const uint sg_n = r0 + 32 * (sgitg % 2);
+    const uint sg_m = r1 + 16 * (sgitg / 2);
+
+    if (!FC_mm_bc_out || (sg_m + 16 <= M && sg_n + 32 <= N)) {
+        device float* C = Y + sg_m * N + sg_n;
+        #pragma clang loop unroll(full)
+    for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], C + 8 * (i % 4) + 8 * N * (i / 4), N, 0, false);
+        }
+    } else {
+        threadgroup float* sc = (threadgroup float*)(shmem);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* temp_str = sc + 32 * (sgitg % 2) + 16 * (sgitg / 2) * SGMM_NR0;
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], temp_str + 8 * (i % 4) + 8 * SGMM_NR0 * (i / 4), SGMM_NR0, 0, false);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            for (int j = tiitg; j < (int)nr1; j += SGMM_NR1) {
+                device float* D = Y + (r1 + j) * N + r0;
+                threadgroup float* C = sc + j * SGMM_NR0;
+                for (int i = 0; i < nr0; i++) {
+                    D[i] = C[i];
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// SIMDGROUP MATRIX Q4_0 Matmul with Function Constants
+// =============================================================================
+// Tiled simdgroup matmul for Q4_0: Y[M,N] = X[M,K] @ dequant(W[N,K/32 blocks])^T
+// Same structure as Q8_0 simdgroup but with branchless uint16 mask Q4_0 dequant.
+// =============================================================================
+
+kernel void matmul_q4_0_simdgroup(
+    device const float* X          [[buffer(0)]],
+    device const void* W           [[buffer(1)]],
+    device float* Y                [[buffer(2)]],
+    constant uint& M               [[buffer(3)]],
+    constant uint& K               [[buffer(4)]],
+    constant uint& N               [[buffer(5)]],
+    threadgroup char* shmem        [[threadgroup(0)]],
+    uint3 tgpig                    [[threadgroup_position_in_grid]],
+    ushort tiitg                   [[thread_index_in_threadgroup]],
+    ushort sgitg                   [[simdgroup_index_in_threadgroup]]
+) {
+    // Granite convention: r0=N offset (64), r1=M offset (32)
+    const uint r0 = tgpig.y * SGMM_NR0;
+    const uint r1 = tgpig.x * SGMM_NR1;
+
+    const short nr0 = FC_mm_bc_inp ? min((uint)SGMM_NR0, N - r0) : SGMM_NR0;
+    const short nr1 = FC_mm_bc_inp ? min((uint)SGMM_NR1, M - r1) : SGMM_NR1;
+
+    threadgroup half* sa = (threadgroup half*)(shmem);
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096);
+
+    simdgroup_float8x8 mc[8];
+    #pragma clang loop unroll(full)
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    constexpr short NL0 = 2;
+    constexpr short NL1 = 4;
+
+    const short lr0 = FC_mm_bc_inp ? min((short)(tiitg / NL0), (short)(nr0 - 1)) : (tiitg / NL0);
+    const short lr1 = FC_mm_bc_inp ? min((short)(tiitg / NL1), (short)(nr1 - 1)) : (tiitg / NL1);
+    const short il0 = tiitg % NL0;
+    const short il1 = tiitg % NL1;
 
     const uint num_blocks_k = K / QK4_0;
     const device block_q4_0* weights = (const device block_q4_0*)W;
 
-    float sum = 0.0f;
+    // Activation pointer setup
+    device const float* x_ptr = FC_mm_bc_inp
+        ? ((lr1 < nr1) ? X + (r1 + lr1) * K + il1 * 8 : nullptr)
+        : X + (r1 + lr1) * K + il1 * 8;
 
-    for (uint kb = 0; kb < num_blocks_k; kb++) {
-        const device block_q4_0* block = &weights[col * num_blocks_k + kb];
-        float d = float(block->d);
+    // Weight pointer setup
+    device const block_q4_0* w_ptr = FC_mm_bc_inp
+        ? ((lr0 < nr0) ? &weights[(r0 + lr0) * num_blocks_k] : nullptr)
+        : &weights[(r0 + lr0) * num_blocks_k];
 
-        uint base_idx = kb * QK4_0;
+    for (uint loop_k = 0; loop_k < K; loop_k += SGMM_NK) {
+        // --- Load A tile (weight W, dequantized Q4_0) [64 N-rows × 32 K-cols] as half ---
+        // Each Q4_0 block has 16 bytes = 32 nibbles. With NL0=2, each thread handles 16 values.
+        // il0=0: positions 0-15 (low nibbles of bytes 0-7 + high nibbles of bytes 0-7)
+        // il0=1: positions 16-31 (low nibbles of bytes 8-15 + high nibbles of bytes 8-15)
+        // We use the same branchless uint16 mask extraction as GrML.
+        {
+            const bool oob_col = FC_mm_bc_inp && (lr0 >= nr0);
+            const device block_q4_0* blk = oob_col ? nullptr : &w_ptr[loop_k / 32];
+            const float scale = oob_col ? 0.0f : float(blk->d);
+            const short sy = lr0 / 8;
+            const short lx = lr0 % 8;
 
-        for (int i = 0; i < 16; i++) {
-            uint8_t qbyte = block->qs[i];
-            int q0 = (qbyte & 0xF) - 8;
-            int q1 = (qbyte >> 4) - 8;
-            sum += d * float(q0) * X[row * K + base_idx + i*2 + 0];
-            sum += d * float(q1) * X[row * K + base_idx + i*2 + 1];
+            // Dequantize 16 values: read 8 bytes, extract lo and hi nibbles
+            // il0=0: bytes 0-7 → positions 0-7 (low) and 16-23 (high) but we remap
+            //   Actually Q4_0 layout: byte[i] low nibble = element[i], byte[i] high nibble = element[i+16]
+            //   So il0=0 handles elements 0-15: low nibbles of bytes 0-15 → but that's 16 bytes
+            //   Simpler: il0=0 handles qs bytes 0-7 (16 values), il0=1 handles qs bytes 8-15
+            device const uint8_t* qs = oob_col ? nullptr : blk->qs;
+            const short byte_off = il0 * 8;  // 0 or 8
+
+            #pragma clang loop unroll(full)
+    for (short i = 0; i < 8; i++) {
+                // Two elements per byte: element[i] (low nibble) and element[i+16] (high nibble)
+                // In Q4_0, byte[j] packs element[j] (low) and element[j+16] (high)
+                bool oob_lo = FC_mm_bc_inp && (loop_k + (byte_off + i) >= K);
+                bool oob_hi = FC_mm_bc_inp && (loop_k + (byte_off + i + 16) >= K);
+                uint8_t qbyte = (oob_col || oob_lo) ? (uint8_t)0 : qs[byte_off + i];
+                float lo_val = scale * float((int)(qbyte & 0xF) - 8);
+                float hi_val = scale * float((int)(qbyte >> 4) - 8);
+
+                // Map to sa: position (byte_off + i) and (byte_off + i + 16) in K-dim
+                // sa layout: sa[64 * ib + 8 * ly + lx] where ib=8*sx+sy, sx=K/8, ly=K%8
+                {
+                    const short k_pos = byte_off + i;
+                    const short sx = k_pos / 8;
+                    const short ly = k_pos % 8;
+                    const short ib = 8 * sx + sy;
+                    sa[64 * ib + 8 * ly + lx] = (oob_col || oob_lo) ? half(0) : half(lo_val);
+                }
+                {
+                    const short k_pos = byte_off + i + 16;
+                    const short sx = k_pos / 8;
+                    const short ly = k_pos % 8;
+                    const short ib = 8 * sx + sy;
+                    sa[64 * ib + 8 * ly + lx] = (oob_col || oob_hi) ? half(0) : half(hi_val);
+                }
+            }
         }
+
+        // --- Load B tile (activation X) [32 M-rows × 32 K-cols] as half ---
+        {
+            if (FC_mm_bc_inp) {
+                if (x_ptr != nullptr) {
+                    const short sx = tiitg % NL1;
+                    const short sy = lr1 / 8;
+                    const short ly = lr1 % 8;
+                    const short ib = 4 * sx + sy;
+                    *(threadgroup half2x4*)(sb + 64 * ib + 8 * ly) = half2x4(*(device const float2x4*)x_ptr);
+                }
+            } else {
+                const short sx = tiitg % NL1;
+                const short sy = lr1 / 8;
+                const short ly = lr1 % 8;
+                const short ib = 4 * sx + sy;
+                *(threadgroup half2x4*)(sb + 64 * ib + 8 * ly) = half2x4(*(device const float2x4*)x_ptr);
+            }
+        }
+
+        if (FC_mm_bc_inp) {
+            x_ptr = (x_ptr != nullptr) ? x_ptr + SGMM_NK : nullptr;
+        } else {
+            x_ptr = x_ptr + SGMM_NK;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // --- Simdgroup MMA ---
+        simdgroup_half8x8 ma[4], mb[2];
+        threadgroup const half* lsma = sa + 4 * 64 * (sgitg % 2);
+        threadgroup const half* lsmb = sb + 2 * 64 * (sgitg / 2);
+
+        #pragma clang loop unroll(full)
+    for (short ik = 0; ik < SGMM_NK / 8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+    for (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+    for (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+    for (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            }
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    Y[row * N + col] = sum;
-}
+    // --- Write results ---
+    const uint sg_n = r0 + 32 * (sgitg % 2);
+    const uint sg_m = r1 + 16 * (sgitg / 2);
 
-// Fused Gate+Up Q4_0 Matmul (Batched - Prefill)
-kernel void fused_gate_up_q4_0(
-    device const float* X          [[buffer(0)]],
-    device const void* W_gate      [[buffer(1)]],
-    device const void* W_up        [[buffer(2)]],
-    device float* Y_gate           [[buffer(3)]],
-    device float* Y_up             [[buffer(4)]],
-    constant uint& M               [[buffer(5)]],
-    constant uint& K               [[buffer(6)]],
-    constant uint& N               [[buffer(7)]],
-    uint2 gid                      [[thread_position_in_grid]]
-) {
-    uint row = gid.y;
-    uint col = gid.x;
-
-    if (row >= M || col >= N) return;
-
-    const uint num_blocks_k = K / QK4_0;
-    const device block_q4_0* wg = (const device block_q4_0*)W_gate;
-    const device block_q4_0* wu = (const device block_q4_0*)W_up;
-
-    float sum_g = 0.0f;
-    float sum_u = 0.0f;
-
-    for (uint kb = 0; kb < num_blocks_k; kb++) {
-        const device block_q4_0* block_g = &wg[col * num_blocks_k + kb];
-        const device block_q4_0* block_u = &wu[col * num_blocks_k + kb];
-        float d_g = float(block_g->d);
-        float d_u = float(block_u->d);
-
-        uint base_idx = kb * QK4_0;
-
-        for (int i = 0; i < 16; i++) {
-            uint8_t qbyte_g = block_g->qs[i];
-            uint8_t qbyte_u = block_u->qs[i];
-            int qg0 = (qbyte_g & 0xF) - 8;
-            int qg1 = (qbyte_g >> 4) - 8;
-            int qu0 = (qbyte_u & 0xF) - 8;
-            int qu1 = (qbyte_u >> 4) - 8;
-            float x0 = X[row * K + base_idx + i*2 + 0];
-            float x1 = X[row * K + base_idx + i*2 + 1];
-            sum_g += d_g * float(qg0) * x0;
-            sum_g += d_g * float(qg1) * x1;
-            sum_u += d_u * float(qu0) * x0;
-            sum_u += d_u * float(qu1) * x1;
+    if (!FC_mm_bc_out || (sg_m + 16 <= M && sg_n + 32 <= N)) {
+        device float* C = Y + sg_m * N + sg_n;
+        #pragma clang loop unroll(full)
+    for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], C + 8 * (i % 4) + 8 * N * (i / 4), N, 0, false);
+        }
+    } else {
+        threadgroup float* sc = (threadgroup float*)(shmem);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* temp_str = sc + 32 * (sgitg % 2) + 16 * (sgitg / 2) * SGMM_NR0;
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], temp_str + 8 * (i % 4) + 8 * SGMM_NR0 * (i / 4), SGMM_NR0, 0, false);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            for (int j = tiitg; j < (int)nr1; j += SGMM_NR1) {
+                device float* D = Y + (r1 + j) * N + r0;
+                threadgroup float* C = sc + j * SGMM_NR0;
+                for (int i = 0; i < nr0; i++) {
+                    D[i] = C[i];
+                }
+            }
         }
     }
-
-    Y_gate[row * N + col] = sum_g;
-    Y_up[row * N + col] = sum_u;
 }
 
 // Fused RMSNorm + Q4_0 MatVec

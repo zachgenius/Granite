@@ -470,8 +470,18 @@ kernel void elementwise_mul(
     constant uint& size            [[buffer(3)]],
     uint gid                       [[thread_position_in_grid]]
 ) {
-    if (gid >= size) return;
-    c[gid] = a[gid] * b[gid];
+    // Process 4 elements per thread for better memory bandwidth
+    uint idx = gid * 4;
+    if (idx + 3 < size) {
+        float4 va = *((device const float4*)(a + idx));
+        float4 vb = *((device const float4*)(b + idx));
+        *((device float4*)(c + idx)) = va * vb;
+    } else if (idx < size) {
+        // Handle remaining elements
+        for (uint i = idx; i < size; i++) {
+            c[i] = a[i] * b[i];
+        }
+    }
 }
 
 kernel void rope(
@@ -624,34 +634,65 @@ kernel void rope_multihead(
     }
 }
 
-// Softmax over rows (in-place)
+// Softmax over rows (in-place) — simd-reduced, 256 threads per row
 // x shape: [M, N], softmax over N dimension
+// One threadgroup (256 threads) collaborates on each row for high throughput.
 kernel void softmax_row(
     device float* x                [[buffer(0)]],
     constant uint& M               [[buffer(1)]],
     constant uint& N               [[buffer(2)]],
-    uint gid                       [[thread_position_in_grid]]
+    uint tg_idx                    [[threadgroup_position_in_grid]],
+    uint tid                       [[thread_position_in_threadgroup]],
+    uint tg_size                   [[threads_per_threadgroup]],
+    uint simd_lane                 [[thread_index_in_simdgroup]],
+    uint simd_group                [[simdgroup_index_in_threadgroup]]
 ) {
-    if (gid >= M) return;
+    if (tg_idx >= M) return;
 
-    device float* row = x + gid * N;
+    device float* row = x + tg_idx * N;
 
-    // Find max
-    float max_val = row[0];
-    for (uint i = 1; i < N; i++) {
-        max_val = max(max_val, row[i]);
+    threadgroup float shared_val[8];
+
+    // 1. Parallel max via simd_max + threadgroup reduction
+    float local_max = -INFINITY;
+    for (uint i = tid; i < N; i += tg_size) {
+        local_max = max(local_max, row[i]);
     }
+    local_max = simd_max(local_max);
+    if (simd_lane == 0) shared_val[simd_group] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Exp and sum
-    float sum = 0.0f;
-    for (uint i = 0; i < N; i++) {
-        row[i] = exp(row[i] - max_val);
-        sum += row[i];
+    if (simd_group == 0 && simd_lane < (tg_size / 32)) {
+        local_max = shared_val[simd_lane];
+        local_max = simd_max(local_max);
     }
+    threadgroup float row_max;
+    if (tid == 0) row_max = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Normalize
-    float inv_sum = 1.0f / sum;
-    for (uint i = 0; i < N; i++) {
+    // 2. Parallel exp(x - max) and sum via simd_sum + threadgroup reduction
+    float local_sum = 0.0f;
+    for (uint i = tid; i < N; i += tg_size) {
+        float e = exp(row[i] - row_max);
+        row[i] = e;
+        local_sum += e;
+    }
+    local_sum = simd_sum(local_sum);
+    if (simd_lane == 0) shared_val[simd_group] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float final_sum = 0.0f;
+    if (simd_group == 0 && simd_lane < (tg_size / 32)) {
+        final_sum = shared_val[simd_lane];
+        final_sum = simd_sum(final_sum);
+    }
+    threadgroup float row_sum;
+    if (tid == 0) row_sum = final_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 3. Parallel normalize
+    float inv_sum = 1.0f / row_sum;
+    for (uint i = tid; i < N; i += tg_size) {
         row[i] *= inv_sum;
     }
 }

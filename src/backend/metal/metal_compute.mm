@@ -623,8 +623,8 @@ private:
             "matvec_q4k", "matmul_q4k", "matmul_q4k_vec", "matmul_q4k_tiled", "matmul_q4k_simd",
             // NOTE: matmul_q4k_simdgroup uses function constants and is compiled separately below
             "matvec_f16", "matmul_f16", "matmul_f16_tiled",
-            "matvec_q8_0", "matmul_q8_0",
-            "matvec_q4_0", "matmul_q4_0",
+            "matvec_q8_0",
+            "matvec_q4_0",
             "matvec_iq4_nl", "matmul_iq4_nl",
             "matvec_iq4_xs", "matmul_iq4_xs",
             "matvec_iq3_s", "matmul_iq3_s",
@@ -656,7 +656,7 @@ private:
             // Fused QKV
             "fused_qkv_matvec_q4k",
             // Fused gate+up (non-Q4_K)
-            "fused_gate_up_q8_0", "fused_gate_up_q4_0",
+            // fused_gate_up_q8_0/q4_0 replaced by simdgroup matmul dispatches
             // Simdgroup Flash Attention (high performance decode)
             "simdgroup_flash_attention_decode_f16kv_d64", "simdgroup_flash_attention_decode_f16kv_d128",
             // llama.cpp-style Flash Attention (highest performance)
@@ -870,6 +870,50 @@ private:
             }
 
             pipelines_[v.name] = pipeline;
+        }
+
+        // Compile Q8_0 and Q4_0 simdgroup matmul variants with function constants
+        const char* q8q4_base_names[] = {
+            "matmul_q8_0_simdgroup",
+            "matmul_q4_0_simdgroup",
+        };
+        for (const char* base_name : q8q4_base_names) {
+            std::string suffix_00 = std::string(base_name) + "_00";
+            std::string suffix_01 = std::string(base_name) + "_01";
+            std::string suffix_10 = std::string(base_name) + "_10";
+            std::string suffix_11 = std::string(base_name) + "_11";
+            SgmmVariant q_variants[] = {
+                {suffix_00.c_str(), false, false},
+                {suffix_01.c_str(), false, true},
+                {suffix_10.c_str(), true, false},
+                {suffix_11.c_str(), true, true},
+            };
+
+            NS::String* q_func_name = NS::String::string(base_name, NS::UTF8StringEncoding);
+
+            for (const auto& v : q_variants) {
+                MTL::FunctionConstantValues* fc_values = MTL::FunctionConstantValues::alloc()->init();
+                fc_values->setConstantValue(&v.bc_inp, MTL::DataTypeBool, FC_MUL_MM + 0);
+                fc_values->setConstantValue(&v.bc_out, MTL::DataTypeBool, FC_MUL_MM + 1);
+
+                MTL::Function* func = library->newFunction(q_func_name, fc_values, &error);
+                fc_values->release();
+
+                if (!func) {
+                    GRANITE_LOG_WARN("Function '{}' not found with constants", v.name);
+                    continue;
+                }
+
+                MTL::ComputePipelineState* pipeline = device_->newComputePipelineState(func, &error);
+                func->release();
+
+                if (!pipeline) {
+                    GRANITE_LOG_WARN("Failed to create pipeline for '{}'", v.name);
+                    continue;
+                }
+
+                pipelines_[v.name] = pipeline;
+            }
         }
 
         // Compile fused_gate_up_q4k_simdgroup with function constants
@@ -1191,7 +1235,9 @@ Result<void> MetalCompute::matmul_q8_0(
     MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
     uint32_t M, uint32_t K, uint32_t N)
 {
-    return impl_->dispatch_matmul("matmul_q8_0", X, W, Y, M, K, N);
+    const char* variant = (M % 32 == 0 && N % 64 == 0)
+        ? "matmul_q8_0_simdgroup_00" : "matmul_q8_0_simdgroup_11";
+    return impl_->dispatch_matmul_simdgroup(variant, X, W, Y, M, K, N);
 }
 
 Result<void> MetalCompute::fused_gate_up_q8_0(
@@ -1199,27 +1245,11 @@ Result<void> MetalCompute::fused_gate_up_q8_0(
     MTL::Buffer* Y_gate, MTL::Buffer* Y_up,
     uint32_t M, uint32_t K, uint32_t N)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("fused_gate_up_q8_0");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "fused_gate_up_q8_0 pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(X, 0, 0);
-    encoder->setBuffer(W_gate, 0, 1);
-    encoder->setBuffer(W_up, 0, 2);
-    encoder->setBuffer(Y_gate, 0, 3);
-    encoder->setBuffer(Y_up, 0, 4);
-    encoder->setBytes(&M, sizeof(M), 5);
-    encoder->setBytes(&K, sizeof(K), 6);
-    encoder->setBytes(&N, sizeof(N), 7);
-
-    MTL::Size grid_size = MTL::Size::Make(N, M, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
-    encoder->dispatchThreads(grid_size, threadgroup_size);
-
-    return {};
+    const char* variant = (M % 32 == 0 && N % 64 == 0)
+        ? "matmul_q8_0_simdgroup_00" : "matmul_q8_0_simdgroup_11";
+    auto res = impl_->dispatch_matmul_simdgroup(variant, X, W_gate, Y_gate, M, K, N);
+    if (!res.ok()) return res;
+    return impl_->dispatch_matmul_simdgroup(variant, X, W_up, Y_up, M, K, N);
 }
 
 // -----------------------------------------------------------------------------
@@ -1237,7 +1267,9 @@ Result<void> MetalCompute::matmul_q4_0(
     MTL::Buffer* X, MTL::Buffer* W, MTL::Buffer* Y,
     uint32_t M, uint32_t K, uint32_t N)
 {
-    return impl_->dispatch_matmul("matmul_q4_0", X, W, Y, M, K, N);
+    const char* variant = (M % 32 == 0 && N % 64 == 0)
+        ? "matmul_q4_0_simdgroup_00" : "matmul_q4_0_simdgroup_11";
+    return impl_->dispatch_matmul_simdgroup(variant, X, W, Y, M, K, N);
 }
 
 Result<void> MetalCompute::fused_gate_up_q4_0(
@@ -1245,27 +1277,11 @@ Result<void> MetalCompute::fused_gate_up_q4_0(
     MTL::Buffer* Y_gate, MTL::Buffer* Y_up,
     uint32_t M, uint32_t K, uint32_t N)
 {
-    auto* encoder = impl_->get_encoder();
-    auto* pipeline = impl_->get_pipeline("fused_gate_up_q4_0");
-    if (!pipeline) {
-        return Error(ErrorCode::InternalError, "fused_gate_up_q4_0 pipeline not found");
-    }
-
-    encoder->setComputePipelineState(pipeline);
-    encoder->setBuffer(X, 0, 0);
-    encoder->setBuffer(W_gate, 0, 1);
-    encoder->setBuffer(W_up, 0, 2);
-    encoder->setBuffer(Y_gate, 0, 3);
-    encoder->setBuffer(Y_up, 0, 4);
-    encoder->setBytes(&M, sizeof(M), 5);
-    encoder->setBytes(&K, sizeof(K), 6);
-    encoder->setBytes(&N, sizeof(N), 7);
-
-    MTL::Size grid_size = MTL::Size::Make(N, M, 1);
-    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
-    encoder->dispatchThreads(grid_size, threadgroup_size);
-
-    return {};
+    const char* variant = (M % 32 == 0 && N % 64 == 0)
+        ? "matmul_q4_0_simdgroup_00" : "matmul_q4_0_simdgroup_11";
+    auto res = impl_->dispatch_matmul_simdgroup(variant, X, W_gate, Y_gate, M, K, N);
+    if (!res.ok()) return res;
+    return impl_->dispatch_matmul_simdgroup(variant, X, W_up, Y_up, M, K, N);
 }
 
 // -----------------------------------------------------------------------------
@@ -1714,7 +1730,9 @@ Result<void> MetalCompute::elementwise_mul(
     encoder->setBuffer(c, 0, 2);
     encoder->setBytes(&size, sizeof(size), 3);
 
-    MTL::Size grid_size = MTL::Size::Make(size, 1, 1);
+    // Each thread processes 4 elements (float4 vectorized)
+    uint32_t num_threads = (size + 3) / 4;
+    MTL::Size grid_size = MTL::Size::Make(num_threads, 1, 1);
     uint32_t tg_size = impl_->tuned_threadgroup_size_1d(256);
     MTL::Size threadgroup_size = MTL::Size::Make(tg_size, 1, 1);
     impl_->mark_kernel("elementwise_mul");
@@ -1846,11 +1864,11 @@ Result<void> MetalCompute::softmax(MTL::Buffer* x, uint32_t M, uint32_t N)
     encoder->setBytes(&M, sizeof(M), 1);
     encoder->setBytes(&N, sizeof(N), 2);
 
-    MTL::Size grid_size = MTL::Size::Make(N, M, 1);
-    uint32_t tg_size = impl_->tuned_threadgroup_size_1d(256);
-    MTL::Size threadgroup_size = MTL::Size::Make(tg_size, 1, 1);
+    // One threadgroup (256 threads) per row — simd-reduced softmax
+    MTL::Size grid_size = MTL::Size::Make(M, 1, 1);
+    MTL::Size threadgroup_size = MTL::Size::Make(256, 1, 1);
     impl_->mark_kernel("softmax_row");
-    encoder->dispatchThreads(grid_size, threadgroup_size);
+    encoder->dispatchThreadgroups(grid_size, threadgroup_size);
     impl_->post_dispatch("softmax_row");
 
     return {};
