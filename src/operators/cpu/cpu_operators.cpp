@@ -379,6 +379,65 @@ public:
 };
 
 // =============================================================================
+// CPU Embedding — backed by GrML kernel
+// =============================================================================
+
+class CPUEmbeddingOp : public IOperator {
+public:
+    OpType type() const override { return OpType::Embedding; }
+
+    Result<void> validate(const OpContext& ctx) const override {
+        if (ctx.num_inputs() != 2) {
+            return Error(ErrorCode::InvalidArgument, "Embedding requires 2 inputs (weight, indices)");
+        }
+        return {};
+    }
+
+    Result<std::vector<std::vector<int64_t>>> infer_shapes(const OpContext& ctx) const override {
+        const auto& weight = ctx.inputs[0];
+        const auto& indices = ctx.inputs[1];
+
+        int64_t dim = weight.size(weight.ndim() - 1);
+        int64_t n_tokens = static_cast<int64_t>(indices.numel());
+
+        return std::vector<std::vector<int64_t>>{{n_tokens, dim}};
+    }
+
+    Result<void> execute(OpContext& ctx) override {
+        const auto& weight = ctx.inputs[0];
+        const auto& indices = ctx.inputs[1];
+        auto& out = ctx.outputs[0];
+
+        if (weight.dtype() != DataType::FP32) {
+            return Error(ErrorCode::NotImplemented, "CPU Embedding only supports FP32 weights");
+        }
+
+        auto map_w = ctx.backend->map_buffer(weight.buffer());
+        auto map_idx = ctx.backend->map_buffer(indices.buffer());
+        auto map_out = ctx.backend->map_buffer(out.buffer());
+
+        if (!map_w.ok() || !map_idx.ok() || !map_out.ok()) {
+            return Error(ErrorCode::InternalError, "Failed to map buffers");
+        }
+
+        const float* pw = static_cast<const float*>(map_w.value());
+        const int32_t* pidx = static_cast<const int32_t*>(map_idx.value());
+        float* pout = static_cast<float*>(map_out.value());
+
+        int64_t dim = static_cast<int64_t>(weight.size(weight.ndim() - 1));
+        int64_t n_tokens = static_cast<int64_t>(indices.numel());
+
+        grml_kernel_embedding_f32(dim, n_tokens, pout, pw, pidx);
+
+        ctx.backend->unmap_buffer(weight.buffer());
+        ctx.backend->unmap_buffer(indices.buffer());
+        ctx.backend->unmap_buffer(out.buffer());
+
+        return {};
+    }
+};
+
+// =============================================================================
 // CPU Quantized MatMul — Q8_0/Q4_0 backed by GrML SIMD, Q4_K kept as-is
 // =============================================================================
 
@@ -647,6 +706,8 @@ void register_cpu_operators() {
                         []() { return std::make_unique<CPULayerNormOp>(); });
     registry.register_op(OpType::RMSNorm, BackendType::CPU,
                         []() { return std::make_unique<CPURMSNormOp>(); });
+    registry.register_op(OpType::Embedding, BackendType::CPU,
+                        []() { return std::make_unique<CPUEmbeddingOp>(); });
 
 }
 
