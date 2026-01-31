@@ -111,13 +111,40 @@ Result<TransformerModel> TransformerModel::load(
         model.model_config_.head_dim,
         model.model_config_.rope_theta);
 
-    // Load weights (dequantized for CPU path)
+    // Build skip set: quantized projection weights that will be loaded as raw
+    std::unordered_set<std::string> skip_dequant;
+    for (const auto& info : model.gguf_->tensors()) {
+        // Same filter as raw weight loading below
+        if (info.type != GGMLType::Q4_K && info.type != GGMLType::Q6_K &&
+            info.type != GGMLType::Q5_K && info.type != GGMLType::Q3_K &&
+            info.type != GGMLType::Q2_K &&
+            info.type != GGMLType::Q8_0 && info.type != GGMLType::Q4_0 &&
+            info.type != GGMLType::IQ4_NL && info.type != GGMLType::IQ4_XS &&
+            info.type != GGMLType::IQ3_S) {
+            continue;
+        }
+        if (info.name.find(".weight") == std::string::npos ||
+            info.name.find("_norm") != std::string::npos ||
+            info.name.find("embd") != std::string::npos) {
+            continue;
+        }
+        // Keep output.weight dequantized (used by FP16 output projection)
+        if (info.name == "output.weight") {
+            continue;
+        }
+        skip_dequant.insert(info.name);
+    }
+
+    // Load weights (dequantized for CPU path), skipping those loaded as raw quantized
     ModelLoader loader(backend, config.use_memory_mapping);
-    auto weights_result = loader.load_weights(*model.gguf_);
+    auto weights_result = loader.load_weights(*model.gguf_, &skip_dequant);
     if (!weights_result.ok()) {
         return weights_result.error();
     }
     model.weights_ = std::move(weights_result).take();
+
+    GRANITE_LOG_INFO("Skipped dequantization for {} projection weights (loaded as raw quantized)",
+                     skip_dequant.size());
 
     // Also load raw quantized weights for GPU path
     // Only load quantized weights that are used in matmul operations
