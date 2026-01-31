@@ -128,6 +128,15 @@ Result<TransformerModel> TransformerModel::load(
             info.name.find("embd") != std::string::npos) {
             continue;
         }
+        // Only skip output.weight for types with efficient simdgroup matmul kernels.
+        // Q6_K, Q5_K, Q3_K, Q2_K, IQ4_NL, IQ4_XS, IQ3_S lack simdgroup matmul —
+        // their basic dispatchThreads fallback is slower than FP16 simdgroup matmul.
+        if (info.name == "output.weight" &&
+            info.type != GGMLType::Q4_K &&
+            info.type != GGMLType::Q8_0 &&
+            info.type != GGMLType::Q4_0) {
+            continue;
+        }
         skip_dequant.insert(info.name);
     }
 
