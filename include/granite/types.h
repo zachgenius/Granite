@@ -94,6 +94,7 @@ enum class BackendType : uint8_t {
     CPU,
     Metal,
     Vulkan,
+    Talos,
 };
 
 constexpr const char* backend_name(BackendType type) {
@@ -101,6 +102,7 @@ constexpr const char* backend_name(BackendType type) {
         case BackendType::CPU:    return "CPU";
         case BackendType::Metal:  return "Metal";
         case BackendType::Vulkan: return "Vulkan";
+        case BackendType::Talos:  return "Talos";
     }
     return "unknown";
 }

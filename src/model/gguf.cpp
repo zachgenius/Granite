@@ -788,11 +788,16 @@ Result<ModelInfo> ModelLoader::load_info(const std::string& path) {
 }
 
 Result<std::unordered_map<std::string, Tensor>> ModelLoader::load_weights(
-    const GGUFFile& file)
+    const GGUFFile& file,
+    const std::unordered_set<std::string>* skip_names)
 {
     std::unordered_map<std::string, Tensor> tensors;
 
     for (const auto& info : file.tensors()) {
+        if (skip_names && skip_names->count(info.name)) {
+            continue;  // Skip — will be loaded as raw quantized
+        }
+
         auto tensor_result = load_tensor(file, info.name);
         if (!tensor_result.ok()) {
             GRANITE_LOG_WARN("Failed to load tensor '{}': {}",

@@ -111,13 +111,45 @@ Result<TransformerModel> TransformerModel::load(
         model.model_config_.head_dim,
         model.model_config_.rope_theta);
 
-    // Load weights (dequantized for CPU path)
+    // Build skip set: quantized projection weights that will be loaded as raw
+    std::unordered_set<std::string> skip_dequant;
+    for (const auto& info : model.gguf_->tensors()) {
+        // Same filter as raw weight loading below
+        if (info.type != GGMLType::Q4_K && info.type != GGMLType::Q6_K &&
+            info.type != GGMLType::Q5_K && info.type != GGMLType::Q3_K &&
+            info.type != GGMLType::Q2_K &&
+            info.type != GGMLType::Q8_0 && info.type != GGMLType::Q4_0 &&
+            info.type != GGMLType::IQ4_NL && info.type != GGMLType::IQ4_XS &&
+            info.type != GGMLType::IQ3_S) {
+            continue;
+        }
+        if (info.name.find(".weight") == std::string::npos ||
+            info.name.find("_norm") != std::string::npos ||
+            info.name.find("embd") != std::string::npos) {
+            continue;
+        }
+        // Only skip output.weight for types with efficient simdgroup matmul kernels.
+        // Q6_K, Q5_K, Q3_K, Q2_K, IQ4_NL, IQ4_XS, IQ3_S lack simdgroup matmul —
+        // their basic dispatchThreads fallback is slower than FP16 simdgroup matmul.
+        if (info.name == "output.weight" &&
+            info.type != GGMLType::Q4_K &&
+            info.type != GGMLType::Q8_0 &&
+            info.type != GGMLType::Q4_0) {
+            continue;
+        }
+        skip_dequant.insert(info.name);
+    }
+
+    // Load weights (dequantized for CPU path), skipping those loaded as raw quantized
     ModelLoader loader(backend, config.use_memory_mapping);
-    auto weights_result = loader.load_weights(*model.gguf_);
+    auto weights_result = loader.load_weights(*model.gguf_, &skip_dequant);
     if (!weights_result.ok()) {
         return weights_result.error();
     }
     model.weights_ = std::move(weights_result).take();
+
+    GRANITE_LOG_INFO("Skipped dequantization for {} projection weights (loaded as raw quantized)",
+                     skip_dequant.size());
 
     // Also load raw quantized weights for GPU path
     // Only load quantized weights that are used in matmul operations
@@ -463,7 +495,8 @@ Result<Tensor> TransformerModel::forward(
         // Try tied embeddings
         output_weight = get_weight("token_embd.weight");
     }
-    if (!output_weight) {
+    // output_weight may be null if skipped from dequantization — raw weight handles GPU path
+    if (!output_weight && !get_raw_weight("output.weight")) {
         GRANITE_FAIL(ErrorCode::InvalidState, "Output weight not found");
     }
 
@@ -480,9 +513,11 @@ Result<Tensor> TransformerModel::forward(
         if (gpu && gpu->is_initialized()) {
             auto* h_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(hidden.buffer()));
             auto* norm_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(norm_weight->buffer()));
-            auto* out_w_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(output_weight->buffer()));
+            auto* out_w_buf = output_weight
+                ? static_cast<MTL::Buffer*>(backend_->get_native_buffer(output_weight->buffer()))
+                : nullptr;
 
-            if (h_buf && norm_buf && out_w_buf) {
+            if (h_buf && norm_buf && (out_w_buf || get_raw_weight("output.weight"))) {
                 // Allocate output tensor for normalized hidden
                 std::vector<int64_t> norm_shape = {1, 1, static_cast<int64_t>(model_config_.hidden_dim)};
                 auto norm_out_result = Tensor::allocate(norm_shape, DataType::FP32, backend_);
@@ -508,9 +543,29 @@ Result<Tensor> TransformerModel::forward(
                                      model_config_.hidden_dim, model_config_.rms_norm_eps);
                     }
 
-                    // GPU Output projection (FP16 weights -> matvec_f16)
-                    gpu->matvec_f16(norm_out_buf, out_w_buf, logits_buf,
-                                   model_config_.hidden_dim, model_config_.vocab_size);
+                    // GPU Output projection — prefer quantized raw weight
+                    const RawWeight* raw_output = get_raw_weight("output.weight");
+                    if (raw_output) {
+                        auto* raw_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_output->buffer));
+                        uint32_t K = model_config_.hidden_dim;
+                        uint32_t N = model_config_.vocab_size;
+                        switch (raw_output->quant_type) {
+                            case GGMLType::Q4_K:  gpu->matvec_q4k(norm_out_buf, raw_buf, logits_buf, K, N); break;
+                            case GGMLType::Q8_0:  gpu->matvec_q8_0(norm_out_buf, raw_buf, logits_buf, K, N); break;
+                            case GGMLType::Q4_0:  gpu->matvec_q4_0(norm_out_buf, raw_buf, logits_buf, K, N); break;
+                            case GGMLType::Q6_K:  gpu->matvec_q6_k(norm_out_buf, raw_buf, logits_buf, K, N); break;
+                            case GGMLType::Q5_K:  gpu->matvec_q5_k(norm_out_buf, raw_buf, logits_buf, K, N); break;
+                            case GGMLType::Q3_K:  gpu->matvec_q3_k(norm_out_buf, raw_buf, logits_buf, K, N); break;
+                            case GGMLType::Q2_K:  gpu->matvec_q2_k(norm_out_buf, raw_buf, logits_buf, K, N); break;
+                            case GGMLType::IQ4_NL: gpu->matvec_iq4_nl(norm_out_buf, raw_buf, logits_buf, K, N); break;
+                            case GGMLType::IQ4_XS: gpu->matvec_iq4_xs(norm_out_buf, raw_buf, logits_buf, K, N); break;
+                            case GGMLType::IQ3_S: gpu->matvec_iq3_s(norm_out_buf, raw_buf, logits_buf, K, N); break;
+                            default: gpu->matvec_f16(norm_out_buf, out_w_buf, logits_buf, K, N); break;
+                        }
+                    } else {
+                        gpu->matvec_f16(norm_out_buf, out_w_buf, logits_buf,
+                                       model_config_.hidden_dim, model_config_.vocab_size);
+                    }
 
                     // Sync before returning results
                     gpu->sync();
@@ -527,9 +582,11 @@ Result<Tensor> TransformerModel::forward(
         if (gpu && gpu->is_initialized()) {
             auto* h_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(hidden.buffer()));
             auto* norm_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(norm_weight->buffer()));
-            auto* out_w_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(output_weight->buffer()));
+            auto* out_w_buf = output_weight
+                ? static_cast<MTL::Buffer*>(backend_->get_native_buffer(output_weight->buffer()))
+                : nullptr;
 
-            if (h_buf && norm_buf && out_w_buf) {
+            if (h_buf && norm_buf && (out_w_buf || get_raw_weight("output.weight"))) {
                 // Allocate normalized hidden tensor
                 std::vector<int64_t> norm_shape = {batch, seq_len, static_cast<int64_t>(model_config_.hidden_dim)};
                 auto norm_out_result = Tensor::allocate(norm_shape, DataType::FP32, backend_);
@@ -555,10 +612,30 @@ Result<Tensor> TransformerModel::forward(
                                            total_tokens, model_config_.hidden_dim, model_config_.rms_norm_eps);
                     }
 
-                    // GPU Output projection using batched FP16 matmul
-                    // output_weight is [vocab_size, hidden_dim] in FP16
-                    gpu->matmul_f16(norm_out_buf, out_w_buf, logits_buf,
-                                   total_tokens, model_config_.hidden_dim, model_config_.vocab_size);
+                    // GPU Output projection — prefer quantized raw weight
+                    const RawWeight* raw_output = get_raw_weight("output.weight");
+                    if (raw_output) {
+                        auto* raw_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_output->buffer));
+                        uint32_t M = total_tokens;
+                        uint32_t K = model_config_.hidden_dim;
+                        uint32_t N = model_config_.vocab_size;
+                        switch (raw_output->quant_type) {
+                            case GGMLType::Q4_K:  gpu->matmul_q4k(norm_out_buf, raw_buf, logits_buf, M, K, N); break;
+                            case GGMLType::Q8_0:  gpu->matmul_q8_0(norm_out_buf, raw_buf, logits_buf, M, K, N); break;
+                            case GGMLType::Q4_0:  gpu->matmul_q4_0(norm_out_buf, raw_buf, logits_buf, M, K, N); break;
+                            case GGMLType::Q6_K:  gpu->matmul_q6_k(norm_out_buf, raw_buf, logits_buf, M, K, N); break;
+                            case GGMLType::Q5_K:  gpu->matmul_q5_k(norm_out_buf, raw_buf, logits_buf, M, K, N); break;
+                            case GGMLType::Q3_K:  gpu->matmul_q3_k(norm_out_buf, raw_buf, logits_buf, M, K, N); break;
+                            case GGMLType::Q2_K:  gpu->matmul_q2_k(norm_out_buf, raw_buf, logits_buf, M, K, N); break;
+                            case GGMLType::IQ4_NL: gpu->matmul_iq4_nl(norm_out_buf, raw_buf, logits_buf, M, K, N); break;
+                            case GGMLType::IQ4_XS: gpu->matmul_iq4_xs(norm_out_buf, raw_buf, logits_buf, M, K, N); break;
+                            case GGMLType::IQ3_S: gpu->matmul_iq3_s(norm_out_buf, raw_buf, logits_buf, M, K, N); break;
+                            default: gpu->matmul_f16(norm_out_buf, out_w_buf, logits_buf, M, K, N); break;
+                        }
+                    } else {
+                        gpu->matmul_f16(norm_out_buf, out_w_buf, logits_buf,
+                                       total_tokens, model_config_.hidden_dim, model_config_.vocab_size);
+                    }
 
                     // Sync before returning results
                     gpu->sync();
@@ -3528,7 +3605,8 @@ Result<void*> TransformerModel::forward_prefill_raw(
     const Tensor* output_weight = get_weight("output.weight");
     if (!output_weight) output_weight = get_weight("token_embd.weight");
 
-    if (!emb_weight || !norm_weight || !output_weight) {
+    // output_weight may be null if skipped from dequantization — raw weight handles GPU path
+    if (!emb_weight || !norm_weight || (!output_weight && !get_raw_weight("output.weight"))) {
         gpu->end_batch();
         GRANITE_FAIL(ErrorCode::InvalidState, "Missing weights");
     }
@@ -3551,7 +3629,9 @@ Result<void*> TransformerModel::forward_prefill_raw(
 
     auto* emb_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(emb_weight->buffer()));
     auto* out_norm_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(norm_weight->buffer()));
-    auto* out_w_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(output_weight->buffer()));
+    auto* out_w_buf = output_weight
+        ? static_cast<MTL::Buffer*>(backend_->get_native_buffer(output_weight->buffer()))
+        : nullptr;
 
     // Copy token IDs to GPU buffer
     auto* ids_ptr = static_cast<int32_t*>(token_ids_buf->contents());
@@ -4336,10 +4416,82 @@ Result<void*> TransformerModel::forward_prefill_raw(
     enc->setBytes(&eps, 4, 5);
     enc->dispatchThreadgroups(MTL::Size::Make(M, 1, 1), MTL::Size::Make(256, 1, 1));
 
-    // Output projection (FP16 matmul)
+    // Output projection — prefer quantized raw weight
     uint32_t out_M = last_token_only ? 1 : M;
     size_t norm_offset = last_token_only ? static_cast<size_t>(M - 1) * hd * sizeof(float) : 0;
-    if (last_token_only && pipe_matvec_f16) {
+
+    const RawWeight* raw_output = get_raw_weight("output.weight");
+    if (raw_output && !last_token_only) {
+        // Multi-token: use MetalCompute matmul wrappers (no offset needed, shares encoder)
+        auto* raw_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_output->buffer));
+        switch (raw_output->quant_type) {
+            case GGMLType::Q4_K:  gpu->matmul_q4k(norm_out_buf, raw_buf, logits_buf, out_M, hd, vs); break;
+            case GGMLType::Q8_0:  gpu->matmul_q8_0(norm_out_buf, raw_buf, logits_buf, out_M, hd, vs); break;
+            case GGMLType::Q4_0:  gpu->matmul_q4_0(norm_out_buf, raw_buf, logits_buf, out_M, hd, vs); break;
+            case GGMLType::Q6_K:  gpu->matmul_q6_k(norm_out_buf, raw_buf, logits_buf, out_M, hd, vs); break;
+            case GGMLType::Q5_K:  gpu->matmul_q5_k(norm_out_buf, raw_buf, logits_buf, out_M, hd, vs); break;
+            case GGMLType::Q3_K:  gpu->matmul_q3_k(norm_out_buf, raw_buf, logits_buf, out_M, hd, vs); break;
+            case GGMLType::Q2_K:  gpu->matmul_q2_k(norm_out_buf, raw_buf, logits_buf, out_M, hd, vs); break;
+            case GGMLType::IQ4_NL: gpu->matmul_iq4_nl(norm_out_buf, raw_buf, logits_buf, out_M, hd, vs); break;
+            case GGMLType::IQ4_XS: gpu->matmul_iq4_xs(norm_out_buf, raw_buf, logits_buf, out_M, hd, vs); break;
+            case GGMLType::IQ3_S: gpu->matmul_iq3_s(norm_out_buf, raw_buf, logits_buf, out_M, hd, vs); break;
+            default: gpu->matmul_f16(norm_out_buf, out_w_buf, logits_buf, out_M, hd, vs); break;
+        }
+    } else if (raw_output && last_token_only) {
+        // Single token with offset: raw dispatch for offset support on quantized matvec
+        auto* raw_buf = static_cast<MTL::Buffer*>(backend_->get_native_buffer(raw_output->buffer));
+        // Determine pipeline name and dispatch params per quant type
+        // matvec dispatch: rows_per_tg = simd_groups * rows_per_simd, threadgroup = 32 * simd_groups
+        const char* pipe_name = nullptr;
+        uint32_t simd_groups = 2;
+        uint32_t rows_per_simd = 2;
+        switch (raw_output->quant_type) {
+            case GGMLType::Q4_K:  pipe_name = "matvec_q4k"; simd_groups = 2; rows_per_simd = 2; break;
+            case GGMLType::Q8_0:  pipe_name = "matvec_q8_0"; simd_groups = 8; rows_per_simd = 2; break;
+            case GGMLType::Q4_0:  pipe_name = "matvec_q4_0"; simd_groups = 8; rows_per_simd = 2; break;
+            case GGMLType::Q6_K:  pipe_name = "matvec_q6_k"; simd_groups = 8; rows_per_simd = 2; break;
+            case GGMLType::Q5_K:  pipe_name = "matvec_q5_k"; simd_groups = 8; rows_per_simd = 2; break;
+            case GGMLType::Q3_K:  pipe_name = "matvec_q3_k"; simd_groups = 8; rows_per_simd = 2; break;
+            case GGMLType::Q2_K:  pipe_name = "matvec_q2_k"; simd_groups = 8; rows_per_simd = 2; break;
+            case GGMLType::IQ4_NL: pipe_name = "matvec_iq4_nl"; simd_groups = 8; rows_per_simd = 2; break;
+            case GGMLType::IQ4_XS: pipe_name = "matvec_iq4_xs"; simd_groups = 8; rows_per_simd = 2; break;
+            case GGMLType::IQ3_S: pipe_name = "matvec_iq3_s"; simd_groups = 8; rows_per_simd = 2; break;
+            default: break;
+        }
+        if (pipe_name) {
+            auto* pipe = static_cast<MTL::ComputePipelineState*>(gpu->get_pipeline(pipe_name));
+            if (pipe) {
+                uint32_t rows_per_tg = simd_groups * rows_per_simd;
+                uint32_t num_tg = (vs + rows_per_tg - 1) / rows_per_tg;
+                enc->setComputePipelineState(pipe);
+                enc->setBuffer(norm_out_buf, norm_offset, 0);
+                enc->setBuffer(raw_buf, 0, 1);
+                enc->setBuffer(logits_buf, 0, 2);
+                enc->setBytes(&hd, 4, 3);
+                enc->setBytes(&vs, 4, 4);
+                enc->dispatchThreadgroups(MTL::Size::Make(num_tg, 1, 1),
+                                          MTL::Size::Make(32 * simd_groups, 1, 1));
+            } else {
+                // Pipeline not found — fall back to FP16
+                enc->setComputePipelineState(pipe_matvec_f16);
+                enc->setBuffer(norm_out_buf, norm_offset, 0);
+                enc->setBuffer(out_w_buf, 0, 1);
+                enc->setBuffer(logits_buf, 0, 2);
+                enc->setBytes(&hd, 4, 3);
+                enc->setBytes(&vs, 4, 4);
+                enc->dispatchThreadgroups(MTL::Size::Make(vs, 1, 1), MTL::Size::Make(32, 1, 1));
+            }
+        } else {
+            // Unknown quant type — fall back to FP16
+            enc->setComputePipelineState(pipe_matvec_f16);
+            enc->setBuffer(norm_out_buf, norm_offset, 0);
+            enc->setBuffer(out_w_buf, 0, 1);
+            enc->setBuffer(logits_buf, 0, 2);
+            enc->setBytes(&hd, 4, 3);
+            enc->setBytes(&vs, 4, 4);
+            enc->dispatchThreadgroups(MTL::Size::Make(vs, 1, 1), MTL::Size::Make(32, 1, 1));
+        }
+    } else if (last_token_only && pipe_matvec_f16) {
         enc->setComputePipelineState(pipe_matvec_f16);
         enc->setBuffer(norm_out_buf, norm_offset, 0);
         enc->setBuffer(out_w_buf, 0, 1);

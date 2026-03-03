@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <memory>
 #include <variant>
 #include <optional>
@@ -289,8 +290,10 @@ public:
 
     /// Load model weights into tensors
     /// Returns a map of tensor name -> Tensor
+    /// If skip_names is provided, tensors with those names are skipped (not dequantized)
     [[nodiscard]] Result<std::unordered_map<std::string, Tensor>> load_weights(
-        const GGUFFile& file);
+        const GGUFFile& file,
+        const std::unordered_set<std::string>* skip_names = nullptr);
 
     /// Load specific tensor by name
     [[nodiscard]] Result<Tensor> load_tensor(

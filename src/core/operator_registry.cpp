@@ -20,12 +20,22 @@ void OperatorRegistry::register_op(OpType op, BackendType backend, OperatorFacto
 std::unique_ptr<IOperator> OperatorRegistry::create(OpType op, BackendType backend) const {
     Key key{op, backend};
     auto it = factories_.find(key);
-    if (it == factories_.end()) {
-        GRANITE_LOG_WARN("No implementation for {} on {}",
-                         op_type_name(op), backend_name(backend));
-        return nullptr;
+    if (it != factories_.end()) {
+        return it->second();
     }
-    return it->second();
+    // Fall back to CPU implementation if the requested backend doesn't have one
+    if (backend != BackendType::CPU) {
+        Key cpu_key{op, BackendType::CPU};
+        auto cpu_it = factories_.find(cpu_key);
+        if (cpu_it != factories_.end()) {
+            GRANITE_LOG_INFO("Falling back to CPU for {} (not available on {})",
+                             op_type_name(op), backend_name(backend));
+            return cpu_it->second();
+        }
+    }
+    GRANITE_LOG_WARN("No implementation for {} on {} (no CPU fallback either)",
+                     op_type_name(op), backend_name(backend));
+    return nullptr;
 }
 
 bool OperatorRegistry::has_implementation(OpType op, BackendType backend) const {
@@ -312,6 +322,12 @@ void register_metal_operators() {}
 void register_vulkan_operators() {}
 #endif
 
+#ifdef GRANITE_HAS_TALOS
+// Defined in talos-aegis/granite/talos_operators.cpp
+#else
+void register_talos_operators() {}
+#endif
+
 namespace {
     bool operators_initialized = false;
 }
@@ -331,6 +347,10 @@ void initialize_operators() {
 
 #ifdef GRANITE_HAS_VULKAN
     register_vulkan_operators();
+#endif
+
+#ifdef GRANITE_HAS_TALOS
+    register_talos_operators();
 #endif
 
     operators_initialized = true;

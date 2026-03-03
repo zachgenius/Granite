@@ -14,9 +14,12 @@ endif()
 option(GRANITE_BUILD_METAL "Build Metal backend (Apple only)" ON)
 option(GRANITE_BUILD_VULKAN "Build Vulkan backend (Linux/Android/Windows)" OFF)
 option(GRANITE_BUILD_CPU "Build CPU backend" ON)
+option(GRANITE_BUILD_TALOS "Build Talos ASIC accelerator backend" OFF)
 option(GRANITE_BUILD_TESTS "Build tests" ON)
 option(GRANITE_BUILD_EXAMPLES "Build examples" ON)
 option(GRANITE_ENABLE_ONNX "Enable ONNX model loader (requires Protobuf)" OFF)
+
+set(TALOS_AEGIS_DIR "" CACHE PATH "Path to talos-aegis repository")
 
 # =============================================================================
 # Dependencies
@@ -183,6 +186,10 @@ endif()
 # =============================================================================
 
 if(GRANITE_BUILD_CPU)
+    # Link GrML for SIMD-accelerated CPU kernels
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../GrML grml_build EXCLUDE_FROM_ALL)
+    target_link_libraries(granite PRIVATE grml)
+
     set(GRANITE_CPU_SOURCES
         src/backend/cpu/cpu_backend.cpp
         src/operators/cpu/cpu_operators.cpp
@@ -258,6 +265,33 @@ if(GRANITE_BUILD_VULKAN)
             endif()
         endif()
     endif()
+endif()
+
+# =============================================================================
+# Talos Backend (ASIC accelerator, requires talos-aegis)
+# =============================================================================
+
+if(GRANITE_BUILD_TALOS)
+    if(NOT TALOS_AEGIS_DIR)
+        set(TALOS_AEGIS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ASICPlan/talos-aegis")
+    endif()
+    if(NOT EXISTS "${TALOS_AEGIS_DIR}/CMakeLists.txt")
+        message(FATAL_ERROR "talos-aegis not found at ${TALOS_AEGIS_DIR}. "
+                "Set TALOS_AEGIS_DIR or disable GRANITE_BUILD_TALOS.")
+    endif()
+
+    add_subdirectory(${TALOS_AEGIS_DIR} talos_aegis_build EXCLUDE_FROM_ALL)
+
+    target_sources(granite PRIVATE
+        ${TALOS_AEGIS_DIR}/granite/talos_bridge.cpp
+        ${TALOS_AEGIS_DIR}/granite/talos_operators.cpp
+    )
+    target_include_directories(granite PRIVATE
+        ${TALOS_AEGIS_DIR}/runtime
+        ${TALOS_AEGIS_DIR}/driver/hal
+    )
+    target_link_libraries(granite PRIVATE talos_hal talos_compiler)
+    target_compile_definitions(granite PUBLIC GRANITE_HAS_TALOS=1)
 endif()
 
 # =============================================================================

@@ -26,6 +26,10 @@ extern std::unique_ptr<IComputeBackend> create_metal_backend();
 extern std::unique_ptr<IComputeBackend> create_vulkan_backend();
 #endif
 
+#ifdef GRANITE_HAS_TALOS
+extern std::unique_ptr<IComputeBackend> create_talos_backend_granite();
+#endif
+
 std::unique_ptr<IComputeBackend> create_backend(BackendType type) {
     // Initialize operators on first backend creation
     initialize_operators();
@@ -52,6 +56,14 @@ std::unique_ptr<IComputeBackend> create_backend(BackendType type) {
             return create_vulkan_backend();
 #else
             GRANITE_LOG_WARN("Vulkan backend not available");
+            return nullptr;
+#endif
+
+        case BackendType::Talos:
+#ifdef GRANITE_HAS_TALOS
+            return create_talos_backend_granite();
+#else
+            GRANITE_LOG_WARN("Talos backend not available (build with GRANITE_BUILD_TALOS=ON)");
             return nullptr;
 #endif
     }
@@ -93,6 +105,13 @@ bool is_backend_available(BackendType type) {
 
         case BackendType::Vulkan:
 #ifdef GRANITE_HAS_VULKAN
+            return true;
+#else
+            return false;
+#endif
+
+        case BackendType::Talos:
+#ifdef GRANITE_HAS_TALOS
             return true;
 #else
             return false;
