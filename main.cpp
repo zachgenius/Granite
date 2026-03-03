@@ -36,12 +36,25 @@ inline float debug_fp16_to_fp32(uint16_t h) {
 void print_usage(const char* program) {
     std::cerr << "Usage: " << program << " <model.gguf> [options] [prompt]\n";
     std::cerr << "\nOptions:\n";
+    std::cerr << "  --backend <type>      Backend: cpu, metal, vulkan, talos (default: auto)\n";
     std::cerr << "  --draft-model <path>  Enable speculative decoding with draft model\n";
     std::cerr << "  --max-tokens <n>      Maximum tokens to generate (default: 20)\n";
     std::cerr << "  --spec-k <n>          Initial speculation depth (default: 4)\n";
+    std::cerr << "\nBackend notes:\n";
+    std::cerr << "  Talos backend reads TALOS_HAL_BACKEND env var: verilator (default), asic, fpga\n";
     std::cerr << "\nExamples:\n";
     std::cerr << "  " << program << " model.gguf \"Hello\"\n";
+    std::cerr << "  " << program << " model.gguf --backend talos \"Hello\"\n";
     std::cerr << "  " << program << " large.gguf --draft-model small.gguf \"Hello\"\n";
+}
+
+granite::BackendType parse_backend_type(const std::string& name) {
+    if (name == "cpu")    return granite::BackendType::CPU;
+    if (name == "metal")  return granite::BackendType::Metal;
+    if (name == "vulkan") return granite::BackendType::Vulkan;
+    if (name == "talos")  return granite::BackendType::Talos;
+    GRANITE_LOG_ERROR("Unknown backend: '{}'. Valid options: cpu, metal, vulkan, talos", name);
+    std::exit(1);
 }
 
 int main(int argc, char* argv[]) {
@@ -57,6 +70,7 @@ int main(int argc, char* argv[]) {
     // Parse arguments
     std::string model_path;
     std::string draft_model_path;
+    std::string backend_name_str;
     std::string prompt = "Hello";
     int max_tokens = 20;
     int spec_k = 4;
@@ -64,7 +78,9 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
 
-        if (arg == "--draft-model" && i + 1 < argc) {
+        if (arg == "--backend" && i + 1 < argc) {
+            backend_name_str = argv[++i];
+        } else if (arg == "--draft-model" && i + 1 < argc) {
             draft_model_path = argv[++i];
         } else if (arg == "--max-tokens" && i + 1 < argc) {
             max_tokens = std::atoi(argv[++i]);
@@ -171,7 +187,14 @@ int main(int argc, char* argv[]) {
     auto& tokenizer = tok_result.value();
 
     // Create backend
-    auto backend = granite::create_default_backend();
+    std::unique_ptr<granite::IComputeBackend> backend;
+    if (!backend_name_str.empty()) {
+        auto type = parse_backend_type(backend_name_str);
+        GRANITE_LOG_INFO("Using {} backend (requested via --backend)", granite::backend_name(type));
+        backend = granite::create_backend(type);
+    } else {
+        backend = granite::create_default_backend();
+    }
     if (!backend) {
         GRANITE_LOG_ERROR("Failed to create backend");
         return 1;

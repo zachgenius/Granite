@@ -284,6 +284,9 @@ void register_metal_operators();
 /// Register Vulkan operators (called automatically during initialization)
 void register_vulkan_operators();
 
+/// Register Talos operators (called automatically during initialization)
+void register_talos_operators();
+
 /// Initialize all available operators
 void initialize_operators();
 
